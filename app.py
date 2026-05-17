@@ -9,6 +9,7 @@ import pymongo
 from pymongo.errors import ConnectionFailure
 from dotenv import load_dotenv
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
+from flask_cors import CORS
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.local import LocalProxy
 
@@ -17,7 +18,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
 FRONTEND_DIR = os.path.join(PROJECT_ROOT, "Frontend")
 
+# Load .env from backend dir first, then project root as fallback
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://127.0.0.1:5173")
 
 app = Flask(
@@ -26,6 +30,24 @@ app = Flask(
     static_folder=os.path.join(FRONTEND_DIR, "static"),
 )
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Allow requests from local dev AND the production Vercel frontend domain.
+# supports_credentials=True is required so session cookies work across origins.
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    FRONTEND_URL,
+    "https://swarajya-crm-frontend.vercel.app",
+]
+CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+
+# ── Session cookie settings ────────────────────────────────────────────────────
+# "None" + Secure is required for cross-site cookies (frontend on Vercel,
+# backend on Vercel = different subdomains so treat as cross-site).
+app.config["SESSION_COOKIE_SAMESITE"] = "None"
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
 
 
 CUSTOMER_STATUSES = ["Lead", "Active", "Inactive"]
