@@ -50,6 +50,25 @@ app.config["SESSION_COOKIE_SECURE"] = True
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 
 
+# ── Health check ───────────────────────────────────────────────────────────────
+@app.route("/")
+@app.route("/api/health")
+def health_check():
+    mongo_uri_set = bool(os.getenv("MONGO_DB_URI"))
+    try:
+        db = get_db()
+        db.command("ping")
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    return jsonify({
+        "status": "ok",
+        "service": "Swarajya CRM Backend",
+        "mongo_uri_configured": mongo_uri_set,
+        "database": db_status
+    })
+
+
 CUSTOMER_STATUSES = ["Lead", "Active", "Inactive"]
 OPPORTUNITY_STAGES = ["Draft", "Discussion", "Contractual negotiations", "DA Signed", "Lost to competitor", "Rejected by SC", "Lost"]
 PROJECT_STATUSES = ["Planning", "In Progress", "Blocked", "Delivered", "On Hold"]
