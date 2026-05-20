@@ -421,6 +421,34 @@ def handle_db_error(error):
         return jsonify({"error": str(error)}), 500
     return render_template("error.html", error=error), 500
 
+def validate_password_strength(password):
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long."
+    if not re.search(r"[A-Z]", password):
+        return False, "Password must contain at least one uppercase letter."
+    if not re.search(r"[a-z]", password):
+        return False, "Password must contain at least one lowercase letter."
+    if not re.search(r"\d", password):
+        return False, "Password must contain at least one number."
+    if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+        return False, "Password must contain at least one special character."
+    return True, ""
+
+@app.before_request
+def force_password_change_check():
+    if request.path.startswith("/api/") and request.path not in [
+        "/api/auth/login",
+        "/api/auth/logout",
+        "/api/auth/change-password",
+        "/api/health"
+    ]:
+        user_id = session.get("user_id")
+        if user_id:
+            db = get_db()
+            user = db.app_users.find_one({"id": user_id})
+            if user and user.get("requires_password_change", False):
+                return jsonify({"error": "Password change required", "requires_password_change": True}), 403
+
 @app.route("/api/auth/login", methods=["POST"])
 def api_auth_login():
     data = request.get_json()
@@ -445,7 +473,8 @@ def api_auth_login():
             "email": user.get("email"),
             "role_name": role_name,
             "has_treasury_access": user.get("has_treasury_access", 0),
-            "has_finance_access": user.get("has_finance_access", 0)
+            "has_finance_access": user.get("has_finance_access", 0),
+            "requires_password_change": bool(user.get("requires_password_change", False))
         }
         return jsonify({"user": user_data})
         
@@ -454,6 +483,42 @@ def api_auth_login():
 @app.route("/api/auth/logout", methods=["POST"])
 def api_auth_logout():
     session.clear()
+    return jsonify({"success": True})
+
+@app.route("/api/auth/change-password", methods=["POST"])
+def api_auth_change_password():
+    if "user_id" not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.get_json()
+    current_password = data.get("current_password")
+    new_password = data.get("new_password")
+    
+    if not current_password or not new_password:
+        return jsonify({"error": "Current and new passwords are required"}), 400
+        
+    db = get_db()
+    user = db.app_users.find_one({"id": session["user_id"]})
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+        
+    if not check_password_hash(user.get("password_hash", ""), current_password):
+        return jsonify({"error": "Incorrect current password"}), 400
+        
+    if check_password_hash(user.get("password_hash", ""), new_password):
+        return jsonify({"error": "New password cannot be the same as the current password"}), 400
+        
+    is_valid, msg = validate_password_strength(new_password)
+    if not is_valid:
+        return jsonify({"error": msg}), 400
+        
+    db.app_users.update_one(
+        {"id": session["user_id"]},
+        {"$set": {
+            "password_hash": generate_password_hash(new_password),
+            "requires_password_change": False
+        }}
+    )
     return jsonify({"success": True})
 
 def require_treasury_access():
@@ -490,6 +555,103 @@ def log_treasury_action(user_id, action, details=""):
         "details": details,
         "created_at": datetime.now()
     })
+
+
+import threading
+
+def _perform_log_activity(module_name, entity_name, record_id, action_type, old_data, new_data, reference_number, source_screen, user_id, user_name):
+    try:
+        fields_changed = []
+        old_values = {}
+        new_values = {}
+        
+        def sanitize_val(v):
+            if isinstance(v, (datetime, date)):
+                return v.isoformat()
+            if isinstance(v, Decimal):
+                return float(v)
+            if isinstance(v, bytes):
+                return v.decode("utf-8", errors="ignore")
+            return v
+
+        if action_type == "UPDATE":
+            if not old_data:
+                old_data = {}
+            if not new_data:
+                new_data = {}
+            
+            all_keys = set(old_data.keys()).union(new_data.keys())
+            ignored_keys = {"_id", "updated_at", "modified_at", "created_at", "modified_by_id", "modified_by_name", "created_by_id", "created_by_name"}
+            
+            for key in all_keys:
+                if key in ignored_keys:
+                    continue
+                old_val = old_data.get(key)
+                new_val = new_data.get(key)
+                
+                if old_val != new_val:
+                    fields_changed.append(key)
+                    if key in old_data:
+                        old_values[key] = sanitize_val(old_val)
+                    if key in new_data:
+                        new_values[key] = sanitize_val(new_val)
+                        
+            if not fields_changed:
+                return
+        elif action_type == "CREATE":
+            if new_data:
+                ignored_keys = {"_id", "updated_at", "modified_at", "created_at", "modified_by_id", "modified_by_name", "created_by_id", "created_by_name"}
+                for key, val in new_data.items():
+                    if key not in ignored_keys:
+                        new_values[key] = sanitize_val(val)
+                fields_changed = list(new_values.keys())
+        elif action_type == "DELETE":
+            if old_data:
+                ignored_keys = {"_id", "updated_at", "modified_at", "created_at", "modified_by_id", "modified_by_name", "created_by_id", "created_by_name"}
+                for key, val in old_data.items():
+                    if key not in ignored_keys:
+                        old_values[key] = sanitize_val(val)
+                fields_changed = list(old_values.keys())
+
+        db = get_db()
+        log_id = get_next_sequence_value("activity_logs")
+        db.activity_logs.insert_one({
+            "id": log_id,
+            "module_name": module_name,
+            "entity_name": entity_name,
+            "record_id": record_id,
+            "action_type": action_type,
+            "fields_changed": fields_changed,
+            "old_values": old_values,
+            "new_values": new_values,
+            "user_id": user_id,
+            "user_name": user_name,
+            "timestamp": datetime.now(),
+            "reference_number": reference_number,
+            "source_screen": source_screen
+        })
+    except Exception as e:
+        print(f"ASYNC LOGGING ERROR: {e}")
+
+def log_activity_async(module_name, entity_name, record_id, action_type, old_data=None, new_data=None, reference_number=None):
+    try:
+        source_screen = request.path if request else None
+        actor = get_current_user()
+        user_id = actor["id"] if actor else None
+        user_name = actor.get("full_name", "System") if actor else "System"
+        
+        old_data_copy = dict(old_data) if old_data else None
+        new_data_copy = dict(new_data) if new_data else None
+        
+        thread = threading.Thread(
+            target=_perform_log_activity,
+            args=(module_name, entity_name, record_id, action_type, old_data_copy, new_data_copy, reference_number, source_screen, user_id, user_name),
+            daemon=True
+        )
+        thread.start()
+    except Exception as e:
+        print(f"FAILED TO INITIATE ASYNC LOGGING: {e}")
+
 
 
 def dashboard_payload():
@@ -631,6 +793,62 @@ def api_setup_home():
     return jsonify(json_ready({"metrics": metrics, "users": users, "roles": roles, "objects": objects}))
 
 
+@app.route("/api/setup/activity-logs", methods=["GET"])
+def api_setup_activity_logs():
+    actor = get_current_user()
+    if not actor:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    db = get_db()
+    role = db.roles.find_one({"id": actor.get("role_id")})
+    if not role or role["name"] not in ["Admin", "System Administrator"]:
+        return jsonify({"error": "Forbidden"}), 403
+        
+    query = {}
+    module_filter = request.args.get("module_name")
+    if module_filter:
+        query["module_name"] = module_filter
+        
+    entity_filter = request.args.get("entity_name")
+    if entity_filter:
+        query["entity_name"] = entity_filter
+        
+    action_filter = request.args.get("action_type")
+    if action_filter:
+        query["action_type"] = action_filter
+        
+    user_filter = request.args.get("user_name")
+    if user_filter:
+        query["user_name"] = {"$regex": user_filter, "$options": "i"}
+        
+    record_filter = request.args.get("record_id")
+    if record_filter:
+        try:
+            query["record_id"] = int(record_filter)
+        except ValueError:
+            pass
+            
+    try:
+        limit = int(request.args.get("limit", 20))
+    except ValueError:
+        limit = 20
+        
+    try:
+        skip = int(request.args.get("skip", 0))
+    except ValueError:
+        skip = 0
+        
+    total = db.activity_logs.count_documents(query)
+    logs = list(db.activity_logs.find(query, {"_id": 0}).sort("timestamp", pymongo.DESCENDING).skip(skip).limit(limit))
+    
+    return jsonify(json_ready({
+        "logs": logs,
+        "total": total,
+        "skip": skip,
+        "limit": limit
+    }))
+
+
 @app.route("/api/setup/users", methods=["GET", "POST"])
 def api_setup_users():
     db = get_db()
@@ -646,6 +864,7 @@ def api_setup_users():
             "is_active": data.get("is_active", True),
             "has_treasury_access": 1 if data.get("has_treasury_access") else 0,
             "has_finance_access": 1 if data.get("has_finance_access") else 0,
+            "requires_password_change": True,
             "created_at": datetime.now()
         })
         return jsonify({"id": user_id})
@@ -685,6 +904,39 @@ def api_setup_user(user_id):
         return jsonify({"success": True})
         
     return jsonify(json_ready(user))
+
+
+@app.route("/api/setup/users/<int:user_id>/reset-password", methods=["POST"])
+def api_setup_reset_password(user_id):
+    actor = get_current_user()
+    if not actor:
+        return jsonify({"error": "Unauthorized"}), 401
+        
+    db = get_db()
+    role = db.roles.find_one({"id": actor.get("role_id")})
+    if not role or role["name"] not in ["Admin", "System Administrator"]:
+        return jsonify({"error": "Forbidden"}), 403
+        
+    data = request.get_json()
+    new_password = data.get("password")
+    if not new_password:
+        return jsonify({"error": "Password is required"}), 400
+        
+    is_valid, msg = validate_password_strength(new_password)
+    if not is_valid:
+        return jsonify({"error": msg}), 400
+        
+    result = db.app_users.update_one(
+        {"id": user_id},
+        {"$set": {
+            "password_hash": generate_password_hash(new_password),
+            "requires_password_change": True
+        }}
+    )
+    if result.matched_count == 0:
+        return jsonify({"error": "User not found"}), 404
+        
+    return jsonify({"success": True})
 
 
 @app.route("/api/setup/roles", methods=["GET", "POST"])
@@ -776,7 +1028,7 @@ def api_setup_objects():
             return jsonify({"error": "Object with this name already exists"}), 400
             
         object_id = get_next_sequence_value("custom_objects")
-        db.custom_objects.insert_one({
+        insert_data = {
             "id": object_id,
             "label": data["label"],
             "plural_label": data["plural_label"],
@@ -785,7 +1037,9 @@ def api_setup_objects():
             "storage_table": None,
             "description": data.get("description"),
             "created_at": datetime.now()
-        })
+        }
+        db.custom_objects.insert_one(insert_data)
+        log_activity_async("Setup", "Custom Object", object_id, "CREATE", new_data=insert_data)
         return jsonify({"id": object_id, "api_name": api_name})
         
     objects = list(db.custom_objects.aggregate([
@@ -818,7 +1072,7 @@ def api_setup_create_field(object_id):
         return jsonify({"error": "Field with this label already exists on this object"}), 400
         
     field_id = get_next_sequence_value("custom_fields")
-    db.custom_fields.insert_one({
+    insert_data = {
         "id": field_id,
         "object_id": object_id,
         "label": data["label"],
@@ -829,7 +1083,9 @@ def api_setup_create_field(object_id):
         "picklist_options": data.get("picklist_options"),
         "is_required": 1 if data.get("is_required") else 0,
         "created_at": datetime.now()
-    })
+    }
+    db.custom_fields.insert_one(insert_data)
+    log_activity_async("Setup", "Custom Field", field_id, "CREATE", new_data=insert_data)
     return jsonify({"id": field_id})
 
 
@@ -845,6 +1101,7 @@ def api_setup_field_detail(field_id):
             return jsonify({"error": "Cannot delete a native system field."}), 400
         db.custom_fields.delete_one({"id": field_id})
         db.field_level_security.delete_many({"field_id": field_id})
+        log_activity_async("Setup", "Custom Field", field_id, "DELETE", old_data=field)
         return jsonify({"success": True})
         
     data = request.get_json()
@@ -854,7 +1111,10 @@ def api_setup_field_detail(field_id):
         "picklist_options": data.get("picklist_options"),
         "is_required": 1 if data.get("is_required") else 0
     }
+    old_field = db.custom_fields.find_one({"id": field_id})
     db.custom_fields.update_one({"id": field_id}, {"$set": update_data})
+    new_field = db.custom_fields.find_one({"id": field_id})
+    log_activity_async("Setup", "Custom Field", field_id, "UPDATE", old_data=old_field, new_data=new_field)
     return jsonify({"success": True})
 
 
@@ -869,6 +1129,7 @@ def api_setup_object(object_id):
         return jsonify({"error": "Cannot edit standard objects"}), 400
         
     data = request.get_json()
+    old_obj = db.custom_objects.find_one({"id": object_id})
     db.custom_objects.update_one(
         {"id": object_id},
         {"$set": {
@@ -877,6 +1138,8 @@ def api_setup_object(object_id):
             "description": data.get("description")
         }}
     )
+    new_obj = db.custom_objects.find_one({"id": object_id})
+    log_activity_async("Setup", "Custom Object", object_id, "UPDATE", old_data=old_obj, new_data=new_obj)
     return jsonify({"success": True})
 
 @app.route("/api/customers", methods=["GET", "POST"])
@@ -996,12 +1259,28 @@ def api_opportunities():
         actor_id = actor["id"] if actor else None
         actor_name = actor.get("full_name", "Unknown") if actor else "System"
         
+        country = data.get("country", "")
+        country_prefix = (country[:2].upper().ljust(2, 'X')) if country else "XX"
+        now = datetime.now()
+        prefix = f"{country_prefix}{now.strftime('%Y%m')}"
+        
+        opps_with_prefix = list(db.opportunities.find({"opportunity_number": {"$regex": f"^{prefix}"}}, {"_id": 0, "opportunity_number": 1}))
+        max_seq = 0
+        for opp in opps_with_prefix:
+            num_str = opp.get("opportunity_number", "")
+            if num_str and num_str.startswith(prefix):
+                seq_str = num_str[len(prefix):]
+                if seq_str.isdigit():
+                    max_seq = max(max_seq, int(seq_str))
+                    
+        opportunity_number = f"{prefix}{max_seq + 1:03d}"
+        
         insert_data = {
             "id": opportunity_id,
             "title": data.get("title"),
             "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
             "country": data.get("country"),
-            "opportunity_number": data.get("opportunity_number"),
+            "opportunity_number": opportunity_number,
             "value": float(data.get("value")) if data.get("value") else 0.0,
             "currency": data.get("currency", "INR"),
             "stage": data.get("stage", "Draft"),
@@ -1445,7 +1724,7 @@ def api_finance_transactions():
         actor = get_current_user()
         actor_id = actor["id"] if actor else None
         actor_name = actor.get("full_name", "Unknown") if actor else "System"
-        db.transactions.insert_one({
+        insert_data = {
             "id": transaction_id,
             "account_id": int(data.get("account_id")) if data.get("account_id") else None,
             "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
@@ -1473,7 +1752,9 @@ def api_finance_transactions():
             "created_by_name": actor_name,
             "modified_by_id": actor_id,
             "modified_by_name": actor_name
-        })
+        }
+        db.transactions.insert_one(insert_data)
+        log_activity_async("Finance", "Accounting Entry", transaction_id, "CREATE", new_data=insert_data, reference_number=data.get("reference"))
         return jsonify({"id": transaction_id})
         
     transactions = list(db.transactions.aggregate([
@@ -1519,6 +1800,7 @@ def api_finance_transaction_detail(transaction_id):
         if not date_val:
             date_val = datetime.now().strftime("%Y-%m-%d")
             
+        old_tx = db.transactions.find_one({"id": transaction_id})
         db.transactions.update_one(
             {"id": transaction_id},
             {"$set": {
@@ -1544,6 +1826,8 @@ def api_finance_transaction_detail(transaction_id):
                 "total_amount": total_amount
             }}
         )
+        new_tx = db.transactions.find_one({"id": transaction_id})
+        log_activity_async("Finance", "Accounting Entry", transaction_id, "UPDATE", old_data=old_tx, new_data=new_tx, reference_number=new_tx.get("reference"))
         return jsonify({"success": True})
         
     transactions = list(db.transactions.aggregate([
@@ -1579,10 +1863,13 @@ def api_finance_transaction_reverse(transaction_id):
     db = get_db()
     
     # 1. Update transaction status in db.transactions
+    old_tx = db.transactions.find_one({"id": transaction_id})
     res = db.transactions.update_one(
         {"id": transaction_id},
         {"$set": {"status": "Reversed"}}
     )
+    new_tx = db.transactions.find_one({"id": transaction_id})
+    log_activity_async("Finance", "Accounting Entry", transaction_id, "UPDATE", old_data=old_tx, new_data=new_tx, reference_number=new_tx.get("reference") if new_tx else None)
     if res.matched_count == 0:
         abort(404)
         
@@ -1634,7 +1921,7 @@ def api_invoices():
         actor = get_current_user()
         actor_id = actor["id"] if actor else None
         actor_name = actor.get("full_name", "Unknown") if actor else "System"
-        db.invoices.insert_one({
+        insert_data = {
             "id": invoice_id,
             "invoice_number": invoice_number,
             "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
@@ -1655,8 +1942,9 @@ def api_invoices():
             "created_by_name": actor_name,
             "modified_by_id": actor_id,
             "modified_by_name": actor_name
-        })
-        
+        }
+        db.invoices.insert_one(insert_data)
+        log_activity_async("Finance", "Invoice", invoice_id, "CREATE", new_data=insert_data, reference_number=invoice_number)
         return jsonify({"id": invoice_id})
         
     invoices = list(db.invoices.aggregate([
@@ -1693,6 +1981,7 @@ def api_invoice_detail(invoice_id):
         if not issue_date:
             issue_date = datetime.now().strftime("%Y-%m-%d")
             
+        old_inv = db.invoices.find_one({"id": invoice_id})
         db.invoices.update_one(
             {"id": invoice_id},
             {"$set": {
@@ -1714,10 +2003,14 @@ def api_invoice_detail(invoice_id):
                 "modified_by_name": actor_name
             }}
         )
+        new_inv = db.invoices.find_one({"id": invoice_id})
+        log_activity_async("Finance", "Invoice", invoice_id, "UPDATE", old_data=old_inv, new_data=new_inv, reference_number=new_inv.get("invoice_number") if new_inv else None)
         return jsonify({"success": True})
         
     if request.method == "DELETE":
+        old_inv = db.invoices.find_one({"id": invoice_id})
         db.invoices.delete_one({"id": invoice_id})
+        log_activity_async("Finance", "Invoice", invoice_id, "DELETE", old_data=old_inv, reference_number=old_inv.get("invoice_number") if old_inv else None)
         return jsonify({"success": True})
         
     invoice = list(db.invoices.aggregate([
