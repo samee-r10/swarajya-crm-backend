@@ -153,6 +153,38 @@ def slugify_api_name(value, suffix=""):
     return slug
 
 
+
+def get_fields_for_user(object_id):
+    db = get_db()
+    fields = list(db.custom_fields.find({"object_id": object_id}, {"_id": 0}).sort("is_native", -1))
+    user = get_current_user()
+    if not user or not user.get("role_id"):
+        return fields
+        
+    role_id = user["role_id"]
+    fls = list(db.field_level_security.find({"role_id": role_id, "object_id": object_id}))
+    if not fls:
+        # Default is can_view=True, can_edit=True
+        for f in fields:
+            f["can_edit"] = True
+        return fields
+        
+    fls_map = {item["field_id"]: item for item in fls}
+    
+    filtered_fields = []
+    for f in fields:
+        sec = fls_map.get(f["id"])
+        if sec:
+            if sec.get("can_view"):
+                f["can_edit"] = bool(sec.get("can_edit"))
+                filtered_fields.append(f)
+        else:
+            f["can_edit"] = True
+            filtered_fields.append(f)
+            
+    return filtered_fields
+
+
 def custom_objects_for_nav():
     try:
         return fetch_all("SELECT label, plural_label, api_name FROM custom_objects WHERE is_standard = 0 ORDER BY plural_label")
@@ -892,7 +924,7 @@ def api_customers():
     # Fetch fields configured for the Customer object
     fields = []
     if customer_obj:
-        fields = list(db.custom_fields.find({"object_id": customer_obj["id"]}, {"_id": 0}).sort("is_native", -1))
+        fields = get_fields_for_user(customer_obj["id"])
         
     return jsonify(json_ready({
         "customers": customers,
@@ -945,7 +977,7 @@ def api_customer_detail(customer_id):
     customer_obj = db.custom_objects.find_one({"api_name": "customers"})
     fields = []
     if customer_obj:
-        fields = list(db.custom_fields.find({"object_id": customer_obj["id"]}, {"_id": 0}).sort("is_native", -1))
+        fields = get_fields_for_user(customer_obj["id"])
         
     return jsonify(json_ready({
         "customer": customer,
@@ -1015,7 +1047,7 @@ def api_opportunities():
     # Fetch fields configured for the Opportunity object
     fields = []
     if opp_obj:
-        fields = list(db.custom_fields.find({"object_id": opp_obj["id"]}, {"_id": 0}).sort("is_native", -1))
+        fields = get_fields_for_user(opp_obj["id"])
         
     # Also fetch currencies globally
     currencies_records = list(db.currencies.find({}, {"_id": 0, "code": 1}))
@@ -1081,7 +1113,7 @@ def api_opportunity_detail(opportunity_id):
     opp_obj = db.custom_objects.find_one({"api_name": "opportunities"})
     fields = []
     if opp_obj:
-        fields = list(db.custom_fields.find({"object_id": opp_obj["id"]}, {"_id": 0}).sort("is_native", -1))
+        fields = get_fields_for_user(opp_obj["id"])
         
     return jsonify(json_ready({
         "opportunity": opps[0],
@@ -1156,7 +1188,7 @@ def api_projects():
     # Fetch fields configured for the Project object
     fields = []
     if proj_obj:
-        fields = list(db.custom_fields.find({"object_id": proj_obj["id"]}, {"_id": 0}).sort("is_native", -1))
+        fields = get_fields_for_user(proj_obj["id"])
         
     # Fetch currencies
     currencies_records = list(db.currencies.find({}, {"_id": 0, "code": 1}))
@@ -1228,7 +1260,7 @@ def api_project_detail(project_id):
     proj_obj = db.custom_objects.find_one({"api_name": "projects"})
     fields = []
     if proj_obj:
-        fields = list(db.custom_fields.find({"object_id": proj_obj["id"]}, {"_id": 0}).sort("is_native", -1))
+        fields = get_fields_for_user(proj_obj["id"])
         
     return jsonify(json_ready({
         "project": proj,
@@ -1278,7 +1310,7 @@ def api_finance_vendors():
     vendor_obj = db.custom_objects.find_one({"api_name": "vendors"})
     fields = []
     if vendor_obj:
-        fields = list(db.custom_fields.find({"object_id": vendor_obj["id"]}, {"_id": 0}).sort("is_native", -1))
+        fields = get_fields_for_user(vendor_obj["id"])
         
     return jsonify(json_ready({
         "vendors": vendors,
@@ -1325,7 +1357,7 @@ def api_finance_vendor_detail(vendor_id):
     vendor_obj = db.custom_objects.find_one({"api_name": "vendors"})
     fields = []
     if vendor_obj:
-        fields = list(db.custom_fields.find({"object_id": vendor_obj["id"]}, {"_id": 0}).sort("is_native", -1))
+        fields = get_fields_for_user(vendor_obj["id"])
         
     return jsonify(json_ready({
         "vendor": vendor,
