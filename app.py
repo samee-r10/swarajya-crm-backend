@@ -1665,13 +1665,13 @@ def api_finance_dashboard():
     require_finance_access()
     db = get_db()
     total_revenue = list(db.transactions.aggregate([
-        {"$match": {"type": "Credit", "status": "Completed"}},
+        {"$match": {"type": {"$in": ["Credit", "Income"]}, "status": {"$ne": "Reversed"}}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     total_revenue_val = total_revenue[0]["total"] if total_revenue else 0
     
     total_expenses = list(db.transactions.aggregate([
-        {"$match": {"type": "Debit", "status": "Completed"}},
+        {"$match": {"type": {"$in": ["Debit", "Expense"]}, "status": {"$ne": "Reversed"}}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     total_expenses_val = total_expenses[0]["total"] if total_expenses else 0
@@ -1682,10 +1682,13 @@ def api_finance_dashboard():
         "total_revenue": total_revenue_val,
         "total_expenses": total_expenses_val,
         "net_profit": total_revenue_val - total_expenses_val,
+        "bank_balance": total_revenue_val - total_expenses_val,
+        "cash_on_hand": 0.0,
         "unpaid_invoices": unpaid_invoices_count,
     }
     
     recent_transactions = list(db.transactions.aggregate([
+        {"$match": {"status": {"$ne": "Reversed"}}},
         {"$sort": {"date": -1}},
         {"$limit": 6},
         {"$lookup": {"from": "accounts", "localField": "account_id", "foreignField": "id", "as": "account"}},
@@ -1720,7 +1723,8 @@ def api_finance_transactions():
     db = get_db()
     if request.method == "POST":
         data = request.get_json()
-        transaction_id = get_next_sequence_value("transactions")
+        seq = get_next_sequence_value("transactions")
+        transaction_id = f"TXN{seq:03d}"
         
         amount = float(data.get("amount") or 0)
         cgst_percent = float(data.get("cgst_percent") or 0)
@@ -1794,7 +1798,7 @@ def api_finance_transactions():
     ]))
     return jsonify(json_ready({"transactions": transactions}))
 
-@app.route("/api/finance/transactions/<int:transaction_id>", methods=["GET", "PUT"])
+@app.route("/api/finance/transactions/<transaction_id>", methods=["GET", "PUT"])
 def api_finance_transaction_detail(transaction_id):
     require_finance_access()
     db = get_db()
@@ -1873,7 +1877,7 @@ def api_finance_transaction_detail(transaction_id):
         "currency_symbols": CURRENCY_SYMBOLS
     }))
 
-@app.route("/api/finance/transactions/<int:transaction_id>/reverse", methods=["POST"])
+@app.route("/api/finance/transactions/<transaction_id>/reverse", methods=["POST"])
 def api_finance_transaction_reverse(transaction_id):
     require_finance_access()
     db = get_db()
