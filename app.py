@@ -1175,6 +1175,7 @@ def api_customers():
                 insert_data[k] = v
                 
         db.customers.insert_one(insert_data)
+        log_activity_async("Customers", "Customer", customer_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("company_name"))
         customer = db.customers.find_one({"id": customer_id}, {"_id": 0})
         return jsonify(json_ready({"customer": customer}))
         
@@ -1226,10 +1227,13 @@ def api_customer_detail(customer_id):
             if k not in update_data and k != "id" and k != "created_at":
                 update_data[k] = v
                 
+        old_customer = db.customers.find_one({"id": customer_id}, {"_id": 0})
         db.customers.update_one(
             {"id": customer_id},
             {"$set": update_data}
         )
+        new_customer = db.customers.find_one({"id": customer_id}, {"_id": 0})
+        log_activity_async("Customers", "Customer", customer_id, "UPDATE", old_data=old_customer, new_data=new_customer, reference_number=new_customer.get("company_name"))
         return jsonify({"success": True})
         
     # Fetch related
@@ -1259,7 +1263,7 @@ def api_opportunities():
         actor_id = actor["id"] if actor else None
         actor_name = actor.get("full_name", "Unknown") if actor else "System"
         
-        country = data.get("country", "")
+        country = data.get("country") or data.get("country_c") or ""
         country_prefix = (country[:2].upper().ljust(2, 'X')) if country else "XX"
         now = datetime.now()
         prefix = f"{country_prefix}{now.strftime('%Y%m')}"
@@ -1279,7 +1283,7 @@ def api_opportunities():
             "id": opportunity_id,
             "title": data.get("title"),
             "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
-            "country": data.get("country"),
+            "country": data.get("country") or data.get("country_c"),
             "opportunity_number": opportunity_number,
             "value": float(data.get("value")) if data.get("value") else 0.0,
             "currency": data.get("currency", "INR"),
@@ -1301,6 +1305,7 @@ def api_opportunities():
                 insert_data[k] = v
                 
         db.opportunities.insert_one(insert_data)
+        log_activity_async("Opportunities", "Opportunity", opportunity_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("opportunity_number"))
         
         opps = list(db.opportunities.aggregate([
             {"$match": {"id": opportunity_id}},
@@ -1352,7 +1357,7 @@ def api_opportunity_detail(opportunity_id):
         update_data = {
             "title": data.get("title"),
             "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
-            "country": data.get("country"),
+            "country": data.get("country") or data.get("country_c"),
             "opportunity_number": data.get("opportunity_number"),
             "value": float(data.get("value")) if data.get("value") else 0.0,
             "currency": data.get("currency"),
@@ -1370,10 +1375,13 @@ def api_opportunity_detail(opportunity_id):
             if k not in update_data and k != "id" and k != "created_at":
                 update_data[k] = v
                 
+        old_opportunity = db.opportunities.find_one({"id": opportunity_id}, {"_id": 0})
         db.opportunities.update_one(
             {"id": opportunity_id},
             {"$set": update_data}
         )
+        new_opportunity = db.opportunities.find_one({"id": opportunity_id}, {"_id": 0})
+        log_activity_async("Opportunities", "Opportunity", opportunity_id, "UPDATE", old_data=old_opportunity, new_data=new_opportunity, reference_number=new_opportunity.get("opportunity_number"))
         return jsonify({"success": True})
         
     opps = list(db.opportunities.aggregate([
@@ -1437,6 +1445,7 @@ def api_projects():
                 insert_data[k] = v
                 
         db.projects.insert_one(insert_data)
+        log_activity_async("Projects", "Project", project_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("project_name"))
         
         projs = list(db.projects.aggregate([
             {"$match": {"id": project_id}},
@@ -1512,10 +1521,13 @@ def api_project_detail(project_id):
             if k not in update_data and k != "id" and k != "created_at":
                 update_data[k] = v
                 
+        old_project = db.projects.find_one({"id": project_id}, {"_id": 0})
         db.projects.update_one(
             {"id": project_id},
             {"$set": update_data}
         )
+        new_project = db.projects.find_one({"id": project_id}, {"_id": 0})
+        log_activity_async("Projects", "Project", project_id, "UPDATE", old_data=old_project, new_data=new_project, reference_number=new_project.get("project_name"))
         return jsonify({"success": True})
         
     projects = list(db.projects.aggregate([
@@ -1579,6 +1591,7 @@ def api_finance_vendors():
                 insert_data[k] = v
                 
         db.vendors.insert_one(insert_data)
+        log_activity_async("Finance", "Vendor", vendor_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("name"))
         
         vendor = db.vendors.find_one({"id": vendor_id}, {"_id": 0})
         return jsonify(json_ready({"vendor": vendor}))
@@ -1626,10 +1639,13 @@ def api_finance_vendor_detail(vendor_id):
             if k not in update_data and k != "id" and k != "created_at":
                 update_data[k] = v
                 
+        old_vendor = db.vendors.find_one({"id": vendor_id}, {"_id": 0})
         db.vendors.update_one(
             {"id": vendor_id},
             {"$set": update_data}
         )
+        new_vendor = db.vendors.find_one({"id": vendor_id}, {"_id": 0})
+        log_activity_async("Finance", "Vendor", vendor_id, "UPDATE", old_data=old_vendor, new_data=new_vendor, reference_number=new_vendor.get("name"))
         return jsonify({"success": True})
         
     # Fetch fields configured for the Vendor object
