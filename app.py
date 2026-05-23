@@ -1664,27 +1664,73 @@ def api_finance_vendor_detail(vendor_id):
 def api_finance_dashboard():
     require_finance_access()
     db = get_db()
-    total_revenue = list(db.transactions.aggregate([
-        {"$match": {"type": {"$in": ["Credit", "Income"]}, "status": {"$ne": "Reversed"}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]))
-    total_revenue_val = total_revenue[0]["total"] if total_revenue else 0
     
-    total_expenses = list(db.transactions.aggregate([
-        {"$match": {"type": {"$in": ["Debit", "Expense"]}, "status": {"$ne": "Reversed"}}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]))
-    total_expenses_val = total_expenses[0]["total"] if total_expenses else 0
+    # Load exchange rates
+    inr_rate = 95.0
+    setting = db.system_settings.find_one({"key_name": "exchange_rates"})
+    if setting and setting.get("value"):
+        try:
+            rates_data = json.loads(setting["value"])
+            inr_rate = rates_data.get("INR", {}).get("default", 95.0)
+        except Exception:
+            pass
+
+    transactions = list(db.transactions.find({"status": {"$ne": "Reversed"}}))
     
+    total_revenue_usd = 0.0
+    total_revenue_inr = 0.0
+    total_expenses_usd = 0.0
+    total_expenses_inr = 0.0
+
+    for tx in transactions:
+        amount = float(tx.get("total_amount") or tx.get("amount") or 0.0)
+        currency = tx.get("currency", "USD")
+        
+        tx_date = tx.get("transaction_date") or tx.get("date")
+        month = tx_date[:7] if tx_date and len(tx_date) >= 7 else ""
+        current_rate = inr_rate
+        if month and setting and setting.get("value"):
+            try:
+                rates_data = json.loads(setting["value"])
+                monthly_rates = rates_data.get("INR", {}).get("monthly", {})
+                if month in monthly_rates:
+                    current_rate = monthly_rates[month]
+            except Exception:
+                pass
+                
+        if currency == "USD":
+            amt_usd = amount
+            amt_inr = amount * current_rate
+        elif currency == "INR":
+            amt_usd = amount / current_rate
+            amt_inr = amount
+        else:
+            # Fallback for EUR/GBP etc.
+            amt_usd = amount
+            amt_inr = amount * current_rate
+            
+        tx_type = tx.get("type")
+        if tx_type in ["Credit", "Income"]:
+            total_revenue_usd += amt_usd
+            total_revenue_inr += amt_inr
+        elif tx_type in ["Debit", "Expense"]:
+            total_expenses_usd += amt_usd
+            total_expenses_inr += amt_inr
+            
     unpaid_invoices_count = db.invoices.count_documents({"status": {"$in": ["Draft", "Sent", "Partially Paid"]}})
     
     metrics = {
-        "total_revenue": total_revenue_val,
-        "total_expenses": total_expenses_val,
-        "net_profit": total_revenue_val - total_expenses_val,
-        "bank_balance": total_revenue_val - total_expenses_val,
+        "total_revenue": total_revenue_usd,
+        "total_expenses": total_expenses_usd,
+        "net_profit": total_revenue_usd - total_expenses_usd,
+        "bank_balance": total_revenue_usd - total_expenses_usd,
         "cash_on_hand": 0.0,
         "unpaid_invoices": unpaid_invoices_count,
+        "total_revenue_inr": total_revenue_inr,
+        "total_expenses_inr": total_expenses_inr,
+        "net_profit_inr": total_revenue_inr - total_expenses_inr,
+        "bank_balance_inr": total_revenue_inr - total_expenses_inr,
+        "cash_on_hand_inr": 0.0,
     }
     
     recent_transactions = list(db.transactions.aggregate([
@@ -2080,17 +2126,50 @@ def api_settings_company():
         return jsonify(json_ready(json.loads(setting["value"])))
     return jsonify(json_ready({}))
 
+def convert_to_usd(amount, currency, date_str, inr_rate, setting):
+    amount = float(amount or 0.0)
+    if not currency or currency == "USD":
+        return amount
+    
+    # Determine the rate for the transaction date (monthly override support)
+    month = date_str[:7] if date_str and len(date_str) >= 7 else ""
+    current_rate = inr_rate
+    if month and setting and setting.get("value"):
+        try:
+            rates_data = json.loads(setting["value"])
+            monthly_rates = rates_data.get("INR", {}).get("monthly", {})
+            if month in monthly_rates:
+                current_rate = monthly_rates[month]
+        except Exception:
+            pass
+            
+    if currency == "INR":
+        return amount / current_rate
+    else:
+        # Fallback for EUR/GBP
+        return amount / current_rate
+
+
 @app.route("/api/finance/reports/general-ledger")
 def api_gl_report():
     require_finance_access()
     db = get_db()
-    query = {}
     
     account_id = request.args.get("account_id")
     start_date = request.args.get("start_date")
     end_date = request.args.get("end_date")
     
-    # 1. Compute opening balance of previous transactions
+    # Load exchange rates
+    inr_rate = 95.0
+    setting = db.system_settings.find_one({"key_name": "exchange_rates"})
+    if setting and setting.get("value"):
+        try:
+            rates_data = json.loads(setting["value"])
+            inr_rate = rates_data.get("INR", {}).get("default", 95.0)
+        except Exception:
+            pass
+
+    # 1. Compute opening balance of previous transactions (normalized to USD)
     opening_balance = 0.0
     if start_date:
         opening_query = {"date": {"$lt": start_date}, "status": {"$ne": "Reversed"}}
@@ -2100,10 +2179,14 @@ def api_gl_report():
         opening_txns = list(db.transactions.find(opening_query))
         for t in opening_txns:
             amt = float(t.get("total_amount") or t.get("amount") or 0.0)
+            currency = t.get("currency", "USD")
+            txn_date = t.get("transaction_date") or t.get("date")
+            amt_usd = convert_to_usd(amt, currency, txn_date, inr_rate, setting)
+            
             if t.get("type") == "Income":
-                opening_balance += amt
+                opening_balance += amt_usd
             else:
-                opening_balance -= amt
+                opening_balance -= amt_usd
                 
     # 2. Fetch period transactions
     period_query = {"status": {"$ne": "Reversed"}}
@@ -2137,7 +2220,7 @@ def api_gl_report():
         {"$sort": {"transaction_date": 1}}
     ]))
     
-    # 3. Calculate running balance and debit/credit columns
+    # 3. Calculate running balance and debit/credit columns (normalized to USD)
     entries = []
     running_balance = opening_balance
     total_credits = 0.0
@@ -2145,6 +2228,10 @@ def api_gl_report():
     
     for t in transactions:
         amt = float(t.get("total_amount") or t.get("amount") or 0.0)
+        currency = t.get("currency", "USD")
+        txn_date = t.get("transaction_date") or t.get("date")
+        amt_usd = convert_to_usd(amt, currency, txn_date, inr_rate, setting)
+        
         is_income = t.get("type") == "Income"
         
         debit = None
@@ -2152,12 +2239,12 @@ def api_gl_report():
         
         if is_income:
             credit = amt
-            total_credits += amt
-            running_balance += amt
+            total_credits += amt_usd
+            running_balance += amt_usd
         else:
             debit = amt
-            total_debits += amt
-            running_balance -= amt
+            total_debits += amt_usd
+            running_balance -= amt_usd
             
         t["debit"] = debit
         t["credit"] = credit
@@ -2181,8 +2268,26 @@ def api_settings_currencies():
 
 @app.route("/api/settings/exchange-rates", methods=["GET", "POST"])
 def api_settings_exchange_rates():
-    # Skip exchange rates for now
-    return jsonify({"success": True})
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json()
+        db.system_settings.update_one(
+            {"key_name": "exchange_rates"},
+            {"$set": {"value": json.dumps(data)}},
+            upsert=True
+        )
+        return jsonify({"success": True})
+        
+    setting = db.system_settings.find_one({"key_name": "exchange_rates"})
+    if setting and setting.get("value"):
+        return jsonify(json_ready(json.loads(setting["value"])))
+        
+    return jsonify({
+        "INR": {
+            "default": 95.0,
+            "monthly": {}
+        }
+    })
 
 @app.route("/api/treasury/dashboard", methods=["GET"])
 def api_treasury_dashboard():
