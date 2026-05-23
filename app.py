@@ -557,6 +557,92 @@ def log_treasury_action(user_id, action, details=""):
     })
 
 
+def get_settled_revenue_ids(db):
+    return [
+        doc["id"]
+        for doc in db.treasury_revenue.find({"is_settled": True}, {"id": 1, "_id": 0})
+    ]
+
+
+def reserve_balance_payout_clause(settled_revenue_ids):
+    """Match treasury payouts that count toward the company reserve balance."""
+    return {
+        "$or": [
+            {"revenue_id": {"$exists": False}},
+            {"revenue_id": None},
+            {"revenue_id": {"$in": settled_revenue_ids}},
+        ]
+    }
+
+
+def purge_unsettled_revenue_payouts(db):
+    """Remove ledger payouts for revenue that has not been settled yet."""
+    unsettled_ids = [
+        doc["id"]
+        for doc in db.treasury_revenue.find({"is_settled": {"$ne": True}}, {"id": 1, "_id": 0})
+    ]
+    if unsettled_ids:
+        db.treasury_payouts.delete_many({"revenue_id": {"$in": unsettled_ids}})
+
+
+def normalize_stakeholder_flow_payouts(db):
+    """Reclassify stakeholder splits on company expenses as contributions, not earnings."""
+    expense_rev_ids = [
+        doc["id"]
+        for doc in db.treasury_revenue.find({"amount": {"$lt": 0}}, {"id": 1, "_id": 0})
+    ]
+    if expense_rev_ids:
+        db.treasury_payouts.update_many(
+            {
+                "revenue_id": {"$in": expense_rev_ids},
+                "payout_type": "Stakeholder",
+            },
+            {"$set": {"payout_type": "Stakeholder Contribution", "status": "Received"}},
+        )
+
+
+def _format_pct(value):
+    rounded = round(float(value), 2)
+    return int(rounded) if rounded == int(rounded) else rounded
+
+
+def format_stakeholder_audit_details(old_doc, new_data):
+    """Build human-readable audit text for stakeholder create/update."""
+    name = new_data.get("name") or old_doc.get("name", "Unknown")
+    parts = [f"Owner: {name}"]
+
+    if old_doc:
+        old_name = old_doc.get("name", "")
+        new_name = new_data.get("name", "")
+        if old_name != new_name:
+            parts.append(f"name changed '{old_name}' → '{new_name}'")
+
+        old_pct = float(old_doc.get("payout_percentage", old_doc.get("equity_percentage", 0)))
+        new_pct = float(new_data.get("payout_percentage", 0))
+        if old_pct != new_pct:
+            parts.append(f"equity % changed {_format_pct(old_pct)}% → {_format_pct(new_pct)}%")
+
+        old_active = bool(old_doc.get("is_active", True))
+        new_active = bool(new_data.get("is_active", True))
+        if old_active != new_active:
+            parts.append(f"status changed to {'Active' if new_active else 'Inactive'}")
+
+        old_details = (old_doc.get("payment_details") or "").strip()
+        new_details = (new_data.get("payment_details") or "").strip()
+        if old_details != new_details:
+            parts.append("payment/bank details updated")
+    else:
+        pct = float(new_data.get("payout_percentage", 0))
+        parts.append(f"equity {_format_pct(pct)}%")
+        parts.append("Active" if new_data.get("is_active", True) else "Inactive")
+        if (new_data.get("payment_details") or "").strip():
+            parts.append("payment details provided")
+
+    if len(parts) == 1:
+        parts.append("no field changes detected")
+    return "; ".join(parts)
+
+
 import threading
 
 def _perform_log_activity(module_name, entity_name, record_id, action_type, old_data, new_data, reference_number, source_screen, user_id, user_name):
@@ -2293,55 +2379,63 @@ def api_settings_exchange_rates():
 def api_treasury_dashboard():
     user = require_treasury_access()
     db = get_db()
+    purge_unsettled_revenue_payouts(db)
+    normalize_stakeholder_flow_payouts(db)
     
-    # 1. Total revenue
-    total_rev_doc = list(db.treasury_revenue.aggregate([{"$group": {"_id": None, "total": {"$sum": "$amount"}}}]))
-    total_revenue = total_rev_doc[0]["total"] if total_rev_doc else 0.0
-    
-    # 2. Reserve Fund Accumulated
+    # 1. Reserve Fund — only settled revenue allocations (+ manual reserve expenses)
+    settled_revenue_ids = get_settled_revenue_ids(db)
+    reserve_balance_match = reserve_balance_payout_clause(settled_revenue_ids)
+
     reserve_acc_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Reserve Fund"}},
+        {"$match": {"payout_type": "Reserve Fund", **reserve_balance_match}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     reserve_accumulated = reserve_acc_doc[0]["total"] if reserve_acc_doc else 0.0
-    
-    # 3. Reserve Fund Spent
+
     reserve_spent_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Reserve Expense"}},
+        {"$match": {"payout_type": "Reserve Expense", **reserve_balance_match}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     reserve_spent = reserve_spent_doc[0]["total"] if reserve_spent_doc else 0.0
-    
+
     reserve_available = reserve_accumulated - reserve_spent
+
+    # 2. Shared revenue = owner earnings + channel partner payouts (settled only; not contributions)
+    shared_revenue_doc = list(db.treasury_payouts.aggregate([
+        {"$match": {"payout_type": {"$in": ["Stakeholder", "Channel Partner"]}, **reserve_balance_match}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]))
+    shared_revenue = shared_revenue_doc[0]["total"] if shared_revenue_doc else 0.0
     
-    # 4. Partner Payouts
+    # 3. Partner Payouts (settled revenue only)
     partner_paid_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Channel Partner", "status": "Paid"}},
+        {"$match": {"payout_type": "Channel Partner", "status": "Paid", **reserve_balance_match}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     partner_paid = partner_paid_doc[0]["total"] if partner_paid_doc else 0.0
     
     partner_pending_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Channel Partner", "status": "Pending"}},
+        {"$match": {"payout_type": "Channel Partner", "status": "Pending", **reserve_balance_match}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     partner_pending = partner_pending_doc[0]["total"] if partner_pending_doc else 0.0
     
-    # 5. Stakeholder Payouts
+    # 4. Stakeholder Payouts (settled revenue only)
     stakeholder_paid_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Stakeholder", "status": "Paid"}},
+        {"$match": {"payout_type": "Stakeholder", "status": "Paid", **reserve_balance_match}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     stakeholder_paid = stakeholder_paid_doc[0]["total"] if stakeholder_paid_doc else 0.0
     
     stakeholder_pending_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Stakeholder", "status": "Pending"}},
+        {"$match": {"payout_type": "Stakeholder", "status": "Pending", **reserve_balance_match}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     stakeholder_pending = stakeholder_pending_doc[0]["total"] if stakeholder_pending_doc else 0.0
     
-    # 6. Recent Payouts
+    # 5. Recent Payouts (settled revenue + manual reserve expenses)
     recent_payouts = list(db.treasury_payouts.aggregate([
+        {"$match": reserve_balance_match},
         {"$lookup": {"from": "treasury_stakeholders", "localField": "stakeholder_id", "foreignField": "id", "as": "stk"}},
         {"$unwind": {"path": "$stk", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "treasury_partners", "localField": "partner_id", "foreignField": "id", "as": "part"}},
@@ -2356,7 +2450,7 @@ def api_treasury_dashboard():
     ]))
     
     return jsonify(json_ready({
-        "total_revenue": total_revenue,
+        "shared_revenue": shared_revenue,
         "reserve_accumulated": reserve_accumulated,
         "reserve_spent": reserve_spent,
         "reserve_available": reserve_available,
@@ -2371,36 +2465,50 @@ def api_treasury_dashboard():
 def api_treasury_payment_stats():
     user = require_treasury_access()
     db = get_db()
+    purge_unsettled_revenue_payouts(db)
+    normalize_stakeholder_flow_payouts(db)
+    settled_revenue_ids = get_settled_revenue_ids(db)
+    reserve_balance_match = reserve_balance_payout_clause(settled_revenue_ids)
     
     # 1. Fetch Stakeholders and calculate their metrics
     stk_list = []
     stakeholders = list(db.treasury_stakeholders.find({}))
     for s in stakeholders:
         sid = s.get("id")
-        paid_amt = 0.0
-        pending_amt = 0.0
+        earned_paid = 0.0
+        earned_pending = 0.0
+        contributed_amt = 0.0
         
-        # Aggregate paid
-        paid_doc = list(db.treasury_payouts.aggregate([
-            {"$match": {"payout_type": "Stakeholder", "stakeholder_id": sid, "status": "Paid"}},
+        earned_paid_doc = list(db.treasury_payouts.aggregate([
+            {"$match": {"payout_type": "Stakeholder", "stakeholder_id": sid, "status": "Paid", **reserve_balance_match}},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
         ]))
-        if paid_doc: paid_amt = paid_doc[0]["total"]
+        if earned_paid_doc:
+            earned_paid = earned_paid_doc[0]["total"]
         
-        # Aggregate pending
-        pending_doc = list(db.treasury_payouts.aggregate([
-            {"$match": {"payout_type": "Stakeholder", "stakeholder_id": sid, "status": "Pending"}},
+        earned_pending_doc = list(db.treasury_payouts.aggregate([
+            {"$match": {"payout_type": "Stakeholder", "stakeholder_id": sid, "status": "Pending", **reserve_balance_match}},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
         ]))
-        if pending_doc: pending_amt = pending_doc[0]["total"]
+        if earned_pending_doc:
+            earned_pending = earned_pending_doc[0]["total"]
+        
+        contrib_doc = list(db.treasury_payouts.aggregate([
+            {"$match": {"payout_type": "Stakeholder Contribution", "stakeholder_id": sid, **reserve_balance_match}},
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
+        ]))
+        if contrib_doc:
+            contributed_amt = contrib_doc[0]["total"]
         
         stk_list.append({
             "id": sid,
             "name": s.get("name"),
             "payout_percentage": s.get("payout_percentage"),
             "is_active": s.get("is_active"),
-            "paid_amount": paid_amt,
-            "pending_amount": pending_amt
+            "paid_amount": earned_paid,
+            "pending_amount": earned_pending,
+            "contributed_amount": contributed_amt,
+            "earned_from_company": earned_paid + earned_pending,
         })
         
     # 2. Fetch Channel Partners and calculate their metrics
@@ -2413,14 +2521,14 @@ def api_treasury_payment_stats():
         
         # Aggregate paid
         paid_doc = list(db.treasury_payouts.aggregate([
-            {"$match": {"payout_type": "Channel Partner", "partner_id": pid, "status": "Paid"}},
+            {"$match": {"payout_type": "Channel Partner", "partner_id": pid, "status": "Paid", **reserve_balance_match}},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
         ]))
         if paid_doc: paid_amt = paid_doc[0]["total"]
         
         # Aggregate pending
         pending_doc = list(db.treasury_payouts.aggregate([
-            {"$match": {"payout_type": "Channel Partner", "partner_id": pid, "status": "Pending"}},
+            {"$match": {"payout_type": "Channel Partner", "partner_id": pid, "status": "Pending", **reserve_balance_match}},
             {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
         ]))
         if pending_doc: pending_amt = pending_doc[0]["total"]
@@ -2435,9 +2543,9 @@ def api_treasury_payment_stats():
             "pending_amount": pending_amt
         })
         
-    # 3. Reserve Ledger
+    # 3. Reserve Ledger (settled allocations + manual reserve expenses only)
     reserve_ledger = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": {"$in": ["Reserve Fund", "Reserve Expense"]}}},
+        {"$match": {"payout_type": {"$in": ["Reserve Fund", "Reserve Expense"]}, **reserve_balance_match}},
         {"$lookup": {"from": "treasury_revenue", "localField": "revenue_id", "foreignField": "id", "as": "rev"}},
         {"$unwind": {"path": "$rev", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
@@ -2493,12 +2601,25 @@ def api_treasury_stakeholder_settle(sid):
     user = require_treasury_access()
     db = get_db()
     
+    stk = db.treasury_stakeholders.find_one({"id": sid}, {"_id": 0, "name": 1})
+    stk_name = stk.get("name") if stk else f"ID {sid}"
+    
+    pending_doc = list(db.treasury_payouts.aggregate([
+        {"$match": {"payout_type": "Stakeholder", "stakeholder_id": sid, "status": "Pending", **reserve_balance_payout_clause(get_settled_revenue_ids(db))}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]))
+    pending_total = pending_doc[0]["total"] if pending_doc else 0.0
+    
     db.treasury_payouts.update_many(
         {"payout_type": "Stakeholder", "stakeholder_id": sid, "status": "Pending"},
         {"$set": {"status": "Paid"}}
     )
     
-    log_treasury_action(user["id"], "Stakeholder Settled", f"Stakeholder ID {sid} pending payouts marked as Paid.")
+    log_treasury_action(
+        user["id"],
+        "Owner Earnings Settled",
+        f"Marked ₹{pending_total:.2f} pending earnings as Paid for {stk_name}.",
+    )
     return jsonify({"ok": True})
 
 @app.route("/api/treasury/partners/<int:pid>/settle", methods=["POST"])
@@ -2533,7 +2654,11 @@ def api_treasury_stakeholders():
             "is_active": data.get("is_active", True),
             "created_at": datetime.now()
         })
-        log_treasury_action(user["id"], "Added Stakeholder", f"Created stakeholder {data.get('name')}")
+        log_treasury_action(
+            user["id"],
+            "Added Company Owner",
+            format_stakeholder_audit_details(None, data),
+        )
         return jsonify({"ok": True})
         
     stakeholders = list(db.treasury_stakeholders.find({}, {"_id": 0}))
@@ -2545,6 +2670,10 @@ def api_treasury_stakeholder_detail(sid):
     db = get_db()
     data = request.get_json() or {}
     
+    old_doc = db.treasury_stakeholders.find_one({"id": sid}, {"_id": 0})
+    if not old_doc:
+        return jsonify({"error": "Stakeholder not found."}), 404
+
     payout_pct = float(data.get("payout_percentage", 0))
     db.treasury_stakeholders.update_one(
         {"id": sid},
@@ -2556,7 +2685,11 @@ def api_treasury_stakeholder_detail(sid):
             "is_active": data.get("is_active", True)
         }}
     )
-    log_treasury_action(user["id"], "Updated Stakeholder", f"Updated stakeholder ID {sid}")
+    log_treasury_action(
+        user["id"],
+        "Updated Company Owner",
+        format_stakeholder_audit_details(old_doc, data),
+    )
     return jsonify({"ok": True})
 
 @app.route("/api/treasury/channel-partners", methods=["GET", "POST"])
@@ -2658,60 +2791,18 @@ def api_treasury_revenue():
             "partner_commission": partner_commission,
             "stakeholder_total": stakeholder_total,
             "description": description,
+            "is_settled": False,
             "created_at": datetime.now()
         })
-        
-        # Insert payouts
-        # 1. Reserve Fund allocation
-        db.treasury_payouts.insert_one({
-            "id": get_next_sequence_value("treasury_payouts"),
-            "revenue_id": rev_id,
-            "payout_type": "Reserve Fund",
-            "amount": reserve_amount,
-            "status": "Completed",
-            "payout_date": entry_date,
-            "description": f"Reserve fund split allocation for REV-{rev_id}",
-            "created_at": datetime.now()
-        })
-        
-        # 2. Channel Partner Commission payout
-        if channel_partner_id and partner_commission > 0:
-            db.treasury_payouts.insert_one({
-                "id": get_next_sequence_value("treasury_payouts"),
-                "revenue_id": rev_id,
-                "payout_type": "Channel Partner",
-                "partner_id": channel_partner_id,
-                "amount": partner_commission,
-                "status": "Pending",
-                "payout_date": entry_date,
-                "description": f"Commission payout for Channel Partner ID {channel_partner_id}",
-                "created_at": datetime.now()
-            })
-            
-        # 3. Active Stakeholder distributions
-        active_stks = list(db.treasury_stakeholders.find({"is_active": True}))
-        for s in active_stks:
-            pct = float(s.get("payout_percentage", 0))
-            share = stakeholder_total * (pct / 100.0)
-            if share > 0:
-                db.treasury_payouts.insert_one({
-                    "id": get_next_sequence_value("treasury_payouts"),
-                    "revenue_id": rev_id,
-                    "payout_type": "Stakeholder",
-                    "stakeholder_id": s.get("id"),
-                    "amount": share,
-                    "status": "Pending",
-                    "payout_date": entry_date,
-                    "description": f"Equity distribution share ({pct}%) for Stakeholder {s.get('name')}",
-                    "created_at": datetime.now()
-                })
                 
-        log_treasury_action(user["id"], "Logged Revenue", f"Recorded shared revenue split of {amount} as REV-{rev_id}.")
+        log_treasury_action(user["id"], "Logged Revenue", f"Recorded revenue entry {revenue_id_str} (pending settlement).")
         return jsonify({"ok": True})
         
+    purge_unsettled_revenue_payouts(db)
+    normalize_stakeholder_flow_payouts(db)
+
     # Auto-sync ledger transactions from db.transactions (only active ones, not Reversed)
     all_txns = list(db.transactions.find({"status": {"$ne": "Reversed"}}))
-    active_stks = list(db.treasury_stakeholders.find({"is_active": True}))
     
     for t in all_txns:
         existing = db.treasury_revenue.find_one({"transaction_id": t["id"]})
@@ -2761,39 +2852,9 @@ def api_treasury_revenue():
                 "partner_commission": partner_commission,
                 "stakeholder_total": stakeholder_total,
                 "description": t.get("description") or f"Auto-flow from Transaction Ledger #{t['id']}",
+                "is_settled": False,
                 "created_at": datetime.now()
             })
-            
-            # Payouts
-            # 1. Reserve split
-            db.treasury_payouts.insert_one({
-                "id": get_next_sequence_value("treasury_payouts"),
-                "revenue_id": rev_id,
-                "payout_type": "Reserve Expense" if is_expense else "Reserve Fund",
-                "amount": abs(reserve_amount),
-                "status": "Paid" if is_expense else "Completed",
-                "payout_date": entry_date,
-                "description": f"Reserve fund split allocation for transaction #{t['id']}",
-                "created_at": datetime.now()
-            })
-            
-            # 2. Stakeholder split (only for Income)
-            if not is_expense:
-                for s in active_stks:
-                    pct = float(s.get("payout_percentage", 0))
-                    share = stakeholder_total * (pct / 100.0)
-                    if share > 0:
-                        db.treasury_payouts.insert_one({
-                            "id": get_next_sequence_value("treasury_payouts"),
-                            "revenue_id": rev_id,
-                            "payout_type": "Stakeholder",
-                            "stakeholder_id": s.get("id"),
-                            "amount": share,
-                            "status": "Pending",
-                            "payout_date": entry_date,
-                            "description": f"Equity distribution share ({pct}%) for Stakeholder {s.get('name')}",
-                            "created_at": datetime.now()
-                        })
                         
     revenues = list(db.treasury_revenue.aggregate([
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
@@ -2813,6 +2874,9 @@ def api_treasury_revenue_update(revenue_id):
     rev = db.treasury_revenue.find_one({"id": revenue_id})
     if not rev:
         return jsonify({"error": "Revenue split record not found."}), 404
+
+    if rev.get("is_settled"):
+        return jsonify({"error": "This revenue entry is settled and cannot be edited."}), 403
         
     amount = float(rev.get("amount", 0.0))
     entry_date = rev.get("entry_date", datetime.now().strftime("%Y-%m-%d"))
@@ -2821,13 +2885,19 @@ def api_treasury_revenue_update(revenue_id):
     channel_partner_id = data.get("channel_partner_id")
     if channel_partner_id: channel_partner_id = int(channel_partner_id)
     
-    partner_commission_percentage = float(data.get("partner_commission_percentage", 0.0))
+    partner_commission_percentage = float(data.get("partner_commission_percentage", 0.0)) if channel_partner_id else 0.0
+    stk_splits = data.get("stakeholders", [])
+    stakeholder_pct_sum = sum(float(s.get("percentage", 0)) for s in stk_splits)
+    total_split_pct = reserve_percentage + partner_commission_percentage + stakeholder_pct_sum
+    if abs(total_split_pct - 100.0) > 0.01:
+        return jsonify({"error": "Split percentages must sum to exactly 100% before settlement."}), 400
+
     partner_commission = amount * (partner_commission_percentage / 100.0) if channel_partner_id else 0.0
     
     reserve_amount = amount * (reserve_percentage / 100.0)
     stakeholder_total = amount - reserve_amount - partner_commission
     
-    # Update revenue document
+    # Update revenue document and mark settled (100% split confirmed)
     db.treasury_revenue.update_one(
         {"id": revenue_id},
         {"$set": {
@@ -2835,7 +2905,10 @@ def api_treasury_revenue_update(revenue_id):
             "reserve_amount": reserve_amount,
             "channel_partner_id": channel_partner_id,
             "partner_commission": partner_commission,
-            "stakeholder_total": stakeholder_total
+            "stakeholder_total": stakeholder_total,
+            "is_settled": True,
+            "settled_at": datetime.now(),
+            "settled_by": user["id"],
         }}
     )
     
@@ -2852,7 +2925,7 @@ def api_treasury_revenue_update(revenue_id):
         "amount": abs(reserve_amount),
         "status": "Paid" if is_neg else "Completed",
         "payout_date": entry_date,
-        "description": f"Reserve fund split allocation for REV-{revenue_id} (Updated)",
+        "description": f"Reserve fund split allocation for REV-{revenue_id}",
         "created_at": datetime.now()
     })
     
@@ -2866,17 +2939,33 @@ def api_treasury_revenue_update(revenue_id):
             "amount": abs(partner_commission),
             "status": "Pending",
             "payout_date": entry_date,
-            "description": f"Commission payout for Channel Partner ID {channel_partner_id} (Updated)",
+            "description": f"Commission payout for Channel Partner ID {channel_partner_id}",
             "created_at": datetime.now()
         })
         
-    # 3. Custom Stakeholder distributions from payload
-    stk_splits = data.get("stakeholders", [])
+    # 3. Owner splits — contributions on expenses, earnings on income
+    is_company_expense = amount < 0
     for stk_split in stk_splits:
         sid = int(stk_split["id"])
         pct = float(stk_split.get("percentage", 0))
         share = amount * (pct / 100.0)
-        if abs(share) > 0:
+        if abs(share) <= 0:
+            continue
+        stk = db.treasury_stakeholders.find_one({"id": sid}, {"_id": 0, "name": 1})
+        stk_name = stk.get("name") if stk else f"Owner ID {sid}"
+        if is_company_expense:
+            db.treasury_payouts.insert_one({
+                "id": get_next_sequence_value("treasury_payouts"),
+                "revenue_id": revenue_id,
+                "payout_type": "Stakeholder Contribution",
+                "stakeholder_id": sid,
+                "amount": abs(share),
+                "status": "Received",
+                "payout_date": entry_date,
+                "description": f"{stk_name} contributed {_format_pct(pct)}% (₹{abs(share):.2f}) toward company expense REV-{revenue_id}",
+                "created_at": datetime.now()
+            })
+        else:
             db.treasury_payouts.insert_one({
                 "id": get_next_sequence_value("treasury_payouts"),
                 "revenue_id": revenue_id,
@@ -2885,19 +2974,29 @@ def api_treasury_revenue_update(revenue_id):
                 "amount": abs(share),
                 "status": "Pending",
                 "payout_date": entry_date,
-                "description": f"Equity distribution share ({pct}%) for Stakeholder ID {sid} (Updated)",
+                "description": f"{stk_name} earning {_format_pct(pct)}% (₹{abs(share):.2f}) from REV-{revenue_id}",
                 "created_at": datetime.now()
             })
             
-    log_treasury_action(user["id"], "Updated Payout Splits", f"Recalculated split allocations for REV-{revenue_id}.")
-    return jsonify({"ok": True})
+    entry_kind = "company expense (owner contributions)" if is_company_expense else "shared revenue (owner earnings)"
+    log_treasury_action(
+        user["id"],
+        "Revenue Settled",
+        f"Finalized 100% split for REV-{revenue_id} as {entry_kind}. Entry is locked.",
+    )
+    return jsonify({"ok": True, "is_settled": True})
 
 @app.route("/api/treasury/payouts", methods=["GET"])
 def api_treasury_payouts():
     user = require_treasury_access()
     db = get_db()
+    purge_unsettled_revenue_payouts(db)
+    normalize_stakeholder_flow_payouts(db)
+    settled_revenue_ids = get_settled_revenue_ids(db)
+    reserve_balance_match = reserve_balance_payout_clause(settled_revenue_ids)
     
     payouts = list(db.treasury_payouts.aggregate([
+        {"$match": reserve_balance_match},
         {"$lookup": {"from": "treasury_revenue", "localField": "revenue_id", "foreignField": "id", "as": "rev"}},
         {"$unwind": {"path": "$rev", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "projects", "localField": "rev.project_id", "foreignField": "id", "as": "proj"}},
