@@ -1,15 +1,19 @@
 import json
 import os
 import re
+from base64 import urlsafe_b64encode
 from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
+from hashlib import sha256
 
 import pymongo
+from cryptography.fernet import Fernet, InvalidToken
 from pymongo.errors import ConnectionFailure
 from dotenv import load_dotenv
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
 from flask_cors import CORS
+from itsdangerous import BadSignature, URLSafeSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.local import LocalProxy
 
@@ -68,6 +72,15 @@ def health_check():
         "database": db_status
     })
 
+
+VAULT_CATEGORIES = [
+    "Client Credential",
+    "Company Credential",
+    "Infrastructure",
+    "Finance & Banking",
+    "Vendor / Partner",
+    "Other",
+]
 
 CUSTOMER_STATUSES = ["Lead", "Active", "Inactive"]
 OPPORTUNITY_STAGES = ["Draft", "Discussion", "Commercial negotiation", "Contractual negotiation", "DA Signed", "Lost to competitor", "Rejected by SC", "Lost"]
@@ -391,6 +404,7 @@ def init_database():
             "is_active": 1,
             "has_treasury_access": 1,
             "has_finance_access": 1,
+            "has_vault_access": 1,
             "created_at": datetime.now()
         })
     else:
@@ -398,12 +412,23 @@ def init_database():
         admin = db.app_users.find_one({"email": "system.administrator@swarajyaconsultancy.in"})
         if not admin.get("password_hash"):
             db.app_users.update_one({"_id": admin["_id"]}, {"$set": {"password_hash": generate_password_hash("change123")}})
+        db.app_users.update_one(
+            {"_id": admin["_id"]},
+            {"$set": {"has_treasury_access": 1, "has_finance_access": 1, "has_vault_access": 1}},
+        )
+
+    # Backfill module access flags for databases created before these modules existed.
+    db.app_users.update_many({"has_treasury_access": {"$exists": False}}, {"$set": {"has_treasury_access": 0}})
+    db.app_users.update_many({"has_finance_access": {"$exists": False}}, {"$set": {"has_finance_access": 0}})
+    db.app_users.update_many({"has_vault_access": {"$exists": False}}, {"$set": {"has_vault_access": 0}})
 
     # Indexes
     db.app_users.create_index("email", unique=True)
     db.invoices.create_index("invoice_number", unique=True)
     db.treasury_revenue.create_index("revenue_id", unique=True)
     db.custom_objects.create_index("api_name", unique=True)
+    db.vault_entries.create_index("category")
+    db.vault_entries.create_index("title")
 
 
 @app.template_filter("date_or_dash")
@@ -466,14 +491,16 @@ def api_auth_login():
         
         role = db.roles.find_one({"id": user.get("role_id")})
         role_name = role["name"] if role else "Standard"
+        is_admin = role_name in ["Admin", "System Administrator"]
         
         user_data = {
             "id": user["id"],
             "full_name": user.get("full_name"),
             "email": user.get("email"),
             "role_name": role_name,
-            "has_treasury_access": user.get("has_treasury_access", 0),
-            "has_finance_access": user.get("has_finance_access", 0),
+            "has_treasury_access": 1 if is_admin else user.get("has_treasury_access", 0),
+            "has_finance_access": 1 if is_admin else user.get("has_finance_access", 0),
+            "has_vault_access": 1 if is_admin else user.get("has_vault_access", 0),
             "requires_password_change": bool(user.get("requires_password_change", False))
         }
         return jsonify({"user": user_data})
@@ -538,6 +565,83 @@ def require_finance_access():
     if not user or not user.get("has_finance_access"):
         abort(403)
     return user
+
+
+def require_vault_access():
+    if "user_id" not in session:
+        abort(401)
+    db = get_db()
+    user = db.app_users.find_one({"id": session["user_id"]})
+    role = db.roles.find_one({"id": user.get("role_id")}) if user else None
+    is_admin = role and role.get("name") in ["Admin", "System Administrator"]
+    if not user or (not is_admin and not user.get("has_vault_access")):
+        abort(403)
+    return user
+
+
+def require_vault_unlocked():
+    user = require_vault_access()
+    if not user.get("vault_access_code_hash"):
+        return None, (jsonify({"error": "Vault access code is not set for this user."}), 403)
+    if session.get("vault_unlocked_user_id") != user.get("id"):
+        return None, (jsonify({"error": "Vault access code required."}), 423)
+    return user, None
+
+
+def _vault_serializer():
+    secret = app.secret_key or os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
+    return URLSafeSerializer(str(secret), salt="vault-credentials-v1")
+
+
+def _vault_fernet():
+    secret = str(app.secret_key or os.getenv("FLASK_SECRET_KEY", "dev-secret-key"))
+    key = urlsafe_b64encode(sha256(secret.encode("utf-8")).digest())
+    return Fernet(key)
+
+
+def encrypt_vault_secret(value):
+    if value is None or value == "":
+        return ""
+    encrypted = _vault_fernet().encrypt(str(value).encode("utf-8")).decode("utf-8")
+    return f"fernet:{encrypted}"
+
+
+def decrypt_vault_secret(token):
+    if not token:
+        return ""
+    if token.startswith("fernet:"):
+        try:
+            return _vault_fernet().decrypt(token.removeprefix("fernet:").encode("utf-8")).decode("utf-8")
+        except InvalidToken:
+            return ""
+    try:
+        return _vault_serializer().loads(token)
+    except BadSignature:
+        return ""
+
+
+def serialize_vault_entry(doc, include_secrets=False):
+    if not doc:
+        return None
+    entry = {k: v for k, v in doc.items() if k not in ("_id", "password_encrypted")}
+    entry["has_password"] = bool(doc.get("password_encrypted"))
+    if include_secrets:
+        entry["password"] = decrypt_vault_secret(doc.get("password_encrypted", ""))
+    else:
+        entry.pop("password", None)
+    return entry
+
+
+def log_vault_action(user_id, action, details=""):
+    db = get_db()
+    db.vault_logs.insert_one({
+        "id": get_next_sequence_value("vault_logs"),
+        "user_id": user_id,
+        "action": action,
+        "details": details,
+        "created_at": datetime.now(),
+    })
+
 
 def get_current_user():
     """Return the current logged-in user doc, or None if not authenticated."""
@@ -940,6 +1044,9 @@ def api_setup_users():
     db = get_db()
     if request.method == "POST":
         data = request.get_json()
+        vault_access_code = (data.get("vault_access_code") or "").strip()
+        if data.get("has_vault_access") and len(vault_access_code) < 4:
+            return jsonify({"error": "Vault access code must be at least 4 characters."}), 400
         user_id = get_next_sequence_value("app_users")
         db.app_users.insert_one({
             "id": user_id,
@@ -950,6 +1057,8 @@ def api_setup_users():
             "is_active": data.get("is_active", True),
             "has_treasury_access": 1 if data.get("has_treasury_access") else 0,
             "has_finance_access": 1 if data.get("has_finance_access") else 0,
+            "has_vault_access": 1 if data.get("has_vault_access") else 0,
+            "vault_access_code_hash": generate_password_hash(vault_access_code) if vault_access_code else None,
             "requires_password_change": True,
             "created_at": datetime.now()
         })
@@ -958,7 +1067,8 @@ def api_setup_users():
     users = list(db.app_users.aggregate([
         {"$lookup": {"from": "roles", "localField": "role_id", "foreignField": "id", "as": "role"}},
         {"$unwind": {"path": "$role", "preserveNullAndEmptyArrays": True}},
-        {"$project": {"_id": 0, "password_hash": 0}},
+        {"$addFields": {"has_vault_access_code": {"$ne": [{"$ifNull": ["$vault_access_code_hash", None]}, None]}}},
+        {"$project": {"_id": 0, "password_hash": 0, "vault_access_code_hash": 0}},
         {"$addFields": {"role_name": "$role.name"}},
         {"$project": {"role": 0}},
         {"$sort": {"created_at": -1}}
@@ -969,22 +1079,36 @@ def api_setup_users():
 @app.route("/api/setup/users/<int:user_id>", methods=["GET", "PUT"])
 def api_setup_user(user_id):
     db = get_db()
-    user = db.app_users.find_one({"id": user_id}, {"_id": 0})
+    raw_user = db.app_users.find_one({"id": user_id})
+    user = db.app_users.find_one({"id": user_id}, {"_id": 0, "password_hash": 0, "vault_access_code_hash": 0})
     if not user:
         abort(404)
+    user["has_vault_access_code"] = bool(raw_user.get("vault_access_code_hash"))
         
     if request.method == "PUT":
         data = request.get_json()
+        existing_user = db.app_users.find_one({"id": user_id})
+        vault_access_code = (data.get("vault_access_code") or "").strip()
+        has_vault_access = 1 if data.get("has_vault_access") else 0
+        if has_vault_access and not existing_user.get("vault_access_code_hash") and len(vault_access_code) < 4:
+            return jsonify({"error": "Vault access code must be set before enabling Vault access."}), 400
+        if vault_access_code and len(vault_access_code) < 4:
+            return jsonify({"error": "Vault access code must be at least 4 characters."}), 400
         update_data = {
             "full_name": data["full_name"],
             "email": data["email"],
             "role_id": data.get("role_id") or None,
             "is_active": data.get("is_active", True),
             "has_treasury_access": 1 if data.get("has_treasury_access") else 0,
-            "has_finance_access": 1 if data.get("has_finance_access") else 0
+            "has_finance_access": 1 if data.get("has_finance_access") else 0,
+            "has_vault_access": has_vault_access,
         }
         if data.get("password"):
             update_data["password_hash"] = generate_password_hash(data["password"])
+        if vault_access_code:
+            update_data["vault_access_code_hash"] = generate_password_hash(vault_access_code)
+            if session.get("vault_unlocked_user_id") == user_id:
+                session.pop("vault_unlocked_user_id", None)
             
         db.app_users.update_one({"id": user_id}, {"$set": update_data})
         return jsonify({"success": True})
@@ -3045,6 +3169,260 @@ def api_treasury_logs():
         {"$limit": 100}
     ]))
     return jsonify(json_ready({"logs": logs}))
+
+
+@app.route("/api/vault/categories", methods=["GET"])
+def api_vault_categories():
+    require_vault_access()
+    return jsonify(json_ready({"categories": VAULT_CATEGORIES}))
+
+
+@app.route("/api/vault/status", methods=["GET"])
+def api_vault_status():
+    user = require_vault_access()
+    return jsonify({
+        "code_configured": bool(user.get("vault_access_code_hash")),
+        "unlocked": session.get("vault_unlocked_user_id") == user.get("id"),
+    })
+
+
+@app.route("/api/vault/unlock", methods=["POST"])
+def api_vault_unlock():
+    user = require_vault_access()
+    data = request.get_json() or {}
+    access_code = (data.get("access_code") or "").strip()
+    code_hash = user.get("vault_access_code_hash")
+    if not code_hash:
+        return jsonify({"error": "Vault access code is not set for this user."}), 403
+    if not access_code or not check_password_hash(code_hash, access_code):
+        log_vault_action(user["id"], "Failed Unlock", "Incorrect vault access code.")
+        return jsonify({"error": "Invalid vault access code."}), 403
+    session["vault_unlocked_user_id"] = user["id"]
+    log_vault_action(user["id"], "Unlocked Vault", "Vault access code accepted.")
+    log_activity_async(
+        "Vault",
+        "Access",
+        user["id"],
+        "UNLOCK",
+        new_data={"result": "success", "user_id": user["id"], "user_name": user.get("full_name")},
+        reference_number=user.get("email"),
+    )
+    return jsonify({"success": True})
+
+
+@app.route("/api/vault/lock", methods=["POST"])
+def api_vault_lock():
+    require_vault_access()
+    session.pop("vault_unlocked_user_id", None)
+    return jsonify({"success": True})
+
+
+@app.route("/api/vault", methods=["GET", "POST"])
+def api_vault_entries():
+    user, error_response = require_vault_unlocked()
+    if error_response:
+        return error_response
+    db = get_db()
+
+    if request.method == "POST":
+        data = request.get_json() or {}
+        title = (data.get("title") or "").strip()
+        category = (data.get("category") or "Other").strip()
+        if not title:
+            return jsonify({"error": "Title is required."}), 400
+        if category not in VAULT_CATEGORIES:
+            return jsonify({"error": "Invalid category."}), 400
+
+        customer_id = data.get("customer_id")
+        if customer_id in ("", None):
+            customer_id = None
+        else:
+            customer_id = int(customer_id)
+
+        project_id = data.get("project_id")
+        if project_id in ("", None):
+            project_id = None
+        else:
+            project_id = int(project_id)
+
+        entry_id = get_next_sequence_value("vault_entries")
+        now = datetime.now()
+        insert_data = {
+            "id": entry_id,
+            "title": title,
+            "category": category,
+            "login_id": (data.get("login_id") or "").strip(),
+            "password_encrypted": encrypt_vault_secret(data.get("password") or ""),
+            "notes": (data.get("notes") or "").strip(),
+            "url": (data.get("url") or "").strip(),
+            "customer_id": customer_id,
+            "project_id": project_id,
+            "created_by_id": user["id"],
+            "updated_by_id": user["id"],
+            "created_at": now,
+            "updated_at": now,
+        }
+        db.vault_entries.insert_one(insert_data)
+        log_vault_action(user["id"], "Created Credential", f"Added vault entry '{title}' ({category}).")
+        activity_data = {k: v for k, v in insert_data.items() if k != "password_encrypted"}
+        activity_data["has_password"] = bool(insert_data.get("password_encrypted"))
+        log_activity_async("Vault", "Credential", entry_id, "CREATE", new_data=activity_data, reference_number=title)
+        return jsonify({"ok": True, "id": entry_id})
+
+    query = {}
+    category = request.args.get("category")
+    if category and category != "All":
+        query["category"] = category
+    search = (request.args.get("search") or "").strip()
+    if search:
+        query["$or"] = [
+            {"title": {"$regex": search, "$options": "i"}},
+            {"login_id": {"$regex": search, "$options": "i"}},
+            {"notes": {"$regex": search, "$options": "i"}},
+            {"url": {"$regex": search, "$options": "i"}},
+        ]
+
+    entries = list(db.vault_entries.aggregate([
+        {"$match": query},
+        {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
+        {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
+        {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "app_users", "localField": "updated_by_id", "foreignField": "id", "as": "editor"}},
+        {"$unwind": {"path": "$editor", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "customer_name": "$customer.company_name",
+            "project_name": "$project.project_name",
+            "updated_by_name": "$editor.full_name",
+            "has_password": {
+                "$gt": [{"$strLenCP": {"$ifNull": ["$password_encrypted", ""]}}, 0]
+            },
+        }},
+        {"$project": {"customer": 0, "project": 0, "editor": 0, "_id": 0, "password_encrypted": 0}},
+        {"$sort": {"updated_at": -1, "title": 1}},
+    ]))
+
+    category_counts = {
+        doc["_id"]: doc["count"]
+        for doc in db.vault_entries.aggregate([
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}},
+        ])
+    }
+
+    return jsonify(json_ready({
+        "entries": entries,
+        "categories": VAULT_CATEGORIES,
+        "category_counts": category_counts,
+        "total": len(entries),
+    }))
+
+
+@app.route("/api/vault/<int:entry_id>", methods=["GET", "PUT", "DELETE"])
+def api_vault_entry_detail(entry_id):
+    user, error_response = require_vault_unlocked()
+    if error_response:
+        return error_response
+    db = get_db()
+    doc = db.vault_entries.find_one({"id": entry_id})
+    if not doc:
+        return jsonify({"error": "Vault entry not found."}), 404
+
+    if request.method == "GET":
+        reveal = request.args.get("reveal") in ("1", "true", "yes")
+        entry = serialize_vault_entry(doc, include_secrets=reveal)
+        if doc.get("customer_id"):
+            customer = db.customers.find_one({"id": doc["customer_id"]}, {"_id": 0, "id": 1, "company_name": 1})
+            entry["customer_name"] = customer.get("company_name") if customer else None
+        if doc.get("project_id"):
+            project = db.projects.find_one({"id": doc["project_id"]}, {"_id": 0, "id": 1, "project_name": 1})
+            entry["project_name"] = project.get("project_name") if project else None
+        if reveal:
+            log_vault_action(user["id"], "Viewed Credential", f"Revealed password for '{doc.get('title')}'.")
+            log_activity_async(
+                "Vault",
+                "Credential",
+                entry_id,
+                "VIEW_PASSWORD",
+                new_data={
+                    "title": doc.get("title"),
+                    "category": doc.get("category"),
+                    "viewed_password": True,
+                    "customer_id": doc.get("customer_id"),
+                    "project_id": doc.get("project_id"),
+                },
+                reference_number=doc.get("title"),
+            )
+        return jsonify(json_ready({"entry": entry}))
+
+    if request.method == "DELETE":
+        db.vault_entries.delete_one({"id": entry_id})
+        log_vault_action(user["id"], "Deleted Credential", f"Removed vault entry '{doc.get('title')}'.")
+        old_data = {k: v for k, v in doc.items() if k not in ("_id", "password_encrypted")}
+        old_data["has_password"] = bool(doc.get("password_encrypted"))
+        log_activity_async("Vault", "Credential", entry_id, "DELETE", old_data=old_data, reference_number=doc.get("title"))
+        return jsonify({"ok": True})
+
+    data = request.get_json() or {}
+    title = (data.get("title") or doc.get("title") or "").strip()
+    category = (data.get("category") or doc.get("category") or "Other").strip()
+    if not title:
+        return jsonify({"error": "Title is required."}), 400
+    if category not in VAULT_CATEGORIES:
+        return jsonify({"error": "Invalid category."}), 400
+
+    customer_id = data.get("customer_id", doc.get("customer_id"))
+    if customer_id in ("", None):
+        customer_id = None
+    elif customer_id is not None:
+        customer_id = int(customer_id)
+
+    project_id = data.get("project_id", doc.get("project_id"))
+    if project_id in ("", None):
+        project_id = None
+    elif project_id is not None:
+        project_id = int(project_id)
+
+    update_fields = {
+        "title": title,
+        "category": category,
+        "login_id": (data.get("login_id") if "login_id" in data else doc.get("login_id") or "").strip(),
+        "notes": (data.get("notes") if "notes" in data else doc.get("notes") or "").strip(),
+        "url": (data.get("url") if "url" in data else doc.get("url") or "").strip(),
+        "customer_id": customer_id,
+        "project_id": project_id,
+        "updated_by_id": user["id"],
+        "updated_at": datetime.now(),
+    }
+    if "password" in data:
+        update_fields["password_encrypted"] = encrypt_vault_secret(data.get("password") or "")
+
+    db.vault_entries.update_one({"id": entry_id}, {"$set": update_fields})
+    log_vault_action(user["id"], "Updated Credential", f"Updated vault entry '{title}' ({category}).")
+    old_data = {k: v for k, v in doc.items() if k not in ("_id", "password_encrypted")}
+    old_data["has_password"] = bool(doc.get("password_encrypted"))
+    new_doc = db.vault_entries.find_one({"id": entry_id})
+    new_data = {k: v for k, v in new_doc.items() if k not in ("_id", "password_encrypted")}
+    new_data["has_password"] = bool(new_doc.get("password_encrypted"))
+    log_activity_async("Vault", "Credential", entry_id, "UPDATE", old_data=old_data, new_data=new_data, reference_number=title)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/vault/logs", methods=["GET"])
+def api_vault_logs():
+    user, error_response = require_vault_unlocked()
+    if error_response:
+        return error_response
+    db = get_db()
+    logs = list(db.vault_logs.aggregate([
+        {"$lookup": {"from": "app_users", "localField": "user_id", "foreignField": "id", "as": "user"}},
+        {"$unwind": {"path": "$user", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {"user_name": "$user.full_name"}},
+        {"$project": {"user": 0, "_id": 0}},
+        {"$sort": {"created_at": -1}},
+        {"$limit": 100},
+    ]))
+    return jsonify(json_ready({"logs": logs}))
+
 
 if __name__ == "__main__":
     app.run(debug=True)

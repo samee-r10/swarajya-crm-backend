@@ -14,6 +14,10 @@ CREATE TABLE IF NOT EXISTS app_users (
     password_hash VARCHAR(255) NOT NULL,
     role_id INT,
     is_active TINYINT(1) NOT NULL DEFAULT 1,
+    has_treasury_access TINYINT(1) NOT NULL DEFAULT 0,
+    has_finance_access TINYINT(1) NOT NULL DEFAULT 0,
+    has_vault_access TINYINT(1) NOT NULL DEFAULT 0,
+    vault_access_code_hash VARCHAR(255),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_app_users_role
         FOREIGN KEY (role_id) REFERENCES roles(id)
