@@ -70,7 +70,7 @@ def health_check():
 
 
 CUSTOMER_STATUSES = ["Lead", "Active", "Inactive"]
-OPPORTUNITY_STAGES = ["Draft", "Discussion", "Contractual negotiations", "DA Signed", "Lost to competitor", "Rejected by SC", "Lost"]
+OPPORTUNITY_STAGES = ["Draft", "Discussion", "Commercial negotiation", "Contractual negotiation", "DA Signed", "Lost to competitor", "Rejected by SC", "Lost"]
 PROJECT_STATUSES = ["Planning", "In Progress", "Blocked", "Delivered", "On Hold"]
 FIELD_TYPES = ["Text", "Long Text", "Number", "Date", "Checkbox", "Dropdown"]
 
@@ -659,9 +659,9 @@ def dashboard_payload():
     
     metrics = {
         "customers": db.customers.count_documents({}),
-        "open_opportunities": db.opportunities.count_documents({"stage": {"$nin": ["Won", "Lost"]}}),
+        "open_opportunities": db.opportunities.count_documents({"stage": {"$nin": ["DA Signed", "Lost to competitor", "Rejected by SC", "Lost"]}}),
         "pipeline_values": list(db.opportunities.aggregate([
-            {"$match": {"stage": {"$nin": ["Won", "Lost"]}}},
+            {"$match": {"stage": {"$nin": ["DA Signed", "Lost to competitor", "Rejected by SC", "Lost"]}}},
             {"$group": {"_id": "$currency", "total": {"$sum": "$value"}}},
             {"$project": {"_id": 0, "currency": "$_id", "total": 1}}
         ])),
