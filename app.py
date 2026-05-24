@@ -429,6 +429,7 @@ def init_database():
     db.custom_objects.create_index("api_name", unique=True)
     db.vault_entries.create_index("category")
     db.vault_entries.create_index("title")
+    db.bank_accounts.create_index("id", unique=True)
 
 
 @app.template_filter("date_or_dash")
@@ -948,6 +949,9 @@ def api_options():
                 "accounts": accounts,
                 "vendors": vendors,
                 "projects": projects_list,
+                "bank_accounts": list(
+                    db.bank_accounts.find({"is_active": {"$ne": 0}}, {"_id": 0}).sort("label", 1)
+                ),
             }
         )
     )
@@ -2161,6 +2165,41 @@ def api_finance_transaction_reverse(transaction_id):
     
     return jsonify({"success": True})
 
+def build_invoice_payment_details(bank_doc, invoice_number):
+    if not bank_doc:
+        return None
+    return {
+        "label": bank_doc.get("label"),
+        "beneficiary_name": bank_doc.get("beneficiary_name", ""),
+        "bank_name": bank_doc.get("bank_name", ""),
+        "account_number": bank_doc.get("account_number", ""),
+        "ifsc_code": bank_doc.get("ifsc_code", ""),
+        "payment_reference": invoice_number or "",
+    }
+
+
+def snapshot_invoice_payment_details(db, bank_account_id, invoice_number):
+    if not bank_account_id:
+        return None
+    bank = db.bank_accounts.find_one({"id": int(bank_account_id)}, {"_id": 0})
+    return build_invoice_payment_details(bank, invoice_number)
+
+
+def attach_invoice_payment_details(inv_dict, db):
+    snap = inv_dict.get("payment_details_snapshot")
+    if snap:
+        details = dict(snap)
+        details["payment_reference"] = inv_dict.get("invoice_number") or details.get("payment_reference", "")
+        inv_dict["payment_details"] = details
+        return
+    bank_id = inv_dict.get("bank_account_id")
+    if bank_id:
+        bank = db.bank_accounts.find_one({"id": int(bank_id)}, {"_id": 0})
+        inv_dict["payment_details"] = build_invoice_payment_details(bank, inv_dict.get("invoice_number"))
+    else:
+        inv_dict["payment_details"] = None
+
+
 @app.route("/api/finance/invoices", methods=["GET", "POST"])
 def api_invoices():
     require_finance_access()
@@ -2212,6 +2251,10 @@ def api_invoices():
             "status": data.get("status", "Draft"),
             "notes": data.get("notes"),
             "items": data.get("items", []),
+            "bank_account_id": int(data["bank_account_id"]) if data.get("bank_account_id") else None,
+            "payment_details_snapshot": snapshot_invoice_payment_details(
+                db, data.get("bank_account_id"), invoice_number
+            ),
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
             "created_by_id": actor_id,
@@ -2241,6 +2284,7 @@ def api_invoices():
     ]))
     for inv in invoices:
         inv["invoice_date"] = inv.get("issue_date")
+        attach_invoice_payment_details(inv, db)
     return jsonify(json_ready({"invoices": invoices}))
 
 @app.route("/api/finance/invoices/<int:invoice_id>", methods=["GET", "PUT", "DELETE"])
@@ -2258,6 +2302,8 @@ def api_invoice_detail(invoice_id):
             issue_date = datetime.now().strftime("%Y-%m-%d")
             
         old_inv = db.invoices.find_one({"id": invoice_id})
+        inv_number = data.get("invoice_number") or (old_inv.get("invoice_number") if old_inv else None)
+        bank_account_id = int(data["bank_account_id"]) if data.get("bank_account_id") else None
         db.invoices.update_one(
             {"id": invoice_id},
             {"$set": {
@@ -2274,6 +2320,8 @@ def api_invoice_detail(invoice_id):
                 "status": data.get("status"),
                 "notes": data.get("notes"),
                 "items": data.get("items", []),
+                "bank_account_id": bank_account_id,
+                "payment_details_snapshot": snapshot_invoice_payment_details(db, bank_account_id, inv_number),
                 "updated_at": datetime.now(),
                 "modified_by_id": actor_id,
                 "modified_by_name": actor_name
@@ -2312,12 +2360,70 @@ def api_invoice_detail(invoice_id):
     inv_dict["invoice_date"] = inv_dict.get("issue_date")
     
     # Load and embed company profile information
-    import json
     setting = db.system_settings.find_one({"key_name": "company_profile"})
     company_info = json.loads(setting["value"]) if setting and setting.get("value") else None
     inv_dict["company_info"] = company_info
+    attach_invoice_payment_details(inv_dict, db)
     
     return jsonify(json_ready({"invoice": inv_dict, "items": inv_dict.get("items", [])}))
+
+@app.route("/api/settings/bank-accounts", methods=["GET", "POST"])
+def api_settings_bank_accounts():
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json() or {}
+        bank_id = get_next_sequence_value("bank_accounts")
+        is_default = bool(data.get("is_default"))
+        if is_default:
+            db.bank_accounts.update_many({}, {"$set": {"is_default": 0}})
+        doc = {
+            "id": bank_id,
+            "label": (data.get("label") or "").strip(),
+            "beneficiary_name": (data.get("beneficiary_name") or "").strip(),
+            "bank_name": (data.get("bank_name") or "").strip(),
+            "account_number": (data.get("account_number") or "").strip(),
+            "ifsc_code": (data.get("ifsc_code") or "").strip(),
+            "is_default": 1 if is_default else 0,
+            "is_active": 0 if data.get("is_active") is False else 1,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        }
+        db.bank_accounts.insert_one(doc)
+        return jsonify(json_ready({"id": bank_id}))
+    accounts = list(db.bank_accounts.find({}, {"_id": 0}).sort([("is_default", -1), ("label", 1)]))
+    return jsonify(json_ready({"bank_accounts": accounts}))
+
+
+@app.route("/api/settings/bank-accounts/<int:bank_id>", methods=["PUT", "DELETE"])
+def api_settings_bank_account_detail(bank_id):
+    db = get_db()
+    existing = db.bank_accounts.find_one({"id": bank_id})
+    if not existing:
+        abort(404)
+    if request.method == "DELETE":
+        db.bank_accounts.delete_one({"id": bank_id})
+        return jsonify({"success": True})
+    data = request.get_json() or {}
+    is_default = bool(data.get("is_default")) if "is_default" in data else bool(existing.get("is_default"))
+    if is_default:
+        db.bank_accounts.update_many({"id": {"$ne": bank_id}}, {"$set": {"is_default": 0}})
+    db.bank_accounts.update_one(
+        {"id": bank_id},
+        {
+            "$set": {
+                "label": (data.get("label", existing.get("label")) or "").strip(),
+                "beneficiary_name": (data.get("beneficiary_name", existing.get("beneficiary_name")) or "").strip(),
+                "bank_name": (data.get("bank_name", existing.get("bank_name")) or "").strip(),
+                "account_number": (data.get("account_number", existing.get("account_number")) or "").strip(),
+                "ifsc_code": (data.get("ifsc_code", existing.get("ifsc_code")) or "").strip(),
+                "is_default": 1 if is_default else 0,
+                "is_active": 0 if data.get("is_active") is False else 1,
+                "updated_at": datetime.now(),
+            }
+        },
+    )
+    return jsonify({"success": True})
+
 
 @app.route("/api/settings/company", methods=["GET", "POST"])
 def api_settings_company():
