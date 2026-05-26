@@ -387,6 +387,23 @@ def init_database():
             {"id": get_next_sequence_value("accounts"), "name": "Operating Expenses", "type": "Expense", "balance": 0, "is_system_default": 1, "created_at": datetime.now()}
         ])
 
+    # Ensure additional expense accounts exist
+    additional_expense_accounts = [
+        "Salary",
+        "Stakeholder Payout",
+        "Channel Partner Payout"
+    ]
+    for acc_name in additional_expense_accounts:
+        if not db.accounts.find_one({"name": acc_name}):
+            db.accounts.insert_one({
+                "id": get_next_sequence_value("accounts"),
+                "name": acc_name,
+                "type": "Expense",
+                "balance": 0,
+                "is_system_default": 1,
+                "created_at": datetime.now()
+            })
+
     # Seed roles
     if db.roles.count_documents({}) == 0:
         db.roles.insert_one({"id": get_next_sequence_value("roles"), "name": "Admin", "description": "Full access", "created_at": datetime.now()})
@@ -2018,6 +2035,7 @@ def api_finance_transactions():
             "currency": data.get("currency", "USD"),
             "reference": data.get("reference"),
             "category": data.get("category"),
+            "depreciation_value": float(data.get("depreciation_value") or 0) if data.get("category") == "Fixed Assets" else None,
             "status": data.get("status", "Completed"),
             "cgst_percent": cgst_percent,
             "cgst_amount": cgst_amount,
@@ -2057,6 +2075,32 @@ def api_finance_transactions():
         {"$sort": {"transaction_date": -1}}
     ]))
     return jsonify(json_ready({"transactions": transactions}))
+
+@app.route("/api/finance/fixed-assets", methods=["GET"])
+def api_finance_fixed_assets():
+    require_finance_access()
+    db = get_db()
+    assets = list(db.transactions.aggregate([
+        {"$match": {"category": "Fixed Assets", "status": {"$ne": "Reversed"}}},
+        {"$lookup": {"from": "accounts", "localField": "account_id", "foreignField": "id", "as": "account"}},
+        {"$unwind": {"path": "$account", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "vendors", "localField": "vendor_id", "foreignField": "id", "as": "vendor"}},
+        {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "account_name": "$account.name",
+            "vendor_name": "$vendor.name",
+            "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
+        }},
+        {"$project": {"account": 0, "vendor": 0, "_id": 0}},
+        {"$sort": {"transaction_date": -1}}
+    ]))
+    total_cost = sum(float(a.get("amount") or 0) for a in assets)
+    total_current_value = sum(float(a.get("depreciation_value") or a.get("amount") or 0) for a in assets)
+    return jsonify(json_ready({
+        "assets": assets,
+        "total_cost": total_cost,
+        "total_current_value": total_current_value
+    }))
 
 @app.route("/api/finance/transactions/<transaction_id>", methods=["GET", "PUT"])
 def api_finance_transaction_detail(transaction_id):
