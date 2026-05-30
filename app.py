@@ -92,6 +92,7 @@ CUSTOMER_STATUSES = ["Lead", "Active", "Inactive"]
 OPPORTUNITY_STAGES = ["Draft", "Discussion", "Commercial negotiation", "Contractual negotiation", "DA Signed", "Lost to competitor", "Rejected by SC", "Lost"]
 PROJECT_STATUSES = ["Planning", "In Progress", "Blocked", "Delivered", "On Hold"]
 FIELD_TYPES = ["Text", "Long Text", "Number", "Date", "Checkbox", "Dropdown"]
+SETUP_HIDDEN_OBJECT_API_NAMES = {"accounts"}
 
 
 def _check_scrypt_password_hash(pwhash, password):
@@ -319,12 +320,6 @@ def seed_native_standard_fields():
             ("Category", "category", "Text", 0),
             ("Notes", "notes", "Long Text", 0),
         ],
-        "accounts": [
-            ("Name", "name", "Text", 1),
-            ("Type", "type", "Dropdown", 1, '["Asset", "Liability", "Equity", "Revenue", "Expense"]'),
-            ("Balance", "balance", "Number", 1),
-            ("System Default", "is_system_default", "Checkbox", 0),
-        ],
         "transactions": [
             ("Transaction Date", "transaction_date", "Date", 1),
             ("Amount", "amount", "Number", 1),
@@ -372,6 +367,17 @@ def seed_native_standard_fields():
                     "created_at": datetime.now()
                 })
 
+
+def remove_hidden_setup_object_metadata(db):
+    hidden_objects = list(db.custom_objects.find({"api_name": {"$in": list(SETUP_HIDDEN_OBJECT_API_NAMES)}}))
+    hidden_object_ids = [obj["id"] for obj in hidden_objects]
+    if not hidden_object_ids:
+        return
+    db.custom_fields.delete_many({"object_id": {"$in": hidden_object_ids}})
+    db.field_level_security.delete_many({"object_id": {"$in": hidden_object_ids}})
+    db.custom_objects.delete_many({"id": {"$in": hidden_object_ids}})
+
+
 def init_database():
     db = get_db()
     
@@ -381,12 +387,13 @@ def init_database():
         db.create_collection("counters")
         
     # Seed custom objects
+    remove_hidden_setup_object_metadata(db)
+
     standard_objects = [
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Customer', 'plural_label': 'Customers', 'api_name': 'customers', 'is_standard': 1, 'storage_table': 'customers', 'description': 'Standard customer object.', 'created_at': datetime.now()},
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Opportunity', 'plural_label': 'Opportunities', 'api_name': 'opportunities', 'is_standard': 1, 'storage_table': 'opportunities', 'description': 'Standard sales opportunity object.', 'created_at': datetime.now()},
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Project', 'plural_label': 'Projects', 'api_name': 'projects', 'is_standard': 1, 'storage_table': 'projects', 'description': 'Standard delivery project object.', 'created_at': datetime.now()},
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Vendor', 'plural_label': 'Vendors', 'api_name': 'vendors', 'is_standard': 1, 'storage_table': 'vendors', 'description': 'Standard vendor object for finance.', 'created_at': datetime.now()},
-        {'id': get_next_sequence_value('custom_objects'), 'label': 'Account', 'plural_label': 'Accounts', 'api_name': 'accounts', 'is_standard': 1, 'storage_table': 'accounts', 'description': 'Standard account object for finance.', 'created_at': datetime.now()},
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Transaction', 'plural_label': 'Transactions', 'api_name': 'transactions', 'is_standard': 1, 'storage_table': 'transactions', 'description': 'Standard transaction object for finance.', 'created_at': datetime.now()}
     ]
     for obj in standard_objects:
@@ -545,7 +552,9 @@ def api_auth_login():
             "id": user["id"],
             "full_name": user.get("full_name"),
             "email": user.get("email"),
+            "phone": user.get("phone", ""),
             "role_name": role_name,
+            "is_active": 1 if user.get("is_active", 1) else 0,
             "has_treasury_access": 1 if is_admin else user.get("has_treasury_access", 0),
             "has_finance_access": 1 if is_admin else user.get("has_finance_access", 0),
             "has_vault_access": 1 if is_admin else user.get("has_vault_access", 0),
@@ -559,6 +568,55 @@ def api_auth_login():
 def api_auth_logout():
     session.clear()
     return jsonify({"success": True})
+
+
+@app.route("/api/profile", methods=["GET", "PUT"])
+def api_profile():
+    if "user_id" not in session:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    db = get_db()
+    user = db.app_users.find_one({"id": session["user_id"]})
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    role = db.roles.find_one({"id": user.get("role_id")})
+    role_name = role["name"] if role else "Standard"
+    is_admin = role_name in ["Admin", "System Administrator"]
+
+    if request.method == "PUT":
+        data = request.get_json() or {}
+        full_name = (data.get("full_name") or "").strip()
+        phone = (data.get("phone") or "").strip()
+        if not full_name:
+            return jsonify({"error": "Full name is required"}), 400
+
+        old_user = dict(user)
+        db.app_users.update_one(
+            {"id": user["id"]},
+            {"$set": {
+                "full_name": full_name,
+                "phone": phone,
+                "updated_at": datetime.now()
+            }}
+        )
+        user = db.app_users.find_one({"id": session["user_id"]})
+        log_activity_async("Setup", "User Profile", user["id"], "UPDATE", old_data=old_user, new_data=user, reference_number=user.get("email"))
+
+    profile = {
+        "id": user["id"],
+        "full_name": user.get("full_name"),
+        "email": user.get("email"),
+        "phone": user.get("phone", ""),
+        "role_name": role_name,
+        "is_active": 1 if user.get("is_active", 1) else 0,
+        "has_treasury_access": 1 if is_admin else user.get("has_treasury_access", 0),
+        "has_finance_access": 1 if is_admin else user.get("has_finance_access", 0),
+        "has_vault_access": 1 if is_admin else user.get("has_vault_access", 0),
+        "requires_password_change": bool(user.get("requires_password_change", False))
+    }
+    return jsonify(json_ready({"user": profile}))
+
 
 @app.route("/api/auth/change-password", methods=["POST"])
 def api_auth_change_password():
@@ -1128,10 +1186,12 @@ def api_global_search():
 @app.route("/api/setup")
 def api_setup_home():
     db = get_db()
+    remove_hidden_setup_object_metadata(db)
+    visible_object_query = {"api_name": {"$nin": list(SETUP_HIDDEN_OBJECT_API_NAMES)}}
     metrics = {
         "users": db.app_users.count_documents({}),
         "roles": db.roles.count_documents({}),
-        "objects": db.custom_objects.count_documents({}),
+        "objects": db.custom_objects.count_documents(visible_object_query),
         "fields": db.custom_fields.count_documents({}),
     }
     
@@ -1146,6 +1206,7 @@ def api_setup_home():
     roles = list(db.roles.find({}, {"_id": 0, "id": 1, "name": 1, "description": 1}).sort("name", 1))
     
     objects = list(db.custom_objects.aggregate([
+        {"$match": visible_object_query},
         {"$lookup": {"from": "custom_fields", "localField": "id", "foreignField": "object_id", "as": "fields"}},
         {"$addFields": {"field_count": {"$size": "$fields"}}},
         {"$project": {"_id": 0, "fields": 0}},
@@ -1359,7 +1420,13 @@ def api_setup_role(role_id):
 @app.route("/api/setup/roles/<int:role_id>/security", methods=["GET"])
 def api_setup_role_security(role_id):
     db = get_db()
-    objects = list(db.custom_objects.find({}, {"_id": 0}).sort("plural_label", 1))
+    remove_hidden_setup_object_metadata(db)
+    objects = list(
+        db.custom_objects.find(
+            {"api_name": {"$nin": list(SETUP_HIDDEN_OBJECT_API_NAMES)}},
+            {"_id": 0}
+        ).sort("plural_label", 1)
+    )
     return jsonify(json_ready({"objects": objects}))
 
 
@@ -1401,9 +1468,12 @@ def api_setup_role_object_security(role_id, object_id):
 @app.route("/api/setup/objects", methods=["GET", "POST"])
 def api_setup_objects():
     db = get_db()
+    remove_hidden_setup_object_metadata(db)
     if request.method == "POST":
         data = request.get_json()
         api_name = slugify_api_name(data["plural_label"])
+        if api_name in SETUP_HIDDEN_OBJECT_API_NAMES:
+            return jsonify({"error": "This object name is reserved by the system"}), 400
         
         # Check if api_name exists
         if db.custom_objects.find_one({"api_name": api_name}):
@@ -1425,6 +1495,7 @@ def api_setup_objects():
         return jsonify({"id": object_id, "api_name": api_name})
         
     objects = list(db.custom_objects.aggregate([
+        {"$match": {"api_name": {"$nin": list(SETUP_HIDDEN_OBJECT_API_NAMES)}}},
         {"$lookup": {"from": "custom_fields", "localField": "id", "foreignField": "object_id", "as": "fields"}},
         {"$addFields": {"field_count": {"$size": "$fields"}}},
         {"$project": {"_id": 0, "fields": 0}},
@@ -1435,7 +1506,10 @@ def api_setup_objects():
 
 @app.route("/api/setup/objects/<string:api_name>", methods=["GET"])
 def api_setup_object_detail(api_name):
+    if api_name in SETUP_HIDDEN_OBJECT_API_NAMES:
+        abort(404)
     db = get_db()
+    remove_hidden_setup_object_metadata(db)
     obj = db.custom_objects.find_one({"api_name": api_name}, {"_id": 0})
     if not obj:
         abort(404)
@@ -2640,6 +2714,7 @@ def api_settings_bank_accounts():
             "updated_at": datetime.now(),
         }
         db.bank_accounts.insert_one(doc)
+        log_activity_async("Setup", "Bank Account", bank_id, "CREATE", new_data=doc, reference_number=doc.get("label"))
         return jsonify(json_ready({"id": bank_id}))
     accounts = list(db.bank_accounts.find({}, {"_id": 0}).sort([("is_default", -1), ("label", 1)]))
     return jsonify(json_ready({"bank_accounts": accounts}))
@@ -2653,6 +2728,7 @@ def api_settings_bank_account_detail(bank_id):
         abort(404)
     if request.method == "DELETE":
         db.bank_accounts.delete_one({"id": bank_id})
+        log_activity_async("Setup", "Bank Account", bank_id, "DELETE", old_data=existing, reference_number=existing.get("label"))
         return jsonify({"success": True})
     data = request.get_json() or {}
     is_default = bool(data.get("is_default")) if "is_default" in data else bool(existing.get("is_default"))
@@ -2673,6 +2749,8 @@ def api_settings_bank_account_detail(bank_id):
             }
         },
     )
+    updated = db.bank_accounts.find_one({"id": bank_id})
+    log_activity_async("Setup", "Bank Account", bank_id, "UPDATE", old_data=existing, new_data=updated, reference_number=updated.get("label") if updated else existing.get("label"))
     return jsonify({"success": True})
 
 
@@ -3290,34 +3368,33 @@ def api_treasury_revenue():
     
     for t in all_txns:
         existing = db.treasury_revenue.find_one({"transaction_id": t["id"]})
+        amount = float(t.get("total_amount") or t.get("amount") or 0.0)
+        txn_currency = (t.get("currency") or "INR").upper()
+        if txn_currency != "INR":
+            conversion_rates = {"USD": 95.0, "EUR": 102.0, "GBP": 120.0}
+            rate = conversion_rates.get(txn_currency, 95.0)
+            amount = amount * rate
+            
+        is_expense = t.get("type") == "Expense"
+        
+        # Expenses flow as negative in amounts, Incomes as positive
+        if is_expense:
+            amount = -abs(amount)
+            reserve_percentage = 100.0
+            reserve_amount = amount
+            partner_commission = 0.0
+            stakeholder_total = 0.0
+            revenue_type = "Company Expense"
+        else:
+            amount = abs(amount)
+            reserve_percentage = 20.0
+            reserve_amount = amount * 0.20
+            partner_commission = 0.0
+            stakeholder_total = amount - reserve_amount
+            revenue_type = "Sales Income"
+            
+        entry_date = t.get("transaction_date") or t.get("date") or datetime.now().strftime("%Y-%m-%d")
         if not existing:
-            amount = float(t.get("amount") or t.get("total_amount") or 0.0)
-            txn_currency = (t.get("currency") or "INR").upper()
-            if txn_currency != "INR":
-                conversion_rates = {"USD": 95.0, "EUR": 102.0, "GBP": 120.0}
-                rate = conversion_rates.get(txn_currency, 95.0)
-                amount = amount * rate
-                
-            is_expense = t.get("type") == "Expense"
-            
-            # Expenses flow as negative in amounts, Incomes as positive
-            if is_expense:
-                amount = -abs(amount)
-                reserve_percentage = 100.0
-                reserve_amount = amount
-                partner_commission = 0.0
-                stakeholder_total = 0.0
-                revenue_type = "Company Expense"
-            else:
-                amount = abs(amount)
-                reserve_percentage = 20.0
-                reserve_amount = amount * 0.20
-                partner_commission = 0.0
-                stakeholder_total = amount - reserve_amount
-                revenue_type = "Sales Income"
-                
-            entry_date = t.get("transaction_date") or t.get("date") or datetime.now().strftime("%Y-%m-%d")
-            
             rev_id = get_next_sequence_value("treasury_revenue")
             revenue_id_str = f"REV-{rev_id}"
             
@@ -3339,6 +3416,23 @@ def api_treasury_revenue():
                 "is_settled": False,
                 "created_at": datetime.now()
             })
+        elif not existing.get("is_settled"):
+            db.treasury_revenue.update_one(
+                {"id": existing["id"]},
+                {"$set": {
+                    "project_id": t.get("project_id"),
+                    "entry_date": entry_date,
+                    "date": datetime.strptime(entry_date, "%Y-%m-%d") if isinstance(entry_date, str) else entry_date,
+                    "revenue_type": revenue_type,
+                    "amount": amount,
+                    "reserve_percentage": reserve_percentage,
+                    "reserve_amount": reserve_amount,
+                    "partner_commission": partner_commission,
+                    "stakeholder_total": stakeholder_total,
+                    "description": t.get("description") or f"Auto-flow from Transaction Ledger #{t['id']}",
+                    "updated_at": datetime.now()
+                }}
+            )
                         
     revenues = list(db.treasury_revenue.aggregate([
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
