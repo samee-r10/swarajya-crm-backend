@@ -1,20 +1,24 @@
 import json
 import os
 import re
+import hmac
 from base64 import urlsafe_b64encode
 from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 from hashlib import sha256
+import hashlib
 # sameer
 import pymongo
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from pymongo.errors import ConnectionFailure
 from dotenv import load_dotenv
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
 from flask_cors import CORS
 from itsdangerous import BadSignature, URLSafeSerializer
-from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.security import check_password_hash as werkzeug_check_password_hash
+from werkzeug.security import generate_password_hash as werkzeug_generate_password_hash
 from werkzeug.local import LocalProxy
 
 
@@ -47,10 +51,11 @@ ALLOWED_ORIGINS = [
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
 
 # ── Session cookie settings ────────────────────────────────────────────────────
-# "None" + Secure is required for cross-site cookies (frontend on Vercel,
-# backend on Vercel = different subdomains so treat as cross-site).
-app.config["SESSION_COOKIE_SAMESITE"] = "None"
-app.config["SESSION_COOKIE_SECURE"] = True
+# Production Vercel apps are cross-site and need SameSite=None + Secure.
+# Local Vite dev uses an HTTP proxy, so Secure cookies would be dropped by the browser.
+IS_PRODUCTION = bool(os.getenv("VERCEL")) or os.getenv("FLASK_ENV") == "production"
+app.config["SESSION_COOKIE_SAMESITE"] = "None" if IS_PRODUCTION else "Lax"
+app.config["SESSION_COOKIE_SECURE"] = IS_PRODUCTION
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 
 
@@ -86,6 +91,30 @@ CUSTOMER_STATUSES = ["Lead", "Active", "Inactive"]
 OPPORTUNITY_STAGES = ["Draft", "Discussion", "Commercial negotiation", "Contractual negotiation", "DA Signed", "Lost to competitor", "Rejected by SC", "Lost"]
 PROJECT_STATUSES = ["Planning", "In Progress", "Blocked", "Delivered", "On Hold"]
 FIELD_TYPES = ["Text", "Long Text", "Number", "Date", "Checkbox", "Dropdown"]
+
+
+def _check_scrypt_password_hash(pwhash, password):
+    method, salt, hashval = pwhash.split("$", 2)
+    _, n, r, p = method.split(":")
+    kdf = Scrypt(salt=salt.encode(), length=len(bytes.fromhex(hashval)), n=int(n), r=int(r), p=int(p))
+    candidate = kdf.derive(password.encode()).hex()
+    return hmac.compare_digest(candidate, hashval)
+
+
+def check_password_hash(pwhash, password):
+    try:
+        return werkzeug_check_password_hash(pwhash, password)
+    except AttributeError as exc:
+        if "scrypt" in str(exc) and pwhash.startswith("scrypt:"):
+            return _check_scrypt_password_hash(pwhash, password)
+        raise
+
+
+def generate_password_hash(password):
+    method = os.getenv("PASSWORD_HASH_METHOD")
+    if not method:
+        method = "scrypt" if hasattr(hashlib, "scrypt") else "pbkdf2:sha256:1000000"
+    return werkzeug_generate_password_hash(password, method=method)
 
 def get_active_currencies():
     try:
@@ -707,6 +736,35 @@ def purge_unsettled_revenue_payouts(db):
         db.treasury_payouts.delete_many({"revenue_id": {"$in": unsettled_ids}})
 
 
+def purge_orphaned_unsettled_transaction_revenue(db):
+    """Remove unsettled treasury rows whose source transaction no longer exists."""
+    synced_revenues = list(
+        db.treasury_revenue.find(
+            {
+                "transaction_id": {"$exists": True, "$ne": None},
+                "is_settled": {"$ne": True},
+            },
+            {"id": 1, "transaction_id": 1, "_id": 0},
+        )
+    )
+    if not synced_revenues:
+        return
+
+    transaction_ids = [doc["transaction_id"] for doc in synced_revenues]
+    existing_transaction_ids = {
+        doc["id"]
+        for doc in db.transactions.find({"id": {"$in": transaction_ids}}, {"id": 1, "_id": 0})
+    }
+    orphaned_revenue_ids = [
+        doc["id"]
+        for doc in synced_revenues
+        if doc.get("transaction_id") not in existing_transaction_ids
+    ]
+    if orphaned_revenue_ids:
+        db.treasury_revenue.delete_many({"id": {"$in": orphaned_revenue_ids}})
+        db.treasury_payouts.delete_many({"revenue_id": {"$in": orphaned_revenue_ids}})
+
+
 def normalize_stakeholder_flow_payouts(db):
     """Reclassify stakeholder splits on company expenses as contributions, not earnings."""
     expense_rev_ids = [
@@ -972,6 +1030,98 @@ def api_options():
             }
         )
     )
+
+
+@app.route("/api/search")
+def api_global_search():
+    user = get_current_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    db = get_db()
+    term = (request.args.get("q") or "").strip()
+    if len(term) < 2:
+        return jsonify({"results": []})
+
+    normalized_term = term.lstrip("#")
+    pattern = {"$regex": re.escape(term), "$options": "i"}
+    normalized_pattern = {"$regex": re.escape(normalized_term), "$options": "i"}
+    results = []
+
+    def add_result(label, record_type, url, subtitle="", meta=""):
+        results.append({
+            "label": label,
+            "type": record_type,
+            "url": url,
+            "subtitle": subtitle,
+            "meta": meta,
+        })
+
+    for customer in db.customers.find(
+        {"$or": [{"company_name": pattern}, {"contact_name": pattern}, {"email": pattern}, {"phone": pattern}]},
+        {"_id": 0, "id": 1, "company_name": 1, "contact_name": 1, "email": 1},
+    ).limit(6):
+        add_result(
+            customer.get("company_name") or f"Customer #{customer.get('id')}",
+            "Customer",
+            f"/customers/{customer['id']}",
+            customer.get("contact_name") or customer.get("email") or "",
+        )
+
+    for project in db.projects.find(
+        {"$or": [{"project_name": pattern}, {"owner": pattern}, {"status": pattern}]},
+        {"_id": 0, "id": 1, "project_name": 1, "status": 1},
+    ).limit(4):
+        add_result(project.get("project_name") or f"Project #{project.get('id')}", "Project", f"/projects/{project['id']}", project.get("status") or "")
+
+    for opportunity in db.opportunities.find(
+        {"$or": [{"title": pattern}, {"opportunity_number": pattern}, {"stage": pattern}]},
+        {"_id": 0, "id": 1, "title": 1, "opportunity_number": 1, "stage": 1},
+    ).limit(4):
+        add_result(
+            opportunity.get("title") or opportunity.get("opportunity_number") or f"Opportunity #{opportunity.get('id')}",
+            "Opportunity",
+            f"/opportunities/{opportunity['id']}",
+            opportunity.get("opportunity_number") or opportunity.get("stage") or "",
+        )
+
+    role_name = ""
+    if user.get("role_id"):
+        role = db.roles.find_one({"id": user.get("role_id")}, {"_id": 0, "name": 1})
+        role_name = role.get("name") if role else ""
+    is_admin_user = role_name in ["Admin", "System Administrator"]
+    can_search_finance = is_admin_user or bool(user.get("has_finance_access"))
+
+    if can_search_finance:
+        for txn in db.transactions.find(
+            {"$or": [{"id": normalized_pattern}, {"description": pattern}, {"category": pattern}, {"reference": pattern}]},
+            {"_id": 0, "id": 1, "description": 1, "type": 1, "amount": 1, "currency": 1},
+        ).limit(6):
+            add_result(
+                f"#{txn.get('id')}",
+                "Transaction",
+                f"/finance/transactions/{txn['id']}",
+                txn.get("description") or txn.get("type") or "",
+                f"{txn.get('currency', '')} {txn.get('amount', '')}".strip(),
+            )
+
+        for invoice in db.invoices.find(
+            {"$or": [{"invoice_number": pattern}, {"status": pattern}, {"notes": pattern}]},
+            {"_id": 0, "id": 1, "invoice_number": 1, "status": 1, "total_amount": 1, "currency": 1},
+        ).limit(6):
+            add_result(
+                invoice.get("invoice_number") or f"Invoice #{invoice.get('id')}",
+                "Invoice",
+                f"/finance/invoices/{invoice['id']}",
+                invoice.get("status") or "",
+                f"{invoice.get('currency', '')} {invoice.get('total_amount', '')}".strip(),
+            )
+
+        if "ledger" in term.lower() or "transaction" in term.lower():
+            add_result("Transaction Ledger", "Finance", "/finance/transactions", "All accounting entries")
+            add_result("General Ledger Report", "Finance", "/finance/reports/general-ledger", "Ledger balances and journal view")
+
+    return jsonify({"results": results[:20]})
 
 
 @app.route("/api/setup")
@@ -2051,6 +2201,10 @@ def api_finance_transactions():
             "modified_by_id": actor_id,
             "modified_by_name": actor_name
         }
+        for k, v in data.items():
+            if k not in insert_data:
+                insert_data[k] = v
+
         db.transactions.insert_one(insert_data)
         log_activity_async("Finance", "Accounting Entry", transaction_id, "CREATE", new_data=insert_data, reference_number=data.get("reference"))
         return jsonify({"id": transaction_id})
@@ -2074,7 +2228,9 @@ def api_finance_transactions():
         {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "_id": 0}},
         {"$sort": {"transaction_date": -1}}
     ]))
-    return jsonify(json_ready({"transactions": transactions}))
+    transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
+    fields = get_fields_for_user(transaction_obj["id"]) if transaction_obj else []
+    return jsonify(json_ready({"transactions": transactions, "fields": fields}))
 
 @app.route("/api/finance/fixed-assets", methods=["GET"])
 def api_finance_fixed_assets():
@@ -2102,11 +2258,47 @@ def api_finance_fixed_assets():
         "total_current_value": total_current_value
     }))
 
-@app.route("/api/finance/transactions/<transaction_id>", methods=["GET", "PUT"])
+@app.route("/api/finance/transactions/<transaction_id>", methods=["GET", "PUT", "DELETE"])
 def api_finance_transaction_detail(transaction_id):
     require_finance_access()
     db = get_db()
     
+    if request.method == "DELETE":
+        old_tx = db.transactions.find_one({"id": transaction_id})
+        if not old_tx:
+            abort(404)
+
+        db.transactions.delete_one({"id": transaction_id})
+
+        synced_revenues = list(
+            db.treasury_revenue.find(
+                {"transaction_id": transaction_id, "is_settled": {"$ne": True}},
+                {"id": 1, "revenue_id": 1, "_id": 0},
+            )
+        )
+        synced_revenue_ids = [rev["id"] for rev in synced_revenues]
+        if synced_revenue_ids:
+            db.treasury_revenue.delete_many({"id": {"$in": synced_revenue_ids}})
+            db.treasury_payouts.delete_many({"revenue_id": {"$in": synced_revenue_ids}})
+            actor = get_current_user()
+            if actor:
+                refs = ", ".join(rev.get("revenue_id") or f"REV-{rev['id']}" for rev in synced_revenues)
+                log_treasury_action(
+                    actor["id"],
+                    "Removed Unsettled Revenue",
+                    f"Deleted transaction {transaction_id}; removed linked unsettled treasury revenue {refs}.",
+                )
+
+        log_activity_async(
+            "Finance",
+            "Accounting Entry",
+            transaction_id,
+            "DELETE",
+            old_data=old_tx,
+            reference_number=old_tx.get("reference"),
+        )
+        return jsonify({"success": True})
+
     if request.method == "PUT":
         data = request.get_json()
         amount = float(data.get("amount") or 0)
@@ -2150,6 +2342,16 @@ def api_finance_transaction_detail(transaction_id):
                 "total_amount": total_amount
             }}
         )
+        transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
+        transaction_fields = get_fields_for_user(transaction_obj["id"]) if transaction_obj else []
+        native_field_names = {field["api_name"] for field in transaction_fields if field.get("is_native")}
+        dynamic_update_data = {
+            k: v
+            for k, v in data.items()
+            if k not in native_field_names and k not in {"id", "created_at", "updated_at"}
+        }
+        if dynamic_update_data:
+            db.transactions.update_one({"id": transaction_id}, {"$set": dynamic_update_data})
         new_tx = db.transactions.find_one({"id": transaction_id})
         log_activity_async("Finance", "Accounting Entry", transaction_id, "UPDATE", old_data=old_tx, new_data=new_tx, reference_number=new_tx.get("reference"))
         return jsonify({"success": True})
@@ -2176,8 +2378,12 @@ def api_finance_transaction_detail(transaction_id):
     if not transactions:
         abort(404)
         
+    transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
+    fields = get_fields_for_user(transaction_obj["id"]) if transaction_obj else []
+
     return jsonify(json_ready({
         "transaction": transactions[0],
+        "fields": fields,
         "currency_symbols": CURRENCY_SYMBOLS
     }))
 
@@ -2653,6 +2859,7 @@ def api_settings_exchange_rates():
 def api_treasury_dashboard():
     user = require_treasury_access()
     db = get_db()
+    purge_orphaned_unsettled_transaction_revenue(db)
     purge_unsettled_revenue_payouts(db)
     normalize_stakeholder_flow_payouts(db)
     
@@ -2739,6 +2946,7 @@ def api_treasury_dashboard():
 def api_treasury_payment_stats():
     user = require_treasury_access()
     db = get_db()
+    purge_orphaned_unsettled_transaction_revenue(db)
     purge_unsettled_revenue_payouts(db)
     normalize_stakeholder_flow_payouts(db)
     settled_revenue_ids = get_settled_revenue_ids(db)
@@ -3072,6 +3280,7 @@ def api_treasury_revenue():
         log_treasury_action(user["id"], "Logged Revenue", f"Recorded revenue entry {revenue_id_str} (pending settlement).")
         return jsonify({"ok": True})
         
+    purge_orphaned_unsettled_transaction_revenue(db)
     purge_unsettled_revenue_payouts(db)
     normalize_stakeholder_flow_payouts(db)
 
@@ -3264,6 +3473,7 @@ def api_treasury_revenue_update(revenue_id):
 def api_treasury_payouts():
     user = require_treasury_access()
     db = get_db()
+    purge_orphaned_unsettled_transaction_revenue(db)
     purge_unsettled_revenue_payouts(db)
     normalize_stakeholder_flow_payouts(db)
     settled_revenue_ids = get_settled_revenue_ids(db)
