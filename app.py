@@ -378,6 +378,66 @@ def remove_hidden_setup_object_metadata(db):
     db.custom_objects.delete_many({"id": {"$in": hidden_object_ids}})
 
 
+DEFAULT_ACCOUNTS = [
+    {"name": "Cash on Hand", "gl_code": "1000", "type": "Asset"},
+    {"name": "Bank Account", "gl_code": "1010", "type": "Asset"},
+    {"name": "Sales Revenue", "gl_code": "4000", "type": "Revenue"},
+    {"name": "Subscription Revenue", "gl_code": "4010", "type": "Revenue"},
+    {"name": "Operating Expenses", "gl_code": "5000", "type": "Expense"},
+    {"name": "Salary", "gl_code": "5010", "type": "Expense"},
+    {"name": "Stakeholder Payout", "gl_code": "5020", "type": "Expense"},
+    {"name": "Channel Partner Payout", "gl_code": "5030", "type": "Expense"},
+]
+
+
+def ensure_default_accounts(db):
+    for account in DEFAULT_ACCOUNTS:
+        existing = db.accounts.find_one({"name": account["name"]})
+        visibility = default_account_visibility(account["type"])
+        if existing:
+            updates = {}
+            if not existing.get("gl_code"):
+                updates["gl_code"] = account["gl_code"]
+            if not existing.get("type"):
+                updates["type"] = account["type"]
+            if "is_active" not in existing:
+                updates["is_active"] = 1
+            if "show_in_income" not in existing:
+                updates["show_in_income"] = visibility["show_in_income"]
+            if "show_in_expense" not in existing:
+                updates["show_in_expense"] = visibility["show_in_expense"]
+            if updates:
+                db.accounts.update_one({"id": existing["id"]}, {"$set": updates})
+        else:
+            db.accounts.insert_one({
+                "id": get_next_sequence_value("accounts"),
+                "gl_code": account["gl_code"],
+                "name": account["name"],
+                "type": account["type"],
+                "is_active": 1,
+                **visibility,
+                "balance": 0,
+                "is_system_default": 1,
+                "created_at": datetime.now()
+            })
+
+    for account in db.accounts.find({"$or": [
+        {"is_active": {"$exists": False}},
+        {"show_in_income": {"$exists": False}},
+        {"show_in_expense": {"$exists": False}},
+    ]}):
+        visibility = default_account_visibility(account.get("type"))
+        updates = {}
+        if "is_active" not in account:
+            updates["is_active"] = 1
+        if "show_in_income" not in account:
+            updates["show_in_income"] = visibility["show_in_income"]
+        if "show_in_expense" not in account:
+            updates["show_in_expense"] = visibility["show_in_expense"]
+        if updates:
+            db.accounts.update_one({"id": account["id"]}, {"$set": updates})
+
+
 def init_database():
     db = get_db()
     
@@ -418,28 +478,13 @@ def init_database():
     # Seed accounts
     if db.accounts.count_documents({}) == 0:
         db.accounts.insert_many([
-            {"id": get_next_sequence_value("accounts"), "name": "Cash on Hand", "type": "Asset", "balance": 0, "is_system_default": 1, "created_at": datetime.now()},
-            {"id": get_next_sequence_value("accounts"), "name": "Bank Account", "type": "Asset", "balance": 0, "is_system_default": 1, "created_at": datetime.now()},
-            {"id": get_next_sequence_value("accounts"), "name": "Sales Revenue", "type": "Revenue", "balance": 0, "is_system_default": 1, "created_at": datetime.now()},
-            {"id": get_next_sequence_value("accounts"), "name": "Operating Expenses", "type": "Expense", "balance": 0, "is_system_default": 1, "created_at": datetime.now()}
+            {"id": get_next_sequence_value("accounts"), "gl_code": "1000", "name": "Cash on Hand", "type": "Asset", "balance": 0, "is_system_default": 1, "created_at": datetime.now()},
+            {"id": get_next_sequence_value("accounts"), "gl_code": "1010", "name": "Bank Account", "type": "Asset", "balance": 0, "is_system_default": 1, "created_at": datetime.now()},
+            {"id": get_next_sequence_value("accounts"), "gl_code": "4000", "name": "Sales Revenue", "type": "Revenue", "balance": 0, "is_system_default": 1, "created_at": datetime.now()},
+            {"id": get_next_sequence_value("accounts"), "gl_code": "5000", "name": "Operating Expenses", "type": "Expense", "balance": 0, "is_system_default": 1, "created_at": datetime.now()}
         ])
 
-    # Ensure additional expense accounts exist
-    additional_expense_accounts = [
-        "Salary",
-        "Stakeholder Payout",
-        "Channel Partner Payout"
-    ]
-    for acc_name in additional_expense_accounts:
-        if not db.accounts.find_one({"name": acc_name}):
-            db.accounts.insert_one({
-                "id": get_next_sequence_value("accounts"),
-                "name": acc_name,
-                "type": "Expense",
-                "balance": 0,
-                "is_system_default": 1,
-                "created_at": datetime.now()
-            })
+    ensure_default_accounts(db)
 
     # Seed roles
     if db.roles.count_documents({}) == 0:
@@ -1040,6 +1085,7 @@ def api_dashboard():
 @app.route("/api/options")
 def api_options():
     db = get_db()
+    ensure_default_accounts(db)
     customers_list = list(db.customers.find({}, {"_id": 0, "id": 1, "company_name": 1}).sort("company_name", 1))
     
     opportunities_list = list(db.opportunities.aggregate([
@@ -1089,6 +1135,198 @@ def api_options():
             }
         )
     )
+
+
+ACCOUNT_TYPES = {"Asset", "Liability", "Equity", "Revenue", "Expense"}
+
+
+def bool_flag(value):
+    return 1 if value in (True, 1, "1", "true", "True", "on", "yes", "Yes") else 0
+
+
+def default_account_visibility(account_type):
+    return {
+        "show_in_income": 1 if account_type == "Revenue" else 0,
+        "show_in_expense": 1 if account_type == "Expense" else 0,
+    }
+
+
+def normalize_account_payload(data, existing=None):
+    gl_code = (data.get("gl_code") or "").strip()
+    name = (data.get("name") or "").strip()
+    account_type = (data.get("type") or (existing or {}).get("type") or "Revenue").strip()
+    defaults = default_account_visibility(account_type)
+
+    if not gl_code:
+        return None, "GL code is required."
+    if not name:
+        return None, "Name is required."
+    if account_type not in ACCOUNT_TYPES:
+        return None, "Invalid account type."
+
+    return {
+        "gl_code": gl_code,
+        "name": name,
+        "type": account_type,
+        "is_active": bool_flag(data.get("is_active", (existing or {}).get("is_active", 1))),
+        "show_in_income": bool_flag(data.get("show_in_income", (existing or {}).get("show_in_income", defaults["show_in_income"]))),
+        "show_in_expense": bool_flag(data.get("show_in_expense", (existing or {}).get("show_in_expense", defaults["show_in_expense"]))),
+    }, None
+
+
+def account_available_for_transaction(account, transaction_type):
+    if not account or not account.get("is_active", 1):
+        return False
+    if transaction_type == "Income":
+        return bool(account.get("show_in_income", 1 if account.get("type") == "Revenue" else 0))
+    if transaction_type == "Expense":
+        return bool(account.get("show_in_expense", 1 if account.get("type") == "Expense" else 0))
+    return False
+
+
+INVOICE_RECEIPT_STATUSES = ["Approved", "Partially Paid"]
+
+
+def invoice_receipt_summary(invoice):
+    paid = float(invoice.get("amount_paid") or 0)
+    total = float(invoice.get("total_amount") or 0)
+    balance = max(0, total - paid)
+    return {
+        "id": invoice.get("id"),
+        "invoice_number": invoice.get("invoice_number"),
+        "customer_id": invoice.get("customer_id"),
+        "project_id": invoice.get("project_id"),
+        "account_id": invoice.get("account_id"),
+        "invoice_date": invoice.get("issue_date"),
+        "due_date": invoice.get("due_date"),
+        "currency": invoice.get("currency"),
+        "status": invoice.get("status"),
+        "total_amount": total,
+        "amount_paid": paid,
+        "balance_due": balance,
+    }
+
+
+@app.route("/api/finance/accounts", methods=["GET", "POST"])
+def api_finance_accounts():
+    require_finance_access()
+    db = get_db()
+    ensure_default_accounts(db)
+
+    if request.method == "POST":
+        data = request.get_json() or {}
+        payload, error = normalize_account_payload(data)
+        if error:
+            return jsonify({"error": error}), 400
+        if db.accounts.find_one({"gl_code": payload["gl_code"]}):
+            return jsonify({"error": "GL code already exists."}), 400
+        if db.accounts.find_one({"name": {"$regex": f"^{re.escape(payload['name'])}$", "$options": "i"}}):
+            return jsonify({"error": "Account name already exists."}), 400
+
+        account_id = get_next_sequence_value("accounts")
+        doc = {
+            "id": account_id,
+            **payload,
+            "balance": 0,
+            "is_system_default": 0,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        }
+        db.accounts.insert_one(doc)
+        log_activity_async("Finance", "Chart of Account", account_id, "CREATE", new_data=doc, reference_number=payload["name"])
+        return jsonify(json_ready({"account": {k: v for k, v in doc.items() if k != "_id"}}))
+
+    accounts = list(db.accounts.find({}, {"_id": 0}).sort([("gl_code", 1), ("name", 1)]))
+    return jsonify(json_ready({"accounts": accounts, "account_types": sorted(ACCOUNT_TYPES)}))
+
+
+@app.route("/api/finance/accounts/<int:account_id>", methods=["PUT"])
+def api_finance_account_detail(account_id):
+    require_finance_access()
+    db = get_db()
+    ensure_default_accounts(db)
+
+    existing = db.accounts.find_one({"id": account_id})
+    if not existing:
+        abort(404)
+
+    data = request.get_json() or {}
+    payload, error = normalize_account_payload(data, existing)
+    if error:
+        return jsonify({"error": error}), 400
+
+    duplicate_code = db.accounts.find_one({"gl_code": payload["gl_code"], "id": {"$ne": account_id}})
+    if duplicate_code:
+        return jsonify({"error": "GL code already exists."}), 400
+    duplicate_name = db.accounts.find_one({
+        "name": {"$regex": f"^{re.escape(payload['name'])}$", "$options": "i"},
+        "id": {"$ne": account_id},
+    })
+    if duplicate_name:
+        return jsonify({"error": "Account name already exists."}), 400
+
+    update_data = {**payload, "updated_at": datetime.now()}
+    db.accounts.update_one({"id": account_id}, {"$set": update_data})
+    updated = db.accounts.find_one({"id": account_id})
+    log_activity_async("Finance", "Chart of Account", account_id, "UPDATE", old_data=existing, new_data=updated, reference_number=payload["name"])
+    return jsonify(json_ready({"account": {k: v for k, v in updated.items() if k != "_id"}}))
+
+
+@app.route("/api/finance/accounts/<int:account_id>/transactions")
+def api_finance_account_transactions(account_id):
+    require_finance_access()
+    db = get_db()
+    account = db.accounts.find_one({"id": account_id}, {"_id": 0})
+    if not account:
+        abort(404)
+
+    transactions = list(db.transactions.aggregate([
+        {"$match": {"account_id": account_id}},
+        {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
+        {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "vendors", "localField": "vendor_id", "foreignField": "id", "as": "vendor"}},
+        {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
+        {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "invoices", "localField": "invoice_id", "foreignField": "id", "as": "invoice"}},
+        {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "customer_name": "$customer.company_name",
+            "vendor_name": "$vendor.name",
+            "project_name": "$project.project_name",
+            "invoice_number": {"$ifNull": ["$invoice.invoice_number", "$invoice_number"]},
+            "transaction_date": {"$ifNull": ["$transaction_date", "$date"]},
+        }},
+        {"$project": {"customer": 0, "vendor": 0, "project": 0, "invoice": 0, "_id": 0}},
+        {"$sort": {"transaction_date": -1, "id": -1}},
+    ]))
+    return jsonify(json_ready({"account": account, "transactions": transactions}))
+
+
+@app.route("/api/finance/invoices/receivable")
+def api_finance_receivable_invoices():
+    require_finance_access()
+    db = get_db()
+    customer_id = request.args.get("customer_id")
+    account_id = request.args.get("account_id")
+    if not customer_id:
+        return jsonify(json_ready({"invoices": []}))
+
+    query = {
+        "customer_id": int(customer_id),
+        "status": {"$in": INVOICE_RECEIPT_STATUSES},
+    }
+    if account_id:
+        query["$or"] = [
+            {"account_id": int(account_id)},
+            {"account_id": {"$exists": False}},
+            {"account_id": None},
+        ]
+
+    invoices = list(
+        db.invoices.find(query, {"_id": 0}).sort([("issue_date", -1), ("invoice_number", -1)])
+    )
+    return jsonify(json_ready({"invoices": [invoice_receipt_summary(inv) for inv in invoices]}))
 
 
 @app.route("/api/search")
@@ -1179,6 +1417,8 @@ def api_global_search():
         if "ledger" in term.lower() or "transaction" in term.lower():
             add_result("Transaction Ledger", "Finance", "/finance/transactions", "All accounting entries")
             add_result("General Ledger Report", "Finance", "/finance/reports/general-ledger", "Ledger balances and journal view")
+        if "account" in term.lower() or "chart" in term.lower() or "gl" in term.lower():
+            add_result("Chart of Accounts", "Finance", "/finance/accounts", "GL codes and ledger accounts")
 
     return jsonify({"results": results[:20]})
 
@@ -2242,16 +2482,49 @@ def api_finance_transactions():
         date_val = data.get("transaction_date") or data.get("date")
         if not date_val:
             date_val = datetime.now().strftime("%Y-%m-%d")
+
+        account_id = int(data.get("account_id")) if data.get("account_id") else None
+        customer_id = int(data.get("customer_id")) if data.get("customer_id") else None
+        selected_account = db.accounts.find_one({"id": account_id}) if account_id else None
+        transaction_type = data.get("type", "Income")
+        if account_id and not account_available_for_transaction(selected_account, transaction_type):
+            return jsonify({"error": "Selected account is not available for this transaction type."}), 400
+        invoice_id = int(data.get("invoice_id")) if data.get("invoice_id") else None
+        invoice_number = data.get("invoice_number")
+        needs_invoice = transaction_type == "Income" and selected_account and selected_account.get("name") == "Sales Revenue"
+        if needs_invoice:
+            if not customer_id:
+                return jsonify({"error": "Customer is required for Sales Revenue receipts."}), 400
+            if not invoice_id:
+                return jsonify({"error": "Invoice number is required for Sales Revenue receipts."}), 400
+            invoice = db.invoices.find_one({
+                "id": invoice_id,
+                "customer_id": customer_id,
+                "status": {"$in": INVOICE_RECEIPT_STATUSES},
+                "$or": [
+                    {"account_id": account_id},
+                    {"account_id": {"$exists": False}},
+                    {"account_id": None},
+                ],
+            })
+            if not invoice:
+                return jsonify({"error": "Select an approved invoice for this customer and account."}), 400
+            invoice_number = invoice.get("invoice_number")
+        else:
+            invoice_id = None
+            invoice_number = None
             
         actor = get_current_user()
         actor_id = actor["id"] if actor else None
         actor_name = actor.get("full_name", "Unknown") if actor else "System"
         insert_data = {
             "id": transaction_id,
-            "account_id": int(data.get("account_id")) if data.get("account_id") else None,
-            "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
+            "account_id": account_id,
+            "customer_id": customer_id,
             "vendor_id": int(data.get("vendor_id")) if data.get("vendor_id") else None,
             "project_id": int(data.get("project_id")) if data.get("project_id") else None,
+            "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
             "transaction_date": date_val,
             "date": date_val,
             "description": data.get("description"),
@@ -2293,14 +2566,17 @@ def api_finance_transactions():
         {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
         {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "invoices", "localField": "invoice_id", "foreignField": "id", "as": "invoice"}},
+        {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
             "account_name": "$account.name",
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
+            "invoice_number": {"$ifNull": ["$invoice.invoice_number", "$invoice_number"]},
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
         }},
-        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "_id": 0}},
+        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "invoice": 0, "_id": 0}},
         {"$sort": {"transaction_date": -1}}
     ]))
     transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
@@ -2391,14 +2667,47 @@ def api_finance_transaction_detail(transaction_id):
         if not date_val:
             date_val = datetime.now().strftime("%Y-%m-%d")
             
+        account_id = int(data.get("account_id")) if data.get("account_id") else None
+        customer_id = int(data.get("customer_id")) if data.get("customer_id") else None
+        selected_account = db.accounts.find_one({"id": account_id}) if account_id else None
+        transaction_type = data.get("type")
+        if account_id and not account_available_for_transaction(selected_account, transaction_type):
+            return jsonify({"error": "Selected account is not available for this transaction type."}), 400
+        invoice_id = int(data.get("invoice_id")) if data.get("invoice_id") else None
+        invoice_number = data.get("invoice_number")
+        needs_invoice = transaction_type == "Income" and selected_account and selected_account.get("name") == "Sales Revenue"
+        if needs_invoice:
+            if not customer_id:
+                return jsonify({"error": "Customer is required for Sales Revenue receipts."}), 400
+            if not invoice_id:
+                return jsonify({"error": "Invoice number is required for Sales Revenue receipts."}), 400
+            invoice = db.invoices.find_one({
+                "id": invoice_id,
+                "customer_id": customer_id,
+                "status": {"$in": INVOICE_RECEIPT_STATUSES},
+                "$or": [
+                    {"account_id": account_id},
+                    {"account_id": {"$exists": False}},
+                    {"account_id": None},
+                ],
+            })
+            if not invoice:
+                return jsonify({"error": "Select an approved invoice for this customer and account."}), 400
+            invoice_number = invoice.get("invoice_number")
+        else:
+            invoice_id = None
+            invoice_number = None
+
         old_tx = db.transactions.find_one({"id": transaction_id})
         db.transactions.update_one(
             {"id": transaction_id},
             {"$set": {
-                "account_id": int(data.get("account_id")) if data.get("account_id") else None,
-                "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
+                "account_id": account_id,
+                "customer_id": customer_id,
                 "vendor_id": int(data.get("vendor_id")) if data.get("vendor_id") else None,
                 "project_id": int(data.get("project_id")) if data.get("project_id") else None,
+                "invoice_id": invoice_id,
+                "invoice_number": invoice_number,
                 "transaction_date": date_val,
                 "date": date_val,
                 "description": data.get("description"),
@@ -2441,14 +2750,17 @@ def api_finance_transaction_detail(transaction_id):
         {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
         {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "invoices", "localField": "invoice_id", "foreignField": "id", "as": "invoice"}},
+        {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
             "account_name": "$account.name",
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
+            "invoice_number": {"$ifNull": ["$invoice.invoice_number", "$invoice_number"]},
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
         }},
-        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "_id": 0}}
+        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "invoice": 0, "_id": 0}}
     ]))
     if not transactions:
         abort(404)
@@ -2566,6 +2878,7 @@ def api_invoices():
             "invoice_number": invoice_number,
             "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
             "project_id": int(data.get("project_id")) if data.get("project_id") else None,
+            "account_id": int(data.get("account_id")) if data.get("account_id") else None,
             "issue_date": issue_date,
             "due_date": data.get("due_date"),
             "subtotal": float(data.get("subtotal", 0)),
@@ -2635,6 +2948,7 @@ def api_invoice_detail(invoice_id):
                 "invoice_number": data.get("invoice_number"),
                 "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
                 "project_id": int(data.get("project_id")) if data.get("project_id") else None,
+                "account_id": int(data.get("account_id")) if data.get("account_id") else None,
                 "issue_date": issue_date,
                 "due_date": data.get("due_date"),
                 "subtotal": float(data.get("subtotal")) if data.get("subtotal") is not None else 0.0,
