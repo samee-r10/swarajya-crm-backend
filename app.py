@@ -1185,6 +1185,8 @@ def account_available_for_transaction(account, transaction_type):
 
 
 INVOICE_RECEIPT_STATUSES = ["Approved", "Partially Paid"]
+APPROVED_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid"}
+POST_APPROVAL_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid", "Cancelled"}
 
 
 def invoice_receipt_summary(invoice):
@@ -1205,6 +1207,41 @@ def invoice_receipt_summary(invoice):
         "amount_paid": paid,
         "balance_due": balance,
     }
+
+
+def normalize_invoice_amount_paid(status, amount_paid, total_amount):
+    total = max(0.0, float(total_amount or 0))
+    if status == "Paid":
+        return total
+    if status == "Partially Paid":
+        paid = float(amount_paid or 0)
+        return min(max(0.0, paid), total)
+    return 0.0
+
+
+def invoice_core_values(invoice):
+    return {
+        "invoice_number": invoice.get("invoice_number"),
+        "customer_id": int(invoice["customer_id"]) if invoice.get("customer_id") else None,
+        "project_id": int(invoice["project_id"]) if invoice.get("project_id") else None,
+        "account_id": int(invoice["account_id"]) if invoice.get("account_id") else None,
+        "issue_date": invoice.get("invoice_date") or invoice.get("issue_date"),
+        "due_date": invoice.get("due_date"),
+        "subtotal": float(invoice.get("subtotal") or 0),
+        "tax_rate": float(invoice.get("tax_rate") or 0),
+        "tax_amount": float(invoice.get("tax_amount") or 0),
+        "total_amount": float(invoice.get("total_amount") or 0),
+        "currency": invoice.get("currency"),
+        "notes": invoice.get("notes"),
+        "items": invoice.get("items") or [],
+        "bank_account_id": int(invoice["bank_account_id"]) if invoice.get("bank_account_id") else None,
+    }
+
+
+def invoice_core_changed(old_invoice, new_data):
+    old_values = invoice_core_values(old_invoice)
+    new_values = invoice_core_values(new_data)
+    return json.dumps(old_values, sort_keys=True, default=str) != json.dumps(new_values, sort_keys=True, default=str)
 
 
 @app.route("/api/finance/accounts", methods=["GET", "POST"])
@@ -2873,6 +2910,9 @@ def api_invoices():
         actor = get_current_user()
         actor_id = actor["id"] if actor else None
         actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        total_amount = float(data.get("total_amount", 0))
+        status = data.get("status", "Draft")
+        amount_paid = normalize_invoice_amount_paid(status, data.get("amount_paid"), total_amount)
         insert_data = {
             "id": invoice_id,
             "invoice_number": invoice_number,
@@ -2884,9 +2924,10 @@ def api_invoices():
             "subtotal": float(data.get("subtotal", 0)),
             "tax_rate": float(data.get("tax_rate", 0)),
             "tax_amount": float(data.get("tax_amount", 0)),
-            "total_amount": float(data.get("total_amount", 0)),
+            "total_amount": total_amount,
             "currency": data.get("currency", "USD"),
-            "status": data.get("status", "Draft"),
+            "status": status,
+            "amount_paid": amount_paid,
             "notes": data.get("notes"),
             "items": data.get("items", []),
             "bank_account_id": int(data["bank_account_id"]) if data.get("bank_account_id") else None,
@@ -2940,8 +2981,18 @@ def api_invoice_detail(invoice_id):
             issue_date = datetime.now().strftime("%Y-%m-%d")
             
         old_inv = db.invoices.find_one({"id": invoice_id})
+        if not old_inv:
+            abort(404)
+        status = data.get("status")
+        if old_inv.get("status") in APPROVED_INVOICE_STATUSES:
+            if status not in POST_APPROVAL_INVOICE_STATUSES:
+                return jsonify({"error": "Approved invoices cannot be moved back to draft or sent status. Void this invoice and create a new one if correction is required."}), 400
+            if invoice_core_changed(old_inv, data):
+                return jsonify({"error": "Approved invoices cannot be edited. Void this invoice and create a new one if correction is required."}), 400
         inv_number = data.get("invoice_number") or (old_inv.get("invoice_number") if old_inv else None)
         bank_account_id = int(data["bank_account_id"]) if data.get("bank_account_id") else None
+        total_amount = float(data.get("total_amount")) if data.get("total_amount") is not None else 0.0
+        amount_paid = normalize_invoice_amount_paid(status, data.get("amount_paid"), total_amount)
         db.invoices.update_one(
             {"id": invoice_id},
             {"$set": {
@@ -2954,9 +3005,10 @@ def api_invoice_detail(invoice_id):
                 "subtotal": float(data.get("subtotal")) if data.get("subtotal") is not None else 0.0,
                 "tax_rate": float(data.get("tax_rate")) if data.get("tax_rate") is not None else 0.0,
                 "tax_amount": float(data.get("tax_amount")) if data.get("tax_amount") is not None else 0.0,
-                "total_amount": float(data.get("total_amount")) if data.get("total_amount") is not None else 0.0,
+                "total_amount": total_amount,
                 "currency": data.get("currency"),
-                "status": data.get("status"),
+                "status": status,
+                "amount_paid": amount_paid,
                 "notes": data.get("notes"),
                 "items": data.get("items", []),
                 "bank_account_id": bank_account_id,
