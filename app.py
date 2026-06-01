@@ -1184,7 +1184,7 @@ def account_available_for_transaction(account, transaction_type):
     return False
 
 
-INVOICE_RECEIPT_STATUSES = ["Approved", "Partially Paid"]
+INVOICE_RECEIPT_STATUSES = ["Approved", "Partially Paid", "Paid"]
 APPROVED_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid"}
 POST_APPROVAL_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid", "Cancelled"}
 
@@ -2545,7 +2545,7 @@ def api_finance_transactions():
                 ],
             })
             if not invoice:
-                return jsonify({"error": "Select an approved invoice for this customer and account."}), 400
+                return jsonify({"error": "Select an approved, partially paid, or paid invoice for this customer and account."}), 400
             invoice_number = invoice.get("invoice_number")
         else:
             invoice_id = None
@@ -2729,7 +2729,7 @@ def api_finance_transaction_detail(transaction_id):
                 ],
             })
             if not invoice:
-                return jsonify({"error": "Select an approved invoice for this customer and account."}), 400
+                return jsonify({"error": "Select an approved, partially paid, or paid invoice for this customer and account."}), 400
             invoice_number = invoice.get("invoice_number")
         else:
             invoice_id = None
