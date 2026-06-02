@@ -1,4 +1,5 @@
 import json
+import mimetypes
 import os
 import re
 import hmac
@@ -8,12 +9,16 @@ from datetime import date, datetime
 from decimal import Decimal
 from hashlib import sha256
 import hashlib
+import urllib.error
+import urllib.parse
+import urllib.request
 # sameer
 import pymongo
+from bson import ObjectId
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from pymongo.errors import ConnectionFailure
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
 from flask_cors import CORS
 from itsdangerous import BadSignature, URLSafeSerializer
@@ -93,6 +98,60 @@ OPPORTUNITY_STAGES = ["Draft", "Discussion", "Commercial negotiation", "Contract
 PROJECT_STATUSES = ["Planning", "In Progress", "Blocked", "Delivered", "On Hold"]
 FIELD_TYPES = ["Text", "Long Text", "Number", "Date", "Checkbox", "Dropdown"]
 SETUP_HIDDEN_OBJECT_API_NAMES = {"accounts"}
+VENDOR_CATEGORIES = {"Supply", "Service", "Both"}
+REGISTRATION_TYPES = {"Registered", "Not Registered"}
+SUPPLIER_CATEGORIES = {"MSME", "Non-MSME"}
+MASTER_OPTION_CONFIG = {
+    "payment-terms": {
+        "collection": "payment_terms",
+        "counter": "payment_terms",
+        "response_key": "payment_terms",
+        "label": "Payment Term",
+        "defaults": ["Advance", "30 Days"],
+    },
+    "payment-modes": {
+        "collection": "payment_modes",
+        "counter": "payment_modes",
+        "response_key": "payment_modes",
+        "label": "Payment Mode",
+        "defaults": ["Bank Transfer", "UPI", "Cheque", "Cash"],
+    },
+}
+EXPENSE_CLAIM_STATUSES = {
+    "Draft",
+    "Submitted",
+    "Pending Stakeholder Approval",
+    "Pending Approval Sequence 1",
+    "Pending Approval Sequence 2",
+    "Pending Approval Sequence 3",
+    "Under Review",
+    "Approved",
+    "Rejected",
+    "Posted",
+    "Settled",
+    "Cancelled",
+}
+CLAIM_EDITABLE_STATUSES = {"Draft"}
+LOAN_STATUSES = {"Draft", "Active", "Closed", "Cancelled"}
+LOAN_PROVIDER_TYPES = {"Bank", "Stakeholder", "Third-Party Agency", "Other"}
+LOAN_INTEREST_TYPES = {"Fixed", "Floating"}
+LOAN_TENURE_UNITS = {"Months", "Years"}
+LOAN_REPAYMENT_FREQUENCIES = {"Monthly", "Quarterly", "Half-Yearly", "Yearly", "Custom"}
+LOAN_SCHEDULE_STATUSES = {"Unpaid", "Paid", "Overdue", "Partially Paid"}
+STAKEHOLDER_PAYOUT_TYPES = {"Profit Distribution", "Dividend", "Capital Return", "Custom"}
+STAKEHOLDER_PAYOUT_STATUSES = {
+    "Draft",
+    "Pending Stakeholder Approval",
+    "Pending Approval Sequence 1",
+    "Pending Approval Sequence 2",
+    "Pending Approval Sequence 3",
+    "Approved",
+    "Pending Payment",
+    "Partially Paid",
+    "Paid",
+    "Rejected",
+    "Cancelled",
+}
 
 
 def _check_scrypt_password_hash(pwhash, password):
@@ -178,6 +237,8 @@ def execute(query, params=None):
 
 
 def json_ready(value):
+    if isinstance(value, ObjectId):
+        return str(value)
     if isinstance(value, Decimal):
         return float(value)
     if isinstance(value, (date, datetime)):
@@ -187,6 +248,114 @@ def json_ready(value):
     if isinstance(value, list):
         return [json_ready(item) for item in value]
     return value
+
+
+def cloudinary_config():
+    dotenv_config = dotenv_values(os.path.join(BASE_DIR, ".env"))
+    cloudinary_url = os.getenv("CLOUDINARY_URL") or dotenv_config.get("CLOUDINARY_URL")
+    parsed_url = urllib.parse.urlparse(cloudinary_url or "")
+    url_config = {}
+    if parsed_url.scheme == "cloudinary" and parsed_url.hostname:
+        url_config = {
+            "cloud_name": parsed_url.hostname,
+            "api_key": parsed_url.username,
+            "api_secret": parsed_url.password,
+        }
+    return {
+        "cloud_name": os.getenv("CLOUDINARY_CLOUD_NAME") or dotenv_config.get("CLOUDINARY_CLOUD_NAME") or url_config.get("cloud_name"),
+        "api_key": os.getenv("CLOUDINARY_API_KEY") or dotenv_config.get("CLOUDINARY_API_KEY") or url_config.get("api_key"),
+        "api_secret": os.getenv("CLOUDINARY_API_SECRET") or dotenv_config.get("CLOUDINARY_API_SECRET") or url_config.get("api_secret"),
+    }
+
+
+def is_cloudinary_configured():
+    config = cloudinary_config()
+    return all(config.values())
+
+
+def multipart_encode(fields, files):
+    boundary = f"----swarajya-crm-{datetime.now().timestamp()}".replace(".", "")
+    body = bytearray()
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        body.extend(str(value).encode())
+        body.extend(b"\r\n")
+    for name, file_info in files.items():
+        filename = file_info["filename"]
+        content_type = file_info["content_type"]
+        content = file_info["content"]
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode())
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode())
+        body.extend(content)
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+def upload_file_to_cloudinary(file_storage, folder="crm-documents"):
+    if not is_cloudinary_configured():
+        raise ValueError("Cloudinary is not configured for this backend process. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET in the backend environment, or set CLOUDINARY_URL, then restart the backend.")
+    if not file_storage or not file_storage.filename:
+        raise ValueError("Select a document to upload.")
+
+    file_bytes = file_storage.read()
+    if not file_bytes:
+        raise ValueError("Selected document is empty.")
+    max_size = 12 * 1024 * 1024
+    if len(file_bytes) > max_size:
+        raise ValueError("Document must be 12 MB or smaller.")
+
+    config = cloudinary_config()
+    safe_folder = re.sub(r"[^a-zA-Z0-9/_-]+", "-", folder).strip("-") or "crm-documents"
+    timestamp = int(datetime.now().timestamp())
+    signed_params = {
+        "folder": safe_folder,
+        "timestamp": timestamp,
+        "unique_filename": "true",
+        "use_filename": "true",
+    }
+    signature_base = "&".join(f"{key}={signed_params[key]}" for key in sorted(signed_params))
+    signature = hashlib.sha1(f"{signature_base}{config['api_secret']}".encode()).hexdigest()
+    fields = {
+        **signed_params,
+        "api_key": config["api_key"],
+        "signature": signature,
+    }
+    content_type = file_storage.content_type or mimetypes.guess_type(file_storage.filename)[0] or "application/octet-stream"
+    payload, multipart_type = multipart_encode(fields, {
+        "file": {
+            "filename": file_storage.filename,
+            "content_type": content_type,
+            "content": file_bytes,
+        }
+    })
+    upload_url = f"https://api.cloudinary.com/v1_1/{config['cloud_name']}/auto/upload"
+    request_obj = urllib.request.Request(upload_url, data=payload, headers={"Content-Type": multipart_type}, method="POST")
+    try:
+        with urllib.request.urlopen(request_obj, timeout=30) as response:
+            uploaded = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="ignore")
+        raise ValueError(f"Cloudinary upload failed: {detail or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Cloudinary upload failed: {exc.reason}") from exc
+
+    return {
+        "name": file_storage.filename,
+        "type": content_type,
+        "size": uploaded.get("bytes", len(file_bytes)),
+        "secure_url": uploaded.get("secure_url"),
+        "url": uploaded.get("secure_url") or uploaded.get("url"),
+        "public_id": uploaded.get("public_id"),
+        "resource_type": uploaded.get("resource_type"),
+        "format": uploaded.get("format"),
+        "width": uploaded.get("width"),
+        "height": uploaded.get("height"),
+        "created_at": datetime.now(),
+        "provider": "cloudinary",
+    }
 
 
 def slugify_api_name(value, suffix=""):
@@ -387,6 +556,7 @@ DEFAULT_ACCOUNTS = [
     {"name": "Salary", "gl_code": "5010", "type": "Expense"},
     {"name": "Stakeholder Payout", "gl_code": "5020", "type": "Expense"},
     {"name": "Channel Partner Payout", "gl_code": "5030", "type": "Expense"},
+    {"name": "Employee Claims", "gl_code": "7010", "type": "Expense"},
 ]
 
 
@@ -728,6 +898,18 @@ def require_vault_access():
     if not user or (not is_admin and not user.get("has_vault_access")):
         abort(403)
     return user
+
+
+@app.route("/api/uploads/cloudinary", methods=["POST"])
+def api_cloudinary_upload():
+    require_finance_access()
+    upload = request.files.get("file")
+    folder_context = request.form.get("folder") or "finance-documents"
+    try:
+        document = upload_file_to_cloudinary(upload, f"swarajya-crm/{folder_context}")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(json_ready({"document": document}))
 
 
 def require_vault_unlocked():
@@ -1129,6 +1311,8 @@ def api_options():
                 "accounts": accounts,
                 "vendors": vendors,
                 "projects": projects_list,
+                "payment_terms": active_master_option_names(db, "payment-terms"),
+                "payment_modes": active_master_option_names(db, "payment-modes"),
                 "bank_accounts": list(
                     db.bank_accounts.find({"is_active": {"$ne": 0}}, {"_id": 0}).sort("label", 1)
                 ),
@@ -1142,6 +1326,426 @@ ACCOUNT_TYPES = {"Asset", "Liability", "Equity", "Revenue", "Expense"}
 
 def bool_flag(value):
     return 1 if value in (True, 1, "1", "true", "True", "on", "yes", "Yes") else 0
+
+
+def ensure_master_options(db, config):
+    collection = db[config["collection"]]
+    for name in config["defaults"]:
+        if not collection.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
+            option_id = get_next_sequence_value(config["counter"])
+            collection.insert_one({
+                "id": option_id,
+                "name": name,
+                "is_active": 1,
+                "is_default": 1,
+                "created_at": datetime.now(),
+                "updated_at": datetime.now(),
+            })
+
+
+def active_master_option_names(db, key):
+    config = MASTER_OPTION_CONFIG[key]
+    ensure_master_options(db, config)
+    return [
+        item["name"]
+        for item in db[config["collection"]].find({"is_active": {"$ne": 0}}, {"_id": 0, "name": 1}).sort("name", 1)
+    ]
+
+
+def validate_profile_master_fields(db, data, include_supplier_fields=False):
+    registration_type = data.get("registration_type")
+    if registration_type and registration_type not in REGISTRATION_TYPES:
+        return "Registration Type must be Registered or Not Registered."
+
+    if include_supplier_fields:
+        supplier_category = data.get("supplier_category")
+        if supplier_category and supplier_category not in SUPPLIER_CATEGORIES:
+            return "Supplier Category must be MSME or Non-MSME."
+
+    payment_terms = data.get("payment_terms")
+    if payment_terms and payment_terms not in active_master_option_names(db, "payment-terms"):
+        return "Select an active Payment Term from settings."
+
+    payment_mode = data.get("payment_mode")
+    if payment_mode and payment_mode not in active_master_option_names(db, "payment-modes"):
+        return "Select an active Payment Mode from settings."
+
+    return None
+
+
+def parse_float(value, default=0.0):
+    try:
+        return float(value if value not in (None, "") else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value):
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def create_finance_transaction(db, payload, actor=None):
+    transaction_id = get_next_sequence_value("transactions")
+    amount = parse_float(payload.get("amount"))
+    cgst_amount = parse_float(payload.get("cgst_amount"))
+    igst_amount = parse_float(payload.get("igst_amount"))
+    tds_amount = parse_float(payload.get("tds_amount"))
+    total_amount = parse_float(payload.get("total_amount"), amount + cgst_amount + igst_amount - tds_amount)
+    date_val = payload.get("transaction_date") or payload.get("date") or datetime.now().strftime("%Y-%m-%d")
+    actor_id = actor["id"] if actor else None
+    actor_name = actor.get("full_name", "Unknown") if actor else "System"
+    doc = {
+        "id": transaction_id,
+        "account_id": safe_int(payload.get("account_id")),
+        "customer_id": safe_int(payload.get("customer_id")),
+        "vendor_id": safe_int(payload.get("vendor_id")),
+        "project_id": safe_int(payload.get("project_id")),
+        "invoice_id": safe_int(payload.get("invoice_id")),
+        "invoice_number": payload.get("invoice_number"),
+        "loan_account_id": safe_int(payload.get("loan_account_id")),
+        "loan_schedule_id": safe_int(payload.get("loan_schedule_id")),
+        "expense_claim_id": safe_int(payload.get("expense_claim_id")),
+        "attachments": payload.get("attachments") or [],
+        "transaction_date": date_val,
+        "date": date_val,
+        "description": payload.get("description"),
+        "type": payload.get("type", "Income"),
+        "amount": amount,
+        "currency": payload.get("currency", "INR"),
+        "reference": payload.get("reference"),
+        "category": payload.get("category"),
+        "status": payload.get("status", "Completed"),
+        "cgst_percent": parse_float(payload.get("cgst_percent")),
+        "cgst_amount": cgst_amount,
+        "igst_percent": parse_float(payload.get("igst_percent")),
+        "igst_amount": igst_amount,
+        "tds_percent": parse_float(payload.get("tds_percent")),
+        "tds_amount": tds_amount,
+        "total_amount": total_amount,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+        "created_by_id": actor_id,
+        "created_by_name": actor_name,
+        "modified_by_id": actor_id,
+        "modified_by_name": actor_name,
+    }
+    db.transactions.insert_one(doc)
+    log_activity_async("Finance", "Accounting Entry", transaction_id, "CREATE", new_data=doc, reference_number=doc.get("reference"))
+    return doc
+
+
+def sync_transaction_to_treasury_revenue(db, transaction_doc):
+    existing = db.treasury_revenue.find_one({"transaction_id": transaction_doc["id"]})
+    if existing and existing.get("is_settled"):
+        return existing
+    amount = parse_float(transaction_doc.get("total_amount") or transaction_doc.get("amount"))
+    if transaction_doc.get("type") == "Expense":
+        amount = -abs(amount)
+        revenue_type = transaction_doc.get("category") or "Company Expense"
+        reserve_percentage = 100.0
+    else:
+        amount = abs(amount)
+        revenue_type = transaction_doc.get("category") or "Loan Disbursement"
+        reserve_percentage = 100.0
+    reserve_amount = amount * (reserve_percentage / 100.0)
+    stakeholder_total = 0.0
+    entry_date = transaction_doc.get("transaction_date") or datetime.now().strftime("%Y-%m-%d")
+    payload = {
+        "transaction_id": transaction_doc["id"],
+        "project_id": transaction_doc.get("project_id"),
+        "entry_date": entry_date,
+        "date": datetime.strptime(entry_date, "%Y-%m-%d") if isinstance(entry_date, str) else entry_date,
+        "revenue_type": revenue_type,
+        "amount": amount,
+        "reserve_percentage": reserve_percentage,
+        "reserve_amount": reserve_amount,
+        "channel_partner_id": None,
+        "partner_commission": 0.0,
+        "stakeholder_total": stakeholder_total,
+        "description": transaction_doc.get("description") or f"Auto-flow from Transaction Ledger #{transaction_doc['id']}",
+        "is_settled": False,
+        "updated_at": datetime.now(),
+    }
+    if existing:
+        db.treasury_revenue.update_one({"id": existing["id"]}, {"$set": payload})
+        updated = db.treasury_revenue.find_one({"id": existing["id"]})
+        if amount < 0:
+            create_or_update_payable_from_revenue(db, updated)
+        return updated
+    rev_id = get_next_sequence_value("treasury_revenue")
+    payload.update({
+        "id": rev_id,
+        "revenue_id": f"REV-{rev_id}",
+        "created_at": datetime.now(),
+    })
+    db.treasury_revenue.insert_one(payload)
+    if amount < 0:
+        create_or_update_payable_from_revenue(db, payload)
+    return payload
+
+
+def claim_summary(doc):
+    total = parse_float(doc.get("total_claim_amount"))
+    amount = parse_float(doc.get("amount"))
+    gst_amount = parse_float(doc.get("gst_amount"))
+    gst_percent = parse_float(doc.get("gst_percent"))
+    if not gst_percent and amount > 0 and gst_amount > 0:
+        gst_percent = round((gst_amount / amount) * 100, 2)
+    return {
+        **doc,
+        "total_claim_amount": total,
+        "amount": amount,
+        "gst_amount": gst_amount,
+        "gst_percent": gst_percent,
+    }
+
+
+def active_claim_approvers(db):
+    return list(
+        db.treasury_stakeholders.aggregate([
+            {"$match": {
+                "is_active": {"$ne": False},
+                "linked_user_id": {"$nin": [None, ""]},
+            }},
+            {"$lookup": {"from": "app_users", "localField": "linked_user_id", "foreignField": "id", "as": "linked_user"}},
+            {"$unwind": "$linked_user"},
+            {"$match": {"linked_user.is_active": {"$ne": 0}}},
+            {"$addFields": {"approval_sequence": {"$ifNull": ["$approval_sequence", 999]}}},
+            {"$sort": {"approval_sequence": 1, "id": 1}},
+            {"$project": {"_id": 0, "linked_user": 0}},
+        ])
+    )
+
+
+def claim_pending_status(sequence):
+    if sequence in (1, 2, 3):
+        return f"Pending Approval Sequence {sequence}"
+    return "Pending Stakeholder Approval"
+
+
+def create_system_notification(db, user_id, title, message, link=None):
+    if not user_id:
+        return
+    notification_id = get_next_sequence_value("notifications")
+    db.notifications.insert_one({
+        "id": notification_id,
+        "user_id": user_id,
+        "title": title,
+        "message": message,
+        "link": link,
+        "is_read": False,
+        "created_at": datetime.now(),
+    })
+
+
+def company_fund_available(db):
+    settled_revenue_ids = get_settled_revenue_ids(db)
+    reserve_balance_match = reserve_balance_payout_clause(settled_revenue_ids)
+    inflow_doc = list(db.treasury_payouts.aggregate([
+        {"$match": {"payout_type": "Reserve Fund", **reserve_balance_match}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]))
+    outflow_doc = list(db.treasury_payouts.aggregate([
+        {"$match": {"payout_type": {"$in": ["Reserve Expense", "Stakeholder Payout"]}, **reserve_balance_match}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]))
+    inflow = inflow_doc[0]["total"] if inflow_doc else 0.0
+    outflow = outflow_doc[0]["total"] if outflow_doc else 0.0
+    return inflow - outflow
+
+
+def create_or_update_payable_from_revenue(db, revenue_doc):
+    amount = abs(parse_float(revenue_doc.get("amount")))
+    if amount <= 0:
+        return None
+    existing = db.payables.find_one({"source_module": "Revenue Log", "source_id": revenue_doc.get("id")})
+    if existing and existing.get("status") == "Paid":
+        return existing
+    paid_amount = parse_float((existing or {}).get("paid_amount"))
+    outstanding = max(0.0, amount - paid_amount)
+    status = "Paid" if outstanding <= 0.01 else ("Partially Paid" if paid_amount > 0 else "Pending")
+    payload = {
+        "source_module": "Revenue Log",
+        "source_id": revenue_doc.get("id"),
+        "source_reference": revenue_doc.get("revenue_id") or f"REV-{revenue_doc.get('id')}",
+        "party_name": revenue_doc.get("vendor_name") or revenue_doc.get("employee_name") or revenue_doc.get("stakeholder_name") or revenue_doc.get("description") or "Company Expense",
+        "transaction_date": revenue_doc.get("entry_date") or revenue_doc.get("date") or datetime.now().strftime("%Y-%m-%d"),
+        "original_amount": amount,
+        "paid_amount": paid_amount,
+        "outstanding_amount": outstanding,
+        "payment_status": status,
+        "status": status,
+        "due_date": revenue_doc.get("entry_date"),
+        "remarks": revenue_doc.get("description"),
+        "updated_at": datetime.now(),
+    }
+    if existing:
+        db.payables.update_one({"id": existing["id"]}, {"$set": payload})
+        return db.payables.find_one({"id": existing["id"]})
+    payable_id = get_next_sequence_value("payables")
+    payload.update({
+        "id": payable_id,
+        "payable_number": f"PAY-{payable_id:05d}",
+        "created_at": datetime.now(),
+    })
+    db.payables.insert_one(payload)
+    return payload
+
+
+def sync_negative_revenue_payables(db):
+    for revenue_doc in db.treasury_revenue.find({"amount": {"$lt": 0}}):
+        create_or_update_payable_from_revenue(db, revenue_doc)
+
+
+def initialize_claim_approval_workflow(db, claim_id, actor=None):
+    claim = db.expense_claims.find_one({"id": claim_id})
+    if not claim:
+        return None
+    approvers = active_claim_approvers(db)
+    if not approvers:
+        status = "Approved"
+        db.expense_claims.update_one(
+            {"id": claim_id},
+            {"$set": {
+                "status": status,
+                "approval_required": False,
+                "approval_completed": True,
+                "submitted_at": datetime.now(),
+                "submitted_by_id": actor["id"] if actor else claim.get("created_by_id"),
+                "updated_at": datetime.now(),
+            }},
+        )
+        return status
+
+    db.claim_approvals.delete_many({"claim_id": claim_id})
+    now = datetime.now()
+    steps = []
+    for approver in approvers:
+        sequence = int(approver.get("approval_sequence") or 999)
+        steps.append({
+            "id": get_next_sequence_value("claim_approvals"),
+            "claim_id": claim_id,
+            "stakeholder_id": approver.get("id"),
+            "stakeholder_name": approver.get("name"),
+            "email": approver.get("email"),
+            "linked_user_id": approver.get("linked_user_id"),
+            "approval_sequence": sequence,
+            "status": "Pending" if sequence == int(approvers[0].get("approval_sequence") or 999) else "Waiting",
+            "remarks": "",
+            "created_at": now,
+        })
+    if steps:
+        db.claim_approvals.insert_many(steps)
+    first_sequence = steps[0]["approval_sequence"]
+    status = claim_pending_status(first_sequence)
+    db.expense_claims.update_one(
+        {"id": claim_id},
+        {"$set": {
+            "status": status,
+            "approval_required": True,
+            "approval_completed": False,
+            "current_approval_sequence": first_sequence,
+            "submitted_at": now,
+            "submitted_by_id": actor["id"] if actor else claim.get("created_by_id"),
+            "updated_at": now,
+        }},
+    )
+    for step in steps:
+        if step["approval_sequence"] == first_sequence:
+            create_system_notification(
+                db,
+                step.get("linked_user_id"),
+                "Expense claim approval pending",
+                f"{claim.get('claim_number')} is waiting for your approval.",
+                "/claims/approvals",
+            )
+    return status
+
+
+def initialize_stakeholder_payout_approval_workflow(db, payout_id, actor=None):
+    payout = db.stakeholder_payout_receipts.find_one({"id": payout_id})
+    if not payout:
+        return None
+    approvers = [
+        approver for approver in active_claim_approvers(db)
+        if approver.get("id") != payout.get("stakeholder_id")
+    ]
+    if not approvers:
+        status = "Approved"
+        db.stakeholder_payout_receipts.update_one(
+            {"id": payout_id},
+            {"$set": {
+                "status": status,
+                "approval_required": False,
+                "approval_completed": True,
+                "submitted_at": datetime.now(),
+                "submitted_by_id": actor["id"] if actor else payout.get("created_by_id"),
+                "updated_at": datetime.now(),
+            }},
+        )
+        return status
+
+    db.stakeholder_payout_approvals.delete_many({"payout_id": payout_id})
+    now = datetime.now()
+    first_sequence = int(approvers[0].get("approval_sequence") or 999)
+    steps = []
+    for approver in approvers:
+        sequence = int(approver.get("approval_sequence") or 999)
+        steps.append({
+            "id": get_next_sequence_value("stakeholder_payout_approvals"),
+            "payout_id": payout_id,
+            "stakeholder_id": approver.get("id"),
+            "stakeholder_name": approver.get("name"),
+            "email": approver.get("email"),
+            "linked_user_id": approver.get("linked_user_id"),
+            "approval_sequence": sequence,
+            "status": "Pending" if sequence == first_sequence else "Waiting",
+            "remarks": "",
+            "created_at": now,
+        })
+    if steps:
+        db.stakeholder_payout_approvals.insert_many(steps)
+    status = claim_pending_status(first_sequence)
+    db.stakeholder_payout_receipts.update_one(
+        {"id": payout_id},
+        {"$set": {
+            "status": status,
+            "approval_required": True,
+            "approval_completed": False,
+            "current_approval_sequence": first_sequence,
+            "submitted_at": now,
+            "submitted_by_id": actor["id"] if actor else payout.get("created_by_id"),
+            "updated_at": now,
+        }},
+    )
+    for step in steps:
+        if step["approval_sequence"] == first_sequence:
+            create_system_notification(
+                db,
+                step.get("linked_user_id"),
+                "Stakeholder payout approval pending",
+                f"{payout.get('payout_number')} is waiting for your approval.",
+                "/treasury/stakeholder-payouts/approvals",
+            )
+    return status
+
+
+def loan_totals(db, loan_id):
+    disbursed = sum(parse_float(d.get("amount")) for d in db.loan_disbursements.find({"loan_id": loan_id, "status": "Posted"}))
+    principal_repaid = 0.0
+    for schedule in db.loan_repayment_schedules.find({"loan_id": loan_id, "status": {"$in": ["Paid", "Partially Paid"]}}):
+        paid_amount = parse_float(schedule.get("paid_amount"))
+        total_due = parse_float(schedule.get("total_amount"))
+        principal = parse_float(schedule.get("principal_amount"))
+        if total_due > 0 and paid_amount > 0:
+            principal_repaid += min(principal, principal * min(paid_amount / total_due, 1))
+    return {
+        "total_disbursed_amount": disbursed,
+        "total_principal_repaid": principal_repaid,
+        "outstanding_balance": max(0.0, disbursed - principal_repaid),
+    }
 
 
 def default_account_visibility(account_type):
@@ -1335,7 +1939,7 @@ def api_finance_account_transactions(account_id):
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]},
         }},
         {"$project": {"customer": 0, "vendor": 0, "project": 0, "invoice": 0, "_id": 0}},
-        {"$sort": {"transaction_date": -1, "id": -1}},
+        {"$sort": {"transaction_date": -1, "created_at": -1, "id": -1}},
     ]))
     return jsonify(json_ready({"account": account, "transactions": transactions}))
 
@@ -1880,6 +2484,9 @@ def api_customers():
     db = get_db()
     if request.method == "POST":
         data = request.get_json()
+        validation_error = validate_profile_master_fields(db, data)
+        if validation_error:
+            return jsonify({"error": validation_error}), 400
         customer_id = get_next_sequence_value("customers")
         actor = get_current_user()
         actor_id = actor["id"] if actor else None
@@ -1895,6 +2502,15 @@ def api_customers():
             "status": data.get("status", "Lead"),
             "notes": data.get("notes"),
             "billing_address": data.get("billing_address"),
+            "address_line_1": data.get("address_line_1"),
+            "address_line_2": data.get("address_line_2"),
+            "city": data.get("city"),
+            "pincode": data.get("pincode"),
+            "state": data.get("state"),
+            "country": data.get("country"),
+            "registration_type": data.get("registration_type"),
+            "payment_terms": data.get("payment_terms"),
+            "payment_mode": data.get("payment_mode"),
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
             "created_by_id": actor_id,
@@ -1939,6 +2555,9 @@ def api_customer_detail(customer_id):
         
     if request.method == "PUT":
         data = request.get_json()
+        validation_error = validate_profile_master_fields(db, data)
+        if validation_error:
+            return jsonify({"error": validation_error}), 400
         actor = get_current_user()
         actor_id = actor["id"] if actor else None
         actor_name = actor.get("full_name", "Unknown") if actor else "System"
@@ -1951,6 +2570,15 @@ def api_customer_detail(customer_id):
             "status": data.get("status"),
             "notes": data.get("notes"),
             "billing_address": data.get("billing_address"),
+            "address_line_1": data.get("address_line_1"),
+            "address_line_2": data.get("address_line_2"),
+            "city": data.get("city"),
+            "pincode": data.get("pincode"),
+            "state": data.get("state"),
+            "country": data.get("country"),
+            "registration_type": data.get("registration_type"),
+            "payment_terms": data.get("payment_terms"),
+            "payment_mode": data.get("payment_mode"),
             "updated_at": datetime.now(),
             "modified_by_id": actor_id,
             "modified_by_name": actor_name
@@ -2298,6 +2926,12 @@ def api_finance_vendors():
     db = get_db()
     if request.method == "POST":
         data = request.get_json()
+        validation_error = validate_profile_master_fields(db, data, include_supplier_fields=True)
+        if validation_error:
+            return jsonify({"error": validation_error}), 400
+        category = data.get("category") or "Both"
+        if category not in VENDOR_CATEGORIES:
+            return jsonify({"error": "Vendor category must be Supply, Service, or Both."}), 400
         vendor_id = get_next_sequence_value("vendors")
         actor = get_current_user()
         actor_id = actor["id"] if actor else None
@@ -2309,7 +2943,17 @@ def api_finance_vendors():
             "contact_person": data.get("contact_person"),
             "email": data.get("email"),
             "phone": data.get("phone"),
-            "category": data.get("category"),
+            "category": category,
+            "address_line_1": data.get("address_line_1"),
+            "address_line_2": data.get("address_line_2"),
+            "city": data.get("city"),
+            "pincode": data.get("pincode"),
+            "state": data.get("state"),
+            "country": data.get("country"),
+            "registration_type": data.get("registration_type"),
+            "supplier_category": data.get("supplier_category"),
+            "payment_terms": data.get("payment_terms"),
+            "payment_mode": data.get("payment_mode"),
             "notes": data.get("notes"),
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
@@ -2353,6 +2997,12 @@ def api_finance_vendor_detail(vendor_id):
         
     if request.method == "PUT":
         data = request.get_json()
+        validation_error = validate_profile_master_fields(db, data, include_supplier_fields=True)
+        if validation_error:
+            return jsonify({"error": validation_error}), 400
+        category = data.get("category") or "Both"
+        if category not in VENDOR_CATEGORIES:
+            return jsonify({"error": "Vendor category must be Supply, Service, or Both."}), 400
         actor = get_current_user()
         actor_id = actor["id"] if actor else None
         actor_name = actor.get("full_name", "Unknown") if actor else "System"
@@ -2361,7 +3011,17 @@ def api_finance_vendor_detail(vendor_id):
             "contact_person": data.get("contact_person"),
             "email": data.get("email"),
             "phone": data.get("phone"),
-            "category": data.get("category"),
+            "category": category,
+            "address_line_1": data.get("address_line_1"),
+            "address_line_2": data.get("address_line_2"),
+            "city": data.get("city"),
+            "pincode": data.get("pincode"),
+            "state": data.get("state"),
+            "country": data.get("country"),
+            "registration_type": data.get("registration_type"),
+            "supplier_category": data.get("supplier_category"),
+            "payment_terms": data.get("payment_terms"),
+            "payment_mode": data.get("payment_mode"),
             "notes": data.get("notes"),
             "updated_at": datetime.now(),
             "modified_by_id": actor_id,
@@ -2550,6 +3210,52 @@ def api_finance_transactions():
         else:
             invoice_id = None
             invoice_number = None
+
+        category = data.get("category")
+        expense_claim_id = safe_int(data.get("expense_claim_id"))
+        is_employee_claim_account = (
+            transaction_type == "Expense"
+            and selected_account
+            and (
+                str(selected_account.get("gl_code") or "").strip() == "7010"
+                or selected_account.get("name") == "Employee Claims"
+            )
+        )
+        linked_claim = None
+        if is_employee_claim_account:
+            if not expense_claim_id:
+                return jsonify({"error": "Select an approved employee claim before posting to GL 7010 - Employee Claims."}), 400
+            linked_claim = db.expense_claims.find_one({
+                "id": expense_claim_id,
+                "status": "Approved",
+                "posted_transaction_id": {"$exists": False},
+            })
+            if not linked_claim:
+                return jsonify({"error": "Select an approved and unposted employee claim."}), 400
+        loan_account_id = safe_int(data.get("loan_account_id"))
+        loan_schedule_id = safe_int(data.get("loan_schedule_id"))
+        linked_loan = None
+        linked_schedule = None
+        if category in {"Loan Disbursement", "Loan Repayment"}:
+            if not loan_account_id:
+                return jsonify({"error": "Loan Account Number is required for loan transactions."}), 400
+            linked_loan = db.loan_accounts.find_one({"id": loan_account_id, "status": {"$ne": "Cancelled"}})
+            if not linked_loan:
+                return jsonify({"error": "Select a valid loan account."}), 400
+            if category == "Loan Disbursement":
+                if transaction_type != "Income":
+                    return jsonify({"error": "Loan disbursement must be posted as an income/inflow transaction."}), 400
+                totals = loan_totals(db, loan_account_id)
+                if totals["total_disbursed_amount"] + total_amount > parse_float(linked_loan.get("total_loan_amount")) + 0.01:
+                    return jsonify({"error": "Total disbursement cannot exceed approved loan amount."}), 400
+            if category == "Loan Repayment":
+                if transaction_type != "Expense":
+                    return jsonify({"error": "Loan repayment must be posted as an expense/outflow transaction."}), 400
+                if not loan_schedule_id:
+                    return jsonify({"error": "Repayment schedule line is required for loan repayment."}), 400
+                linked_schedule = db.loan_repayment_schedules.find_one({"id": loan_schedule_id, "loan_id": loan_account_id})
+                if not linked_schedule:
+                    return jsonify({"error": "Select a valid repayment schedule line for this loan."}), 400
             
         actor = get_current_user()
         actor_id = actor["id"] if actor else None
@@ -2562,6 +3268,10 @@ def api_finance_transactions():
             "project_id": int(data.get("project_id")) if data.get("project_id") else None,
             "invoice_id": invoice_id,
             "invoice_number": invoice_number,
+            "loan_account_id": loan_account_id,
+            "loan_schedule_id": loan_schedule_id,
+            "expense_claim_id": expense_claim_id,
+            "attachments": data.get("attachments") or [],
             "transaction_date": date_val,
             "date": date_val,
             "description": data.get("description"),
@@ -2569,8 +3279,8 @@ def api_finance_transactions():
             "amount": amount,
             "currency": data.get("currency", "USD"),
             "reference": data.get("reference"),
-            "category": data.get("category"),
-            "depreciation_value": float(data.get("depreciation_value") or 0) if data.get("category") == "Fixed Assets" else None,
+            "category": category,
+            "depreciation_value": float(data.get("depreciation_value") or 0) if category == "Fixed Assets" else None,
             "status": data.get("status", "Completed"),
             "cgst_percent": cgst_percent,
             "cgst_amount": cgst_amount,
@@ -2591,6 +3301,41 @@ def api_finance_transactions():
                 insert_data[k] = v
 
         db.transactions.insert_one(insert_data)
+        if category == "Loan Disbursement" and linked_loan:
+            disb_id = get_next_sequence_value("loan_disbursements")
+            db.loan_disbursements.insert_one({
+                "id": disb_id,
+                "loan_id": loan_account_id,
+                "disbursement_date": date_val,
+                "amount": total_amount,
+                "bank_account_id": safe_int(data.get("bank_account_id") or linked_loan.get("bank_account_id")),
+                "reference": data.get("reference"),
+                "remarks": data.get("description"),
+                "transaction_id": transaction_id,
+                "status": "Posted",
+                "created_at": datetime.now(),
+            })
+            db.loan_accounts.update_one({"id": loan_account_id}, {"$set": {"status": "Active", "updated_at": datetime.now()}})
+            sync_transaction_to_treasury_revenue(db, insert_data)
+        elif category == "Loan Repayment" and linked_schedule:
+            final_status = "Paid" if total_amount >= parse_float(linked_schedule.get("total_amount")) else "Partially Paid"
+            db.loan_repayment_schedules.update_one(
+                {"id": loan_schedule_id},
+                {"$set": {"status": final_status, "transaction_id": transaction_id, "paid_amount": total_amount, "updated_at": datetime.now()}},
+            )
+            sync_transaction_to_treasury_revenue(db, insert_data)
+        elif linked_claim:
+            db.expense_claims.update_one(
+                {"id": expense_claim_id},
+                {"$set": {
+                    "status": "Posted",
+                    "posted_transaction_id": transaction_id,
+                    "posted_at": datetime.now(),
+                    "posted_by": actor_id,
+                    "updated_at": datetime.now(),
+                }},
+            )
+            sync_transaction_to_treasury_revenue(db, insert_data)
         log_activity_async("Finance", "Accounting Entry", transaction_id, "CREATE", new_data=insert_data, reference_number=data.get("reference"))
         return jsonify({"id": transaction_id})
         
@@ -2614,7 +3359,7 @@ def api_finance_transactions():
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
         }},
         {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "invoice": 0, "_id": 0}},
-        {"$sort": {"transaction_date": -1}}
+        {"$sort": {"transaction_date": -1, "created_at": -1, "id": -1}}
     ]))
     transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
     fields = get_fields_for_user(transaction_obj["id"]) if transaction_obj else []
@@ -2735,6 +3480,37 @@ def api_finance_transaction_detail(transaction_id):
             invoice_id = None
             invoice_number = None
 
+        category = data.get("category")
+        expense_claim_id = safe_int(data.get("expense_claim_id"))
+        is_employee_claim_account = (
+            transaction_type == "Expense"
+            and selected_account
+            and (
+                str(selected_account.get("gl_code") or "").strip() == "7010"
+                or selected_account.get("name") == "Employee Claims"
+            )
+        )
+        if is_employee_claim_account and not expense_claim_id:
+            return jsonify({"error": "Select an approved employee claim before posting to GL 7010 - Employee Claims."}), 400
+        loan_account_id = safe_int(data.get("loan_account_id"))
+        loan_schedule_id = safe_int(data.get("loan_schedule_id"))
+        if category in {"Loan Disbursement", "Loan Repayment"}:
+            if not loan_account_id:
+                return jsonify({"error": "Loan Account Number is required for loan transactions."}), 400
+            linked_loan = db.loan_accounts.find_one({"id": loan_account_id, "status": {"$ne": "Cancelled"}})
+            if not linked_loan:
+                return jsonify({"error": "Select a valid loan account."}), 400
+            if category == "Loan Disbursement" and transaction_type != "Income":
+                return jsonify({"error": "Loan disbursement must be posted as an income/inflow transaction."}), 400
+            if category == "Loan Repayment":
+                if transaction_type != "Expense":
+                    return jsonify({"error": "Loan repayment must be posted as an expense/outflow transaction."}), 400
+                if not loan_schedule_id:
+                    return jsonify({"error": "Repayment schedule line is required for loan repayment."}), 400
+                linked_schedule = db.loan_repayment_schedules.find_one({"id": loan_schedule_id, "loan_id": loan_account_id})
+                if not linked_schedule:
+                    return jsonify({"error": "Select a valid repayment schedule line for this loan."}), 400
+
         old_tx = db.transactions.find_one({"id": transaction_id})
         db.transactions.update_one(
             {"id": transaction_id},
@@ -2745,6 +3521,10 @@ def api_finance_transaction_detail(transaction_id):
                 "project_id": int(data.get("project_id")) if data.get("project_id") else None,
                 "invoice_id": invoice_id,
                 "invoice_number": invoice_number,
+                "loan_account_id": loan_account_id,
+                "loan_schedule_id": loan_schedule_id,
+                "expense_claim_id": expense_claim_id,
+                "attachments": data.get("attachments") or [],
                 "transaction_date": date_val,
                 "date": date_val,
                 "description": data.get("description"),
@@ -2752,7 +3532,7 @@ def api_finance_transaction_detail(transaction_id):
                 "amount": amount,
                 "currency": data.get("currency"),
                 "reference": data.get("reference"),
-                "category": data.get("category"),
+                "category": category,
                 "status": data.get("status"),
                 "cgst_percent": cgst_percent,
                 "cgst_amount": cgst_amount,
@@ -2774,6 +3554,16 @@ def api_finance_transaction_detail(transaction_id):
         if dynamic_update_data:
             db.transactions.update_one({"id": transaction_id}, {"$set": dynamic_update_data})
         new_tx = db.transactions.find_one({"id": transaction_id})
+        if category == "Loan Repayment" and loan_schedule_id:
+            linked_schedule = db.loan_repayment_schedules.find_one({"id": loan_schedule_id, "loan_id": loan_account_id})
+            if linked_schedule:
+                final_status = "Paid" if total_amount >= parse_float(linked_schedule.get("total_amount")) else "Partially Paid"
+                db.loan_repayment_schedules.update_one(
+                    {"id": loan_schedule_id},
+                    {"$set": {"status": final_status, "transaction_id": transaction_id, "paid_amount": total_amount, "updated_at": datetime.now()}},
+                )
+        if category in {"Loan Disbursement", "Loan Repayment"} or db.treasury_revenue.find_one({"transaction_id": transaction_id}):
+            sync_transaction_to_treasury_revenue(db, new_tx)
         log_activity_async("Finance", "Accounting Entry", transaction_id, "UPDATE", old_data=old_tx, new_data=new_tx, reference_number=new_tx.get("reference"))
         return jsonify({"success": True})
         
@@ -3137,6 +3927,75 @@ def api_settings_company():
         return jsonify(json_ready(json.loads(setting["value"])))
     return jsonify(json_ready({}))
 
+
+@app.route("/api/settings/master-options/<option_type>", methods=["GET", "POST"])
+def api_settings_master_options(option_type):
+    require_finance_access()
+    config = MASTER_OPTION_CONFIG.get(option_type)
+    if not config:
+        abort(404)
+    db = get_db()
+    ensure_master_options(db, config)
+    collection = db[config["collection"]]
+
+    if request.method == "POST":
+        data = request.get_json() or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": f"{config['label']} name is required."}), 400
+        if collection.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
+            return jsonify({"error": f"{config['label']} already exists."}), 400
+        option_id = get_next_sequence_value(config["counter"])
+        doc = {
+            "id": option_id,
+            "name": name,
+            "is_active": 0 if data.get("is_active") is False else 1,
+            "is_default": 0,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        }
+        collection.insert_one(doc)
+        log_activity_async("Setup", config["label"], option_id, "CREATE", new_data=doc, reference_number=name)
+        return jsonify(json_ready({"option": {k: v for k, v in doc.items() if k != "_id"}}))
+
+    options = list(collection.find({}, {"_id": 0}).sort([("is_active", -1), ("name", 1)]))
+    return jsonify(json_ready({config["response_key"]: options}))
+
+
+@app.route("/api/settings/master-options/<option_type>/<int:option_id>", methods=["PUT"])
+def api_settings_master_option_detail(option_type, option_id):
+    require_finance_access()
+    config = MASTER_OPTION_CONFIG.get(option_type)
+    if not config:
+        abort(404)
+    db = get_db()
+    ensure_master_options(db, config)
+    collection = db[config["collection"]]
+    existing = collection.find_one({"id": option_id})
+    if not existing:
+        abort(404)
+
+    data = request.get_json() or {}
+    name = (data.get("name", existing.get("name")) or "").strip()
+    if not name:
+        return jsonify({"error": f"{config['label']} name is required."}), 400
+    duplicate = collection.find_one({
+        "id": {"$ne": option_id},
+        "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"},
+    })
+    if duplicate:
+        return jsonify({"error": f"{config['label']} already exists."}), 400
+
+    update_data = {
+        "name": name,
+        "is_active": 0 if data.get("is_active") is False else 1,
+        "updated_at": datetime.now(),
+    }
+    collection.update_one({"id": option_id}, {"$set": update_data})
+    updated = collection.find_one({"id": option_id})
+    log_activity_async("Setup", config["label"], option_id, "UPDATE", old_data=existing, new_data=updated, reference_number=name)
+    return jsonify({"success": True})
+
 def convert_to_usd(amount, currency, date_str, inr_rate, setting):
     amount = float(amount or 0.0)
     if not currency or currency == "USD":
@@ -3319,7 +4178,7 @@ def api_treasury_dashboard():
     reserve_accumulated = reserve_acc_doc[0]["total"] if reserve_acc_doc else 0.0
 
     reserve_spent_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Reserve Expense", **reserve_balance_match}},
+        {"$match": {"payout_type": {"$in": ["Reserve Expense", "Stakeholder Payout"]}, **reserve_balance_match}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     reserve_spent = reserve_spent_doc[0]["total"] if reserve_spent_doc else 0.0
@@ -3472,7 +4331,7 @@ def api_treasury_payment_stats():
         
     # 3. Reserve Ledger (settled allocations + manual reserve expenses only)
     reserve_ledger = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": {"$in": ["Reserve Fund", "Reserve Expense"]}, **reserve_balance_match}},
+        {"$match": {"payout_type": {"$in": ["Reserve Fund", "Reserve Expense", "Stakeholder Payout"]}, **reserve_balance_match}},
         {"$lookup": {"from": "treasury_revenue", "localField": "revenue_id", "foreignField": "id", "as": "rev"}},
         {"$unwind": {"path": "$rev", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
@@ -3495,6 +4354,90 @@ def api_treasury_payment_stats():
         "reserve_ledger": reserve_ledger
     }))
 
+
+@app.route("/api/treasury/payables", methods=["GET"])
+def api_treasury_payables():
+    require_treasury_access()
+    db = get_db()
+    sync_negative_revenue_payables(db)
+    status = request.args.get("status")
+    query = {}
+    if status:
+        query["status"] = status
+    payables = list(db.payables.find(query, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1)]))
+    stats = {
+        "total_payables": sum(parse_float(p.get("original_amount")) for p in payables if p.get("status") != "Cancelled"),
+        "pending_payments": sum(parse_float(p.get("outstanding_amount")) for p in payables if p.get("status") in {"Pending", "Partially Paid"}),
+        "paid_amount": sum(parse_float(p.get("paid_amount")) for p in payables),
+        "company_fund_available": company_fund_available(db),
+    }
+    return jsonify(json_ready({"payables": payables, "stats": stats}))
+
+
+@app.route("/api/treasury/payables/<int:payable_id>/payments", methods=["POST"])
+def api_treasury_payable_payment(payable_id):
+    user = require_treasury_access()
+    db = get_db()
+    payable = db.payables.find_one({"id": payable_id})
+    if not payable:
+        abort(404)
+    if payable.get("status") in {"Paid", "Cancelled"}:
+        return jsonify({"error": "This payable is already closed."}), 400
+    data = request.get_json() or {}
+    outstanding = parse_float(payable.get("outstanding_amount"), payable.get("original_amount"))
+    payment_amount = parse_float(data.get("payment_amount"), outstanding)
+    if payment_amount <= 0:
+        return jsonify({"error": "Payment amount must be greater than zero."}), 400
+    if payment_amount > outstanding + 0.01:
+        return jsonify({"error": "Overpayment is not allowed."}), 400
+    available = company_fund_available(db)
+    if payment_amount > available + 0.01:
+        return jsonify({"error": "Insufficient company fund for this payment."}), 400
+    payment_id = get_next_sequence_value("payable_payments")
+    payment_date = data.get("payment_date") or datetime.now().strftime("%Y-%m-%d")
+    db.payable_payments.insert_one({
+        "id": payment_id,
+        "payable_id": payable_id,
+        "payment_amount": payment_amount,
+        "payment_date": payment_date,
+        "bank_account_id": safe_int(data.get("bank_account_id")),
+        "payment_mode": data.get("payment_mode"),
+        "reference": data.get("reference"),
+        "remarks": data.get("remarks"),
+        "created_at": datetime.now(),
+        "created_by_id": user["id"],
+    })
+    db.treasury_payouts.insert_one({
+        "id": get_next_sequence_value("treasury_payouts"),
+        "payable_id": payable_id,
+        "payout_type": "Reserve Expense",
+        "amount": payment_amount,
+        "status": "Paid",
+        "payout_date": payment_date,
+        "description": f"Payable payment {payable.get('payable_number')} - {payable.get('source_reference')}",
+        "created_at": datetime.now(),
+        "created_by_id": user["id"],
+    })
+    paid_amount = parse_float(payable.get("paid_amount")) + payment_amount
+    new_outstanding = max(0.0, parse_float(payable.get("original_amount")) - paid_amount)
+    status = "Paid" if new_outstanding <= 0.01 else "Partially Paid"
+    db.payables.update_one(
+        {"id": payable_id},
+        {"$set": {
+            "paid_amount": paid_amount,
+            "outstanding_amount": new_outstanding,
+            "status": status,
+            "payment_status": status,
+            "payment_mode": data.get("payment_mode"),
+            "settlement_account": safe_int(data.get("bank_account_id")),
+            "last_payment_id": payment_id,
+            "updated_at": datetime.now(),
+        }},
+    )
+    log_treasury_action(user["id"], "Payable Paid", f"Paid {payment_amount:.2f} against {payable.get('payable_number')}.")
+    return jsonify({"success": True, "status": status})
+
+
 @app.route("/api/treasury/reserve/expense", methods=["POST"])
 def api_treasury_reserve_expense():
     user = require_treasury_access()
@@ -3507,21 +4450,28 @@ def api_treasury_reserve_expense():
     
     if amount <= 0:
         return jsonify({"error": "Invalid amount"}), 400
-        
-    payout_id = get_next_sequence_value("treasury_payouts")
-    db.treasury_payouts.insert_one({
-        "id": payout_id,
-        "payout_type": "Reserve Expense",
-        "entity_id": None,
-        "amount": amount,
-        "status": "Paid",
-        "payout_date": expense_date,
-        "description": desc,
-        "created_at": datetime.now()
+
+    payable_id = get_next_sequence_value("payables")
+    db.payables.insert_one({
+        "id": payable_id,
+        "payable_number": f"PAY-{payable_id:05d}",
+        "source_module": "Treasury Expense",
+        "source_id": payable_id,
+        "source_reference": f"TREXP-{payable_id:05d}",
+        "party_name": "Treasury Expense",
+        "transaction_date": expense_date,
+        "original_amount": amount,
+        "outstanding_amount": amount,
+        "paid_amount": 0.0,
+        "payment_status": "Pending",
+        "status": "Pending",
+        "remarks": desc,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
     })
     
-    log_treasury_action(user["id"], "Reserve Expense Recorded", f"Deducted {amount} from Reserve Fund: {desc}")
-    return jsonify({"ok": True})
+    log_treasury_action(user["id"], "Treasury Payable Created", f"Created payable {payable_id} for reserve expense: {desc}")
+    return jsonify({"ok": True, "payable_id": payable_id})
 
 @app.route("/api/treasury/stakeholders/<int:sid>/settle", methods=["POST"])
 def api_treasury_stakeholder_settle(sid):
@@ -3572,12 +4522,19 @@ def api_treasury_stakeholders():
         sid = get_next_sequence_value("treasury_stakeholders")
         
         payout_pct = float(data.get("payout_percentage", 0))
+        linked_user_id = safe_int(data.get("linked_user_id"))
+        if linked_user_id and not db.app_users.find_one({"id": linked_user_id, "is_active": {"$ne": 0}}):
+            return jsonify({"error": "Linked user account must be an active user."}), 400
         db.treasury_stakeholders.insert_one({
             "id": sid,
             "name": data.get("name"),
+            "email": data.get("email"),
+            "linked_user_id": linked_user_id,
+            "approval_sequence": int(data.get("approval_sequence") or 0),
             "payout_percentage": payout_pct,
             "equity_percentage": payout_pct, # backward compatible
             "payment_details": data.get("payment_details", ""),
+            "remarks": data.get("remarks", ""),
             "is_active": data.get("is_active", True),
             "created_at": datetime.now()
         })
@@ -3588,7 +4545,16 @@ def api_treasury_stakeholders():
         )
         return jsonify({"ok": True})
         
-    stakeholders = list(db.treasury_stakeholders.find({}, {"_id": 0}))
+    stakeholders = list(db.treasury_stakeholders.aggregate([
+        {"$lookup": {"from": "app_users", "localField": "linked_user_id", "foreignField": "id", "as": "linked_user"}},
+        {"$unwind": {"path": "$linked_user", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "linked_user_name": "$linked_user.full_name",
+            "linked_user_email": "$linked_user.email",
+        }},
+        {"$project": {"_id": 0, "linked_user": 0}},
+        {"$sort": {"approval_sequence": 1, "created_at": -1}},
+    ]))
     return jsonify(json_ready({"stakeholders": stakeholders}))
 
 @app.route("/api/treasury/stakeholders/<int:sid>", methods=["PUT"])
@@ -3602,13 +4568,20 @@ def api_treasury_stakeholder_detail(sid):
         return jsonify({"error": "Stakeholder not found."}), 404
 
     payout_pct = float(data.get("payout_percentage", 0))
+    linked_user_id = safe_int(data.get("linked_user_id"))
+    if linked_user_id and not db.app_users.find_one({"id": linked_user_id, "is_active": {"$ne": 0}}):
+        return jsonify({"error": "Linked user account must be an active user."}), 400
     db.treasury_stakeholders.update_one(
         {"id": sid},
         {"$set": {
             "name": data.get("name"),
+            "email": data.get("email"),
+            "linked_user_id": linked_user_id,
+            "approval_sequence": int(data.get("approval_sequence") or 0),
             "payout_percentage": payout_pct,
             "equity_percentage": payout_pct, # backward compatible
             "payment_details": data.get("payment_details", ""),
+            "remarks": data.get("remarks", ""),
             "is_active": data.get("is_active", True)
         }}
     )
@@ -3618,6 +4591,246 @@ def api_treasury_stakeholder_detail(sid):
         format_stakeholder_audit_details(old_doc, data),
     )
     return jsonify({"ok": True})
+
+
+@app.route("/api/treasury/stakeholder-payouts", methods=["GET", "POST"])
+def api_treasury_stakeholder_payouts():
+    user = require_treasury_access()
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json() or {}
+        status = data.get("status", "Draft")
+        if status not in {"Draft", "Submitted"}:
+            return jsonify({"error": "Stakeholder payout can only be created as Draft or Submitted."}), 400
+        stakeholder_id = safe_int(data.get("stakeholder_id"))
+        stakeholder = db.treasury_stakeholders.find_one({"id": stakeholder_id, "is_active": {"$ne": False}})
+        if not stakeholder:
+            return jsonify({"error": "Select an active stakeholder."}), 400
+        payout_type = data.get("payout_type", "Profit Distribution")
+        if payout_type not in STAKEHOLDER_PAYOUT_TYPES:
+            return jsonify({"error": "Invalid payout type."}), 400
+        amount = parse_float(data.get("amount"))
+        if amount <= 0:
+            return jsonify({"error": "Payout amount must be greater than zero."}), 400
+        payout_id = get_next_sequence_value("stakeholder_payout_receipts")
+        doc = {
+            "id": payout_id,
+            "payout_number": data.get("payout_number") or f"SP-{datetime.now().strftime('%Y%m')}-{payout_id:04d}",
+            "stakeholder_id": stakeholder_id,
+            "stakeholder_name": stakeholder.get("name"),
+            "stakeholder_account": data.get("stakeholder_account") or stakeholder.get("payment_details"),
+            "payout_date": data.get("payout_date") or datetime.now().strftime("%Y-%m-%d"),
+            "payout_type": payout_type,
+            "amount": amount,
+            "paid_amount": 0.0,
+            "outstanding_amount": amount,
+            "payment_mode": data.get("payment_mode"),
+            "bank_account_id": safe_int(data.get("bank_account_id")),
+            "reference": data.get("reference"),
+            "remarks": data.get("remarks"),
+            "attachment": data.get("attachment"),
+            "status": status,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+            "created_by_id": user["id"],
+            "created_by_name": user.get("full_name"),
+        }
+        db.stakeholder_payout_receipts.insert_one(doc)
+        if status == "Submitted":
+            initialize_stakeholder_payout_approval_workflow(db, payout_id, user)
+        log_treasury_action(user["id"], "Created Stakeholder Payout", f"Created payout {doc['payout_number']} for {stakeholder.get('name')}.")
+        saved = db.stakeholder_payout_receipts.find_one({"id": payout_id}, {"_id": 0})
+        return jsonify(json_ready({"payout": saved}))
+
+    payouts = list(db.stakeholder_payout_receipts.find({}, {"_id": 0}).sort([("created_at", -1)]))
+    return jsonify(json_ready({"payouts": payouts, "company_fund_available": company_fund_available(db)}))
+
+
+@app.route("/api/treasury/stakeholder-payouts/<int:payout_id>", methods=["GET", "PUT"])
+def api_treasury_stakeholder_payout_detail(payout_id):
+    user = require_treasury_access()
+    db = get_db()
+    payout = db.stakeholder_payout_receipts.find_one({"id": payout_id}, {"_id": 0})
+    if not payout:
+        abort(404)
+    if request.method == "PUT":
+        if payout.get("status") != "Draft":
+            return jsonify({"error": "Stakeholder payout cannot be edited after submission."}), 400
+        data = request.get_json() or {}
+        stakeholder_id = safe_int(data.get("stakeholder_id", payout.get("stakeholder_id")))
+        stakeholder = db.treasury_stakeholders.find_one({"id": stakeholder_id, "is_active": {"$ne": False}})
+        if not stakeholder:
+            return jsonify({"error": "Select an active stakeholder."}), 400
+        amount = parse_float(data.get("amount"), payout.get("amount"))
+        if amount <= 0:
+            return jsonify({"error": "Payout amount must be greater than zero."}), 400
+        status = data.get("status", payout.get("status"))
+        update = {
+            "stakeholder_id": stakeholder_id,
+            "stakeholder_name": stakeholder.get("name"),
+            "stakeholder_account": data.get("stakeholder_account", payout.get("stakeholder_account")),
+            "payout_date": data.get("payout_date", payout.get("payout_date")),
+            "payout_type": data.get("payout_type", payout.get("payout_type")),
+            "amount": amount,
+            "outstanding_amount": amount,
+            "payment_mode": data.get("payment_mode", payout.get("payment_mode")),
+            "bank_account_id": safe_int(data.get("bank_account_id", payout.get("bank_account_id"))),
+            "reference": data.get("reference", payout.get("reference")),
+            "remarks": data.get("remarks", payout.get("remarks")),
+            "attachment": data.get("attachment", payout.get("attachment")),
+            "status": status,
+            "updated_at": datetime.now(),
+        }
+        if update["payout_type"] not in STAKEHOLDER_PAYOUT_TYPES:
+            return jsonify({"error": "Invalid payout type."}), 400
+        db.stakeholder_payout_receipts.update_one({"id": payout_id}, {"$set": update})
+        if status == "Submitted":
+            initialize_stakeholder_payout_approval_workflow(db, payout_id, user)
+        return jsonify({"success": True})
+    payments = list(db.stakeholder_payout_payments.find({"payout_id": payout_id}, {"_id": 0}).sort("payment_date", -1))
+    approvals = list(db.stakeholder_payout_approvals.find({"payout_id": payout_id}, {"_id": 0}).sort([("approval_sequence", 1), ("id", 1)]))
+    return jsonify(json_ready({"payout": payout, "payments": payments, "approvals": approvals}))
+
+
+@app.route("/api/treasury/stakeholder-payouts/<int:payout_id>/action", methods=["POST"])
+def api_treasury_stakeholder_payout_action(payout_id):
+    user = require_treasury_access()
+    db = get_db()
+    payout = db.stakeholder_payout_receipts.find_one({"id": payout_id})
+    if not payout:
+        abort(404)
+    data = request.get_json() or {}
+    action = data.get("action")
+    if action == "submit":
+        if payout.get("status") != "Draft":
+            return jsonify({"error": "Only draft stakeholder payouts can be submitted."}), 400
+        status = initialize_stakeholder_payout_approval_workflow(db, payout_id, user)
+        return jsonify({"success": True, "status": status})
+    if action == "cancel":
+        if payout.get("status") != "Draft":
+            return jsonify({"error": "Stakeholder payout cannot be cancelled after submission."}), 400
+        db.stakeholder_payout_receipts.update_one({"id": payout_id}, {"$set": {"status": "Cancelled", "updated_at": datetime.now()}})
+        return jsonify({"success": True, "status": "Cancelled"})
+    if action == "mark_paid":
+        if payout.get("status") not in {"Approved", "Pending Payment", "Partially Paid"}:
+            return jsonify({"error": "Only approved stakeholder payouts can be paid."}), 400
+        outstanding = parse_float(payout.get("outstanding_amount"), payout.get("amount"))
+        payment_amount = parse_float(data.get("payment_amount"), outstanding)
+        if payment_amount <= 0:
+            return jsonify({"error": "Payment amount must be greater than zero."}), 400
+        if payment_amount > outstanding + 0.01:
+            return jsonify({"error": "Overpayment is not allowed."}), 400
+        available = company_fund_available(db)
+        if payment_amount > available + 0.01:
+            return jsonify({"error": "Insufficient company fund for this payout."}), 400
+        payment_id = get_next_sequence_value("stakeholder_payout_payments")
+        payment_date = data.get("payment_date") or datetime.now().strftime("%Y-%m-%d")
+        db.stakeholder_payout_payments.insert_one({
+            "id": payment_id,
+            "payout_id": payout_id,
+            "payment_amount": payment_amount,
+            "payment_date": payment_date,
+            "bank_account_id": safe_int(data.get("bank_account_id") or payout.get("bank_account_id")),
+            "payment_mode": data.get("payment_mode") or payout.get("payment_mode"),
+            "reference": data.get("reference") or payout.get("reference"),
+            "remarks": data.get("remarks"),
+            "created_at": datetime.now(),
+            "created_by_id": user["id"],
+        })
+        movement_id = get_next_sequence_value("treasury_payouts")
+        db.treasury_payouts.insert_one({
+            "id": movement_id,
+            "payout_type": "Stakeholder Payout",
+            "stakeholder_id": payout.get("stakeholder_id"),
+            "stakeholder_payout_id": payout_id,
+            "amount": payment_amount,
+            "status": "Paid",
+            "payout_date": payment_date,
+            "description": f"Stakeholder payout {payout.get('payout_number')} paid",
+            "created_at": datetime.now(),
+        })
+        paid_amount = parse_float(payout.get("paid_amount")) + payment_amount
+        new_outstanding = max(0.0, parse_float(payout.get("amount")) - paid_amount)
+        status = "Paid" if new_outstanding <= 0.01 else "Partially Paid"
+        db.stakeholder_payout_receipts.update_one(
+            {"id": payout_id},
+            {"$set": {
+                "paid_amount": paid_amount,
+                "outstanding_amount": new_outstanding,
+                "status": status,
+                "last_payment_id": payment_id,
+                "updated_at": datetime.now(),
+            }},
+        )
+        log_treasury_action(user["id"], "Stakeholder Payout Paid", f"Paid {payment_amount:.2f} against {payout.get('payout_number')}.")
+        return jsonify({"success": True, "status": status})
+    return jsonify({"error": "Invalid stakeholder payout action."}), 400
+
+
+@app.route("/api/treasury/stakeholder-payout-approvals/pending", methods=["GET"])
+def api_pending_stakeholder_payout_approvals():
+    if "user_id" not in session:
+        abort(401)
+    db = get_db()
+    approvals = list(db.stakeholder_payout_approvals.aggregate([
+        {"$match": {"linked_user_id": session["user_id"], "status": "Pending"}},
+        {"$lookup": {"from": "stakeholder_payout_receipts", "localField": "payout_id", "foreignField": "id", "as": "payout"}},
+        {"$unwind": "$payout"},
+        {"$match": {"payout.status": {"$regex": "^Pending"}}},
+        {"$project": {"_id": 0, "payout._id": 0}},
+        {"$sort": {"approval_sequence": 1, "created_at": 1}},
+    ]))
+    return jsonify(json_ready({"approvals": approvals}))
+
+
+@app.route("/api/treasury/stakeholder-payout-approvals/<int:approval_id>/action", methods=["POST"])
+def api_stakeholder_payout_approval_action(approval_id):
+    if "user_id" not in session:
+        abort(401)
+    db = get_db()
+    user = get_current_user()
+    data = request.get_json() or {}
+    action = data.get("action")
+    if action not in {"approve", "reject"}:
+        return jsonify({"error": "Invalid approval action."}), 400
+    approval = db.stakeholder_payout_approvals.find_one({"id": approval_id, "linked_user_id": user["id"]})
+    if not approval or approval.get("status") != "Pending":
+        return jsonify({"error": "Approval task not found for this user."}), 404
+    payout = db.stakeholder_payout_receipts.find_one({"id": approval.get("payout_id")})
+    if not payout or not str(payout.get("status", "")).startswith("Pending"):
+        return jsonify({"error": "Payout is not pending approval."}), 400
+    now = datetime.now()
+    final_status = "Approved" if action == "approve" else "Rejected"
+    db.stakeholder_payout_approvals.update_one(
+        {"id": approval_id},
+        {"$set": {"status": final_status, "remarks": data.get("remarks", ""), "action_at": now, "action_by_id": user["id"], "action_by_name": user.get("full_name")}},
+    )
+    db.stakeholder_payout_approval_audit.insert_one({
+        "id": get_next_sequence_value("stakeholder_payout_approval_audit"),
+        "payout_id": payout["id"],
+        "approval_id": approval_id,
+        "approval_sequence": approval.get("approval_sequence"),
+        "action": final_status,
+        "remarks": data.get("remarks", ""),
+        "created_at": now,
+        "created_by_id": user["id"],
+    })
+    if action == "reject":
+        db.stakeholder_payout_approvals.update_many({"payout_id": payout["id"], "status": {"$in": ["Pending", "Waiting"]}}, {"$set": {"status": "Skipped", "updated_at": now}})
+        db.stakeholder_payout_receipts.update_one({"id": payout["id"]}, {"$set": {"status": "Rejected", "rejected_at": now, "rejected_by_id": user["id"], "updated_at": now}})
+        return jsonify({"success": True, "status": "Rejected"})
+    if db.stakeholder_payout_approvals.count_documents({"payout_id": payout["id"], "approval_sequence": approval.get("approval_sequence"), "status": "Pending"}):
+        return jsonify({"success": True, "status": payout.get("status")})
+    next_step = db.stakeholder_payout_approvals.find_one({"payout_id": payout["id"], "status": "Waiting"}, sort=[("approval_sequence", 1), ("id", 1)])
+    if next_step:
+        next_sequence = int(next_step.get("approval_sequence") or 999)
+        status = claim_pending_status(next_sequence)
+        db.stakeholder_payout_approvals.update_many({"payout_id": payout["id"], "approval_sequence": next_sequence, "status": "Waiting"}, {"$set": {"status": "Pending", "updated_at": now}})
+        db.stakeholder_payout_receipts.update_one({"id": payout["id"]}, {"$set": {"status": status, "current_approval_sequence": next_sequence, "updated_at": now}})
+        return jsonify({"success": True, "status": status})
+    db.stakeholder_payout_receipts.update_one({"id": payout["id"]}, {"$set": {"status": "Approved", "approval_completed": True, "approved_at": now, "updated_at": now}})
+    return jsonify({"success": True, "status": "Approved"})
+
 
 @app.route("/api/treasury/channel-partners", methods=["GET", "POST"])
 def api_treasury_partners():
@@ -3666,6 +4879,534 @@ def api_treasury_partner_detail(pid):
     log_treasury_action(user["id"], "Updated Partner", f"Updated partner ID {pid}")
     return jsonify({"ok": True})
 
+
+@app.route("/api/finance/expense-claims", methods=["GET", "POST"])
+def api_expense_claims():
+    require_finance_access()
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json() or {}
+        status = data.get("status", "Draft")
+        if status not in {"Draft", "Submitted"}:
+            return jsonify({"error": "Claims can only be created as Draft or Submitted."}), 400
+        amount = parse_float(data.get("amount"))
+        gst_percent = parse_float(data.get("gst_percent"))
+        gst_amount = parse_float(data.get("gst_amount"), amount * (gst_percent / 100.0))
+        if gst_percent:
+            gst_amount = round(amount * (gst_percent / 100.0), 2)
+        total_claim_amount = parse_float(data.get("total_claim_amount"), amount + gst_amount)
+        if total_claim_amount <= 0:
+            return jsonify({"error": "Total claim amount must be greater than zero."}), 400
+        claim_id = get_next_sequence_value("expense_claims")
+        claim_number = data.get("claim_number") or f"CLM-{datetime.now().strftime('%Y%m')}-{claim_id:04d}"
+        actor = get_current_user()
+        doc = {
+            "id": claim_id,
+            "claim_number": claim_number,
+            "employee_name": (data.get("employee_name") or "").strip(),
+            "department": (data.get("department") or "").strip(),
+            "claim_date": data.get("claim_date") or datetime.now().strftime("%Y-%m-%d"),
+            "expense_date": data.get("expense_date") or data.get("claim_date") or datetime.now().strftime("%Y-%m-%d"),
+            "expense_category": data.get("expense_category") or "Operating Expenses",
+            "expense_description": data.get("expense_description") or data.get("description") or "",
+            "amount": amount,
+            "gst_percent": gst_percent,
+            "gst_amount": gst_amount,
+            "total_claim_amount": total_claim_amount,
+            "payment_mode": data.get("payment_mode"),
+            "attachment": data.get("attachment"),
+            "remarks": data.get("remarks"),
+            "status": status,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+            "created_by_id": actor["id"] if actor else None,
+            "created_by_name": actor.get("full_name", "Unknown") if actor else "System",
+        }
+        db.expense_claims.insert_one(doc)
+        if status == "Submitted":
+            initialize_claim_approval_workflow(db, claim_id, actor)
+        log_activity_async("Finance", "Expense Claim", claim_id, "CREATE", new_data=doc, reference_number=claim_number)
+        saved = db.expense_claims.find_one({"id": claim_id}, {"_id": 0})
+        return jsonify(json_ready({"claim": saved}))
+
+    status = request.args.get("status")
+    query = {}
+    if status:
+        query["status"] = status
+    claims = list(db.expense_claims.find(query, {"_id": 0}).sort([("claim_date", -1), ("created_at", -1)]))
+    return jsonify(json_ready({"claims": [claim_summary(claim) for claim in claims]}))
+
+
+@app.route("/api/finance/expense-claims/approved-unposted", methods=["GET"])
+def api_expense_claims_approved_unposted():
+    require_finance_access()
+    db = get_db()
+    claims = list(db.expense_claims.find({
+        "status": "Approved",
+        "posted_transaction_id": {"$exists": False},
+    }, {"_id": 0}).sort([("approved_at", 1), ("claim_date", 1)]))
+    return jsonify(json_ready({"claims": [claim_summary(claim) for claim in claims]}))
+
+
+@app.route("/api/claim-approvals/pending", methods=["GET"])
+def api_pending_claim_approvals():
+    if "user_id" not in session:
+        abort(401)
+    db = get_db()
+    user_id = session["user_id"]
+    approvals = list(db.claim_approvals.aggregate([
+        {"$match": {"linked_user_id": user_id, "status": "Pending"}},
+        {"$lookup": {"from": "expense_claims", "localField": "claim_id", "foreignField": "id", "as": "claim"}},
+        {"$unwind": "$claim"},
+        {"$match": {"claim.status": {"$regex": "^Pending"}}},
+        {"$project": {"_id": 0, "claim._id": 0}},
+        {"$sort": {"approval_sequence": 1, "created_at": 1}},
+    ]))
+    return jsonify(json_ready({"approvals": approvals}))
+
+
+@app.route("/api/claim-approvals/<int:approval_id>/action", methods=["POST"])
+def api_claim_approval_action(approval_id):
+    if "user_id" not in session:
+        abort(401)
+    db = get_db()
+    user = get_current_user()
+    data = request.get_json() or {}
+    action = data.get("action")
+    if action not in {"approve", "reject"}:
+        return jsonify({"error": "Invalid approval action."}), 400
+    approval = db.claim_approvals.find_one({"id": approval_id, "linked_user_id": user["id"]})
+    if not approval:
+        return jsonify({"error": "Approval task not found for this user."}), 404
+    if approval.get("status") != "Pending":
+        return jsonify({"error": "This approval task is not pending."}), 400
+    claim = db.expense_claims.find_one({"id": approval.get("claim_id")})
+    if not claim or not str(claim.get("status", "")).startswith("Pending"):
+        return jsonify({"error": "Claim is not pending stakeholder approval."}), 400
+    now = datetime.now()
+    remarks = data.get("remarks", "")
+    final_status = "Approved" if action == "approve" else "Rejected"
+    db.claim_approvals.update_one(
+        {"id": approval_id},
+        {"$set": {
+            "status": final_status,
+            "remarks": remarks,
+            "action_at": now,
+            "action_by_id": user["id"],
+            "action_by_name": user.get("full_name"),
+        }},
+    )
+    audit = {
+        "id": get_next_sequence_value("claim_approval_audit"),
+        "claim_id": claim["id"],
+        "approval_id": approval_id,
+        "stakeholder_id": approval.get("stakeholder_id"),
+        "stakeholder_name": approval.get("stakeholder_name"),
+        "linked_user_id": user["id"],
+        "approval_sequence": approval.get("approval_sequence"),
+        "action": final_status,
+        "remarks": remarks,
+        "created_at": now,
+    }
+    db.claim_approval_audit.insert_one(audit)
+    if action == "reject":
+        db.claim_approvals.update_many(
+            {"claim_id": claim["id"], "status": {"$in": ["Pending", "Waiting"]}},
+            {"$set": {"status": "Skipped", "updated_at": now}},
+        )
+        db.expense_claims.update_one(
+            {"id": claim["id"]},
+            {"$set": {"status": "Rejected", "rejected_at": now, "rejected_by_id": user["id"], "approval_completed": False, "updated_at": now}},
+        )
+        create_system_notification(db, claim.get("created_by_id"), "Expense claim rejected", f"{claim.get('claim_number')} was rejected.", "/finance/claims")
+        return jsonify({"success": True, "status": "Rejected"})
+
+    remaining_current = db.claim_approvals.count_documents({
+        "claim_id": claim["id"],
+        "approval_sequence": approval.get("approval_sequence"),
+        "status": "Pending",
+    })
+    if remaining_current:
+        return jsonify({"success": True, "status": claim.get("status")})
+    next_step = db.claim_approvals.find_one(
+        {"claim_id": claim["id"], "status": "Waiting"},
+        sort=[("approval_sequence", 1), ("id", 1)],
+    )
+    if next_step:
+        next_sequence = int(next_step.get("approval_sequence") or 999)
+        db.claim_approvals.update_many(
+            {"claim_id": claim["id"], "approval_sequence": next_sequence, "status": "Waiting"},
+            {"$set": {"status": "Pending", "updated_at": now}},
+        )
+        status = claim_pending_status(next_sequence)
+        db.expense_claims.update_one(
+            {"id": claim["id"]},
+            {"$set": {"status": status, "current_approval_sequence": next_sequence, "updated_at": now}},
+        )
+        for step in db.claim_approvals.find({"claim_id": claim["id"], "approval_sequence": next_sequence, "status": "Pending"}):
+            create_system_notification(db, step.get("linked_user_id"), "Expense claim approval pending", f"{claim.get('claim_number')} is waiting for your approval.", "/claims/approvals")
+        return jsonify({"success": True, "status": status})
+
+    db.expense_claims.update_one(
+        {"id": claim["id"]},
+        {"$set": {
+            "status": "Approved",
+            "approval_completed": True,
+            "approved_at": now,
+            "updated_at": now,
+        }},
+    )
+    create_system_notification(db, claim.get("created_by_id"), "Expense claim approved", f"{claim.get('claim_number')} is fully approved.", "/finance/claims")
+    finance_users = db.app_users.find({"has_finance_access": 1, "is_active": {"$ne": 0}}, {"id": 1})
+    for finance_user in finance_users:
+        create_system_notification(db, finance_user.get("id"), "Claim ready for posting", f"{claim.get('claim_number')} is approved and ready for posting.", "/finance/claims")
+    return jsonify({"success": True, "status": "Approved"})
+
+
+@app.route("/api/finance/expense-claims/<int:claim_id>", methods=["GET", "PUT"])
+def api_expense_claim_detail(claim_id):
+    require_finance_access()
+    db = get_db()
+    claim = db.expense_claims.find_one({"id": claim_id}, {"_id": 0})
+    if not claim:
+        abort(404)
+    if request.method == "PUT":
+        if claim.get("status") not in CLAIM_EDITABLE_STATUSES:
+            return jsonify({"error": "Claims cannot be edited after submission for approval."}), 400
+        data = request.get_json() or {}
+        status = data.get("status", claim.get("status"))
+        if status not in EXPENSE_CLAIM_STATUSES:
+            return jsonify({"error": "Invalid claim status."}), 400
+        amount = parse_float(data.get("amount"), claim.get("amount"))
+        gst_percent = parse_float(data.get("gst_percent"), claim.get("gst_percent"))
+        gst_amount = parse_float(data.get("gst_amount"), claim.get("gst_amount"))
+        if gst_percent:
+            gst_amount = round(amount * (gst_percent / 100.0), 2)
+        update_data = {
+            "employee_name": (data.get("employee_name", claim.get("employee_name")) or "").strip(),
+            "department": (data.get("department", claim.get("department")) or "").strip(),
+            "claim_date": data.get("claim_date", claim.get("claim_date")),
+            "expense_date": data.get("expense_date", claim.get("expense_date")),
+            "expense_category": data.get("expense_category", claim.get("expense_category")),
+            "expense_description": data.get("expense_description", claim.get("expense_description")),
+            "amount": amount,
+            "gst_percent": gst_percent,
+            "gst_amount": gst_amount,
+            "total_claim_amount": parse_float(data.get("total_claim_amount"), amount + gst_amount),
+            "payment_mode": data.get("payment_mode", claim.get("payment_mode")),
+            "attachment": data.get("attachment", claim.get("attachment")),
+            "remarks": data.get("remarks", claim.get("remarks")),
+            "status": status,
+            "updated_at": datetime.now(),
+        }
+        old_claim = db.expense_claims.find_one({"id": claim_id})
+        db.expense_claims.update_one({"id": claim_id}, {"$set": update_data})
+        if status == "Submitted" and claim.get("status") != "Submitted":
+            initialize_claim_approval_workflow(db, claim_id, get_current_user())
+        new_claim = db.expense_claims.find_one({"id": claim_id})
+        log_activity_async("Finance", "Expense Claim", claim_id, "UPDATE", old_data=old_claim, new_data=new_claim, reference_number=claim.get("claim_number"))
+        return jsonify({"success": True})
+    return jsonify(json_ready({"claim": claim_summary(claim)}))
+
+
+@app.route("/api/finance/expense-claims/<int:claim_id>/action", methods=["POST"])
+def api_expense_claim_action(claim_id):
+    require_finance_access()
+    db = get_db()
+    claim = db.expense_claims.find_one({"id": claim_id})
+    if not claim:
+        abort(404)
+    data = request.get_json() or {}
+    action = data.get("action")
+    actor = get_current_user()
+
+    def set_status(status, extra=None):
+        update = {"status": status, "updated_at": datetime.now()}
+        if extra:
+            update.update(extra)
+        db.expense_claims.update_one({"id": claim_id}, {"$set": update})
+        log_activity_async("Finance", "Expense Claim", claim_id, "UPDATE", old_data=claim, new_data=db.expense_claims.find_one({"id": claim_id}), reference_number=claim.get("claim_number"))
+        return jsonify({"success": True, "status": status})
+
+    if action == "submit":
+        if claim.get("status") != "Draft":
+            return jsonify({"error": "Only draft claims can be submitted."}), 400
+        status = initialize_claim_approval_workflow(db, claim_id, actor)
+        return jsonify({"success": True, "status": status})
+    if action == "review":
+        if active_claim_approvers(db):
+            return jsonify({"error": "Submitted claims must follow stakeholder approval workflow."}), 400
+        if claim.get("status") != "Submitted":
+            return jsonify({"error": "Only submitted claims can move under review."}), 400
+        return set_status("Under Review")
+    if action == "approve":
+        if active_claim_approvers(db):
+            return jsonify({"error": "Claims must be approved by linked stakeholders in sequence."}), 400
+        if claim.get("status") not in {"Submitted", "Under Review"}:
+            return jsonify({"error": "Only submitted or under-review claims can be approved."}), 400
+        return set_status("Approved", {"approved_at": datetime.now(), "approved_by": actor["id"] if actor else None})
+    if action == "reject":
+        if active_claim_approvers(db):
+            return jsonify({"error": "Submitted claims can only be rejected by the assigned stakeholder approver."}), 400
+        if claim.get("status") in {"Posted", "Settled"}:
+            return jsonify({"error": "Posted or settled claims cannot be rejected."}), 400
+        return set_status("Rejected", {"rejection_reason": data.get("remarks") or data.get("reason")})
+    if action == "cancel":
+        if claim.get("status") != "Draft":
+            return jsonify({"error": "Claims cannot be cancelled after submission for approval."}), 400
+        return set_status("Cancelled")
+    if action == "post":
+        if claim.get("status") != "Approved":
+            return jsonify({"error": "Only approved claims can be posted."}), 400
+        if claim.get("posted_transaction_id"):
+            return jsonify({"error": "This claim has already been posted."}), 400
+        ensure_default_accounts(db)
+        expense_account = db.accounts.find_one({"name": "Operating Expenses"}) or db.accounts.find_one({"type": "Expense"})
+        tx = create_finance_transaction(db, {
+            "account_id": expense_account.get("id") if expense_account else None,
+            "transaction_date": data.get("posting_date") or claim.get("expense_date"),
+            "description": f"Expense claim {claim.get('claim_number')}: {claim.get('expense_description')}",
+            "type": "Expense",
+            "amount": claim.get("amount"),
+            "cgst_amount": claim.get("gst_amount"),
+            "total_amount": claim.get("total_claim_amount"),
+            "currency": data.get("currency") or "INR",
+            "reference": claim.get("claim_number"),
+            "category": claim.get("expense_category") or "Employee Expense Claim",
+            "expense_claim_id": claim_id,
+            "attachments": [claim.get("attachment")] if claim.get("attachment") else [],
+        }, actor)
+        sync_transaction_to_treasury_revenue(db, tx)
+        return set_status("Posted", {"posted_transaction_id": tx["id"], "posted_at": datetime.now(), "posted_by": actor["id"] if actor else None})
+    if action == "settle":
+        if claim.get("status") != "Posted":
+            return jsonify({"error": "Only posted claims can be settled."}), 400
+        if claim.get("settlement_transaction_id"):
+            return jsonify({"error": "This claim is already settled."}), 400
+        expense_account = db.accounts.find_one({"name": "Operating Expenses"}) or db.accounts.find_one({"type": "Expense"})
+        tx = create_finance_transaction(db, {
+            "account_id": expense_account.get("id") if expense_account else None,
+            "transaction_date": data.get("settlement_date") or datetime.now().strftime("%Y-%m-%d"),
+            "description": f"Settlement for expense claim {claim.get('claim_number')}",
+            "type": "Expense",
+            "amount": claim.get("total_claim_amount"),
+            "total_amount": claim.get("total_claim_amount"),
+            "currency": data.get("currency") or "INR",
+            "reference": data.get("reference") or f"SETTLE-{claim.get('claim_number')}",
+            "category": "Expense Claim Settlement",
+            "expense_claim_id": claim_id,
+        }, actor)
+        sync_transaction_to_treasury_revenue(db, tx)
+        return set_status("Settled", {"settlement_transaction_id": tx["id"], "settled_at": datetime.now(), "settled_by": actor["id"] if actor else None})
+    return jsonify({"error": "Invalid claim action."}), 400
+
+
+@app.route("/api/treasury/loans", methods=["GET", "POST"])
+def api_treasury_loans():
+    user = require_treasury_access()
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json() or {}
+        status = data.get("status", "Draft")
+        if status not in LOAN_STATUSES:
+            return jsonify({"error": "Invalid loan status."}), 400
+        provider_type = data.get("provider_type", "Bank")
+        if provider_type not in LOAN_PROVIDER_TYPES:
+            return jsonify({"error": "Invalid loan provider type."}), 400
+        loan_id = get_next_sequence_value("loan_accounts")
+        doc = {
+            "id": loan_id,
+            "loan_account_number": data.get("loan_account_number") or f"LOAN-{loan_id:04d}",
+            "provider_type": provider_type,
+            "provider_name": data.get("provider_name"),
+            "total_loan_amount": parse_float(data.get("total_loan_amount")),
+            "interest_rate": parse_float(data.get("interest_rate")),
+            "interest_type": data.get("interest_type", "Fixed"),
+            "tenure": parse_float(data.get("tenure")),
+            "tenure_unit": data.get("tenure_unit", "Months"),
+            "start_date": data.get("start_date"),
+            "end_date": data.get("end_date"),
+            "repayment_frequency": data.get("repayment_frequency", "Monthly"),
+            "bank_account_id": safe_int(data.get("bank_account_id")),
+            "purpose": data.get("purpose"),
+            "agreement_attachment": data.get("agreement_attachment"),
+            "remarks": data.get("remarks"),
+            "status": status,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+            "created_by_id": user["id"],
+        }
+        if doc["interest_type"] not in LOAN_INTEREST_TYPES or doc["tenure_unit"] not in LOAN_TENURE_UNITS or doc["repayment_frequency"] not in LOAN_REPAYMENT_FREQUENCIES:
+            return jsonify({"error": "Invalid loan configuration."}), 400
+        db.loan_accounts.insert_one(doc)
+        log_treasury_action(user["id"], "Created Loan Account", f"Created loan account {doc['loan_account_number']}.")
+        return jsonify(json_ready({"loan": {k: v for k, v in doc.items() if k != "_id"}}))
+    loans = list(db.loan_accounts.find({}, {"_id": 0}).sort([("created_at", -1)]))
+    for loan in loans:
+        loan.update(loan_totals(db, loan["id"]))
+        loan["schedules"] = list(
+            db.loan_repayment_schedules.find(
+                {"loan_id": loan["id"], "status": {"$in": ["Unpaid", "Partially Paid"]}},
+                {"_id": 0},
+            ).sort("installment_number", 1)
+        )
+    upcoming = db.loan_repayment_schedules.count_documents({"status": "Unpaid", "due_date": {"$gte": datetime.now().strftime("%Y-%m-%d")}})
+    overdue = db.loan_repayment_schedules.count_documents({"status": {"$in": ["Unpaid", "Partially Paid"]}, "due_date": {"$lt": datetime.now().strftime("%Y-%m-%d")}})
+    return jsonify(json_ready({
+        "loans": loans,
+        "stats": {
+            "active_loans": sum(1 for loan in loans if loan.get("status") == "Active"),
+            "total_loan_amount": sum(parse_float(loan.get("total_loan_amount")) for loan in loans if loan.get("status") != "Cancelled"),
+            "total_disbursed_amount": sum(parse_float(loan.get("total_disbursed_amount")) for loan in loans),
+            "outstanding_loan_balance": sum(parse_float(loan.get("outstanding_balance")) for loan in loans),
+            "upcoming_repayments": upcoming,
+            "overdue_repayments": overdue,
+        }
+    }))
+
+
+@app.route("/api/treasury/loans/<int:loan_id>", methods=["GET", "PUT"])
+def api_treasury_loan_detail(loan_id):
+    user = require_treasury_access()
+    db = get_db()
+    loan = db.loan_accounts.find_one({"id": loan_id}, {"_id": 0})
+    if not loan:
+        abort(404)
+    if request.method == "PUT":
+        data = request.get_json() or {}
+        status = data.get("status", loan.get("status"))
+        totals = loan_totals(db, loan_id)
+        if status == "Closed" and totals["outstanding_balance"] > 0:
+            return jsonify({"error": "Loan can be closed only when outstanding balance is zero."}), 400
+        update = {
+            "provider_type": data.get("provider_type", loan.get("provider_type")),
+            "provider_name": data.get("provider_name", loan.get("provider_name")),
+            "total_loan_amount": parse_float(data.get("total_loan_amount"), loan.get("total_loan_amount")),
+            "interest_rate": parse_float(data.get("interest_rate"), loan.get("interest_rate")),
+            "interest_type": data.get("interest_type", loan.get("interest_type")),
+            "tenure": parse_float(data.get("tenure"), loan.get("tenure")),
+            "tenure_unit": data.get("tenure_unit", loan.get("tenure_unit")),
+            "start_date": data.get("start_date", loan.get("start_date")),
+            "end_date": data.get("end_date", loan.get("end_date")),
+            "repayment_frequency": data.get("repayment_frequency", loan.get("repayment_frequency")),
+            "bank_account_id": safe_int(data.get("bank_account_id", loan.get("bank_account_id"))),
+            "purpose": data.get("purpose", loan.get("purpose")),
+            "agreement_attachment": data.get("agreement_attachment", loan.get("agreement_attachment")),
+            "remarks": data.get("remarks", loan.get("remarks")),
+            "status": status,
+            "updated_at": datetime.now(),
+        }
+        db.loan_accounts.update_one({"id": loan_id}, {"$set": update})
+        log_treasury_action(user["id"], "Updated Loan Account", f"Updated loan account {loan.get('loan_account_number')}.")
+        return jsonify({"success": True})
+    disbursements = list(db.loan_disbursements.find({"loan_id": loan_id}, {"_id": 0}).sort("disbursement_date", -1))
+    schedules = list(db.loan_repayment_schedules.find({"loan_id": loan_id}, {"_id": 0}).sort("installment_number", 1))
+    loan.update(loan_totals(db, loan_id))
+    return jsonify(json_ready({"loan": loan, "disbursements": disbursements, "schedules": schedules}))
+
+
+@app.route("/api/treasury/loans/<int:loan_id>/disbursements", methods=["POST"])
+def api_treasury_loan_disbursement(loan_id):
+    user = require_treasury_access()
+    db = get_db()
+    loan = db.loan_accounts.find_one({"id": loan_id})
+    if not loan:
+        abort(404)
+    data = request.get_json() or {}
+    amount = parse_float(data.get("amount"))
+    totals = loan_totals(db, loan_id)
+    if amount <= 0:
+        return jsonify({"error": "Disbursement amount must be greater than zero."}), 400
+    if totals["total_disbursed_amount"] + amount > parse_float(loan.get("total_loan_amount")) + 0.01:
+        return jsonify({"error": "Total disbursement cannot exceed approved loan amount."}), 400
+    tx = create_finance_transaction(db, {
+        "account_id": safe_int(data.get("bank_account_id") or loan.get("bank_account_id")),
+        "loan_account_id": loan_id,
+        "transaction_date": data.get("disbursement_date") or datetime.now().strftime("%Y-%m-%d"),
+        "description": f"Loan disbursement {loan.get('loan_account_number')}",
+        "type": "Income",
+        "amount": amount,
+        "total_amount": amount,
+        "currency": data.get("currency") or "INR",
+        "reference": data.get("reference"),
+        "category": "Loan Disbursement",
+    }, user)
+    sync_transaction_to_treasury_revenue(db, tx)
+    disb_id = get_next_sequence_value("loan_disbursements")
+    doc = {
+        "id": disb_id,
+        "loan_id": loan_id,
+        "disbursement_date": data.get("disbursement_date") or datetime.now().strftime("%Y-%m-%d"),
+        "amount": amount,
+        "bank_account_id": safe_int(data.get("bank_account_id") or loan.get("bank_account_id")),
+        "reference": data.get("reference"),
+        "remarks": data.get("remarks"),
+        "transaction_id": tx["id"],
+        "status": "Posted",
+        "created_at": datetime.now(),
+    }
+    db.loan_disbursements.insert_one(doc)
+    db.loan_accounts.update_one({"id": loan_id}, {"$set": {"status": "Active", "updated_at": datetime.now()}})
+    log_treasury_action(user["id"], "Posted Loan Disbursement", f"Posted disbursement of {amount:.2f} for {loan.get('loan_account_number')}.")
+    return jsonify(json_ready({"disbursement": doc}))
+
+
+@app.route("/api/treasury/loans/<int:loan_id>/schedules", methods=["POST"])
+def api_treasury_loan_schedule(loan_id):
+    user = require_treasury_access()
+    db = get_db()
+    loan = db.loan_accounts.find_one({"id": loan_id})
+    if not loan:
+        abort(404)
+    data = request.get_json() or {}
+    schedule_id = get_next_sequence_value("loan_repayment_schedules")
+    principal = parse_float(data.get("principal_amount"))
+    interest = parse_float(data.get("interest_amount"))
+    doc = {
+        "id": schedule_id,
+        "loan_id": loan_id,
+        "installment_number": int(data.get("installment_number") or (db.loan_repayment_schedules.count_documents({"loan_id": loan_id}) + 1)),
+        "due_date": data.get("due_date"),
+        "principal_amount": principal,
+        "interest_amount": interest,
+        "total_amount": parse_float(data.get("total_amount"), principal + interest),
+        "paid_amount": 0.0,
+        "status": "Unpaid",
+        "transaction_id": None,
+        "created_at": datetime.now(),
+    }
+    db.loan_repayment_schedules.insert_one(doc)
+    log_treasury_action(user["id"], "Added Loan Repayment Schedule", f"Added installment {doc['installment_number']} for {loan.get('loan_account_number')}.")
+    return jsonify(json_ready({"schedule": doc}))
+
+
+@app.route("/api/treasury/loan-schedules/<int:schedule_id>/status", methods=["PUT"])
+def api_treasury_loan_schedule_status(schedule_id):
+    user = require_treasury_access()
+    db = get_db()
+    schedule = db.loan_repayment_schedules.find_one({"id": schedule_id})
+    if not schedule:
+        abort(404)
+    data = request.get_json() or {}
+    status = data.get("status")
+    if status == "Unpaid":
+        db.loan_repayment_schedules.update_one({"id": schedule_id}, {"$set": {"status": "Unpaid", "transaction_id": None, "paid_amount": 0.0, "updated_at": datetime.now()}})
+        return jsonify({"success": True})
+    if status not in {"Paid", "Partially Paid"}:
+        return jsonify({"error": "Invalid schedule status."}), 400
+    transaction_id = data.get("transaction_id")
+    if not transaction_id:
+        return jsonify({"error": "Link a repayment transaction before marking this schedule as paid."}), 400
+    tx = db.transactions.find_one({"id": transaction_id, "type": "Expense", "status": {"$ne": "Reversed"}})
+    if not tx:
+        return jsonify({"error": "Select a valid expense repayment transaction."}), 400
+    paid_amount = parse_float(data.get("paid_amount"), tx.get("total_amount") or tx.get("amount"))
+    final_status = "Paid" if paid_amount >= parse_float(schedule.get("total_amount")) else "Partially Paid"
+    db.loan_repayment_schedules.update_one({"id": schedule_id}, {"$set": {"status": final_status, "transaction_id": transaction_id, "paid_amount": paid_amount, "updated_at": datetime.now()}})
+    db.transactions.update_one({"id": transaction_id}, {"$set": {"loan_account_id": schedule.get("loan_id"), "loan_schedule_id": schedule_id}})
+    log_treasury_action(user["id"], "Linked Loan Repayment", f"Linked transaction #{transaction_id} to repayment schedule #{schedule_id}.")
+    return jsonify({"success": True, "status": final_status})
+
 @app.route("/api/treasury/revenue", methods=["GET", "POST"])
 def api_treasury_revenue():
     user = require_treasury_access()
@@ -3680,26 +5421,14 @@ def api_treasury_revenue():
         project_id = data.get("project_id")
         if project_id: project_id = int(project_id)
         
-        reserve_percentage = float(data.get("reserve_percentage", 20.0))
-        channel_partner_id = data.get("channel_partner_id")
-        if channel_partner_id: channel_partner_id = int(channel_partner_id)
+        reserve_percentage = 100.0
+        channel_partner_id = None
         
         description = data.get("description", "")
         
-        # Calculate Splits
         reserve_amount = amount * (reserve_percentage / 100.0)
-        
         partner_commission = 0.0
-        if channel_partner_id:
-            partner = db.treasury_partners.find_one({"id": channel_partner_id})
-            if partner:
-                val = float(partner.get("commission_value", 0))
-                if partner.get("commission_type") == "Percentage":
-                    partner_commission = amount * (val / 100.0)
-                else:
-                    partner_commission = val
-                    
-        stakeholder_total = max(0.0, amount - reserve_amount - partner_commission)
+        stakeholder_total = 0.0
         
         rev_id = get_next_sequence_value("treasury_revenue")
         revenue_id_str = f"REV-{rev_id}"
@@ -3753,10 +5482,10 @@ def api_treasury_revenue():
             revenue_type = "Company Expense"
         else:
             amount = abs(amount)
-            reserve_percentage = 20.0
-            reserve_amount = amount * 0.20
+            reserve_percentage = 100.0
+            reserve_amount = amount
             partner_commission = 0.0
-            stakeholder_total = amount - reserve_amount
+            stakeholder_total = 0.0
             revenue_type = "Sales Income"
             
         entry_date = t.get("transaction_date") or t.get("date") or datetime.now().strftime("%Y-%m-%d")
@@ -3782,6 +5511,8 @@ def api_treasury_revenue():
                 "is_settled": False,
                 "created_at": datetime.now()
             })
+            if amount < 0:
+                create_or_update_payable_from_revenue(db, db.treasury_revenue.find_one({"id": rev_id}))
         elif not existing.get("is_settled"):
             db.treasury_revenue.update_one(
                 {"id": existing["id"]},
@@ -3793,12 +5524,15 @@ def api_treasury_revenue():
                     "amount": amount,
                     "reserve_percentage": reserve_percentage,
                     "reserve_amount": reserve_amount,
+                    "channel_partner_id": None,
                     "partner_commission": partner_commission,
                     "stakeholder_total": stakeholder_total,
                     "description": t.get("description") or f"Auto-flow from Transaction Ledger #{t['id']}",
                     "updated_at": datetime.now()
                 }}
             )
+            if amount < 0:
+                create_or_update_payable_from_revenue(db, db.treasury_revenue.find_one({"id": existing["id"]}))
                         
     revenues = list(db.treasury_revenue.aggregate([
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
@@ -3824,22 +5558,15 @@ def api_treasury_revenue_update(revenue_id):
         
     amount = float(rev.get("amount", 0.0))
     entry_date = rev.get("entry_date", datetime.now().strftime("%Y-%m-%d"))
+    if amount < 0:
+        create_or_update_payable_from_revenue(db, rev)
+        return jsonify({"error": "Expense entries are payable-managed. Open Payables and mark the payable as paid to deduct company fund."}), 400
     
-    reserve_percentage = float(data.get("reserve_percentage", 20.0))
-    channel_partner_id = data.get("channel_partner_id")
-    if channel_partner_id: channel_partner_id = int(channel_partner_id)
-    
-    partner_commission_percentage = float(data.get("partner_commission_percentage", 0.0)) if channel_partner_id else 0.0
-    stk_splits = data.get("stakeholders", [])
-    stakeholder_pct_sum = sum(float(s.get("percentage", 0)) for s in stk_splits)
-    total_split_pct = reserve_percentage + partner_commission_percentage + stakeholder_pct_sum
-    if abs(total_split_pct - 100.0) > 0.01:
-        return jsonify({"error": "Split percentages must sum to exactly 100% before settlement."}), 400
-
-    partner_commission = amount * (partner_commission_percentage / 100.0) if channel_partner_id else 0.0
-    
+    reserve_percentage = 100.0
+    channel_partner_id = None
+    partner_commission = 0.0
     reserve_amount = amount * (reserve_percentage / 100.0)
-    stakeholder_total = amount - reserve_amount - partner_commission
+    stakeholder_total = 0.0
     
     # Update revenue document and mark settled (100% split confirmed)
     db.treasury_revenue.update_one(
@@ -3859,74 +5586,28 @@ def api_treasury_revenue_update(revenue_id):
     # Reset existing payouts for this revenue entry
     db.treasury_payouts.delete_many({"revenue_id": revenue_id})
     
-    # Re-insert payouts
-    # 1. Reserve split
+    # Re-insert company fund allocation only for inflows. Outflows become
+    # payables and reduce company fund only when the payable is marked paid.
     is_neg = reserve_amount < 0
-    db.treasury_payouts.insert_one({
-        "id": get_next_sequence_value("treasury_payouts"),
-        "revenue_id": revenue_id,
-        "payout_type": "Reserve Expense" if is_neg else "Reserve Fund",
-        "amount": abs(reserve_amount),
-        "status": "Paid" if is_neg else "Completed",
-        "payout_date": entry_date,
-        "description": f"Reserve fund split allocation for REV-{revenue_id}",
-        "created_at": datetime.now()
-    })
-    
-    # 2. Channel Partner Commission payout
-    if channel_partner_id and abs(partner_commission) > 0:
+    if is_neg:
+        create_or_update_payable_from_revenue(db, db.treasury_revenue.find_one({"id": revenue_id}))
+    else:
         db.treasury_payouts.insert_one({
             "id": get_next_sequence_value("treasury_payouts"),
             "revenue_id": revenue_id,
-            "payout_type": "Channel Partner",
-            "partner_id": channel_partner_id,
-            "amount": abs(partner_commission),
-            "status": "Pending",
+            "payout_type": "Reserve Fund",
+            "amount": abs(reserve_amount),
+            "status": "Completed",
             "payout_date": entry_date,
-            "description": f"Commission payout for Channel Partner ID {channel_partner_id}",
+            "description": f"Company fund allocation for REV-{revenue_id}",
             "created_at": datetime.now()
         })
-        
-    # 3. Owner splits — contributions on expenses, earnings on income
-    is_company_expense = amount < 0
-    for stk_split in stk_splits:
-        sid = int(stk_split["id"])
-        pct = float(stk_split.get("percentage", 0))
-        share = amount * (pct / 100.0)
-        if abs(share) <= 0:
-            continue
-        stk = db.treasury_stakeholders.find_one({"id": sid}, {"_id": 0, "name": 1})
-        stk_name = stk.get("name") if stk else f"Owner ID {sid}"
-        if is_company_expense:
-            db.treasury_payouts.insert_one({
-                "id": get_next_sequence_value("treasury_payouts"),
-                "revenue_id": revenue_id,
-                "payout_type": "Stakeholder Contribution",
-                "stakeholder_id": sid,
-                "amount": abs(share),
-                "status": "Received",
-                "payout_date": entry_date,
-                "description": f"{stk_name} contributed {_format_pct(pct)}% (₹{abs(share):.2f}) toward company expense REV-{revenue_id}",
-                "created_at": datetime.now()
-            })
-        else:
-            db.treasury_payouts.insert_one({
-                "id": get_next_sequence_value("treasury_payouts"),
-                "revenue_id": revenue_id,
-                "payout_type": "Stakeholder",
-                "stakeholder_id": sid,
-                "amount": abs(share),
-                "status": "Pending",
-                "payout_date": entry_date,
-                "description": f"{stk_name} earning {_format_pct(pct)}% (₹{abs(share):.2f}) from REV-{revenue_id}",
-                "created_at": datetime.now()
-            })
-            
-    entry_kind = "company expense (owner contributions)" if is_company_expense else "shared revenue (owner earnings)"
+
+    entry_kind = "company expense" if amount < 0 else "company fund receipt"
     log_treasury_action(
         user["id"],
         "Revenue Settled",
-        f"Finalized 100% split for REV-{revenue_id} as {entry_kind}. Entry is locked.",
+        f"Settled REV-{revenue_id} as {entry_kind}; 100% allocated to company fund. Entry is locked.",
     )
     return jsonify({"ok": True, "is_settled": True})
 
