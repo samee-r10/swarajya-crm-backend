@@ -138,7 +138,8 @@ LOAN_INTEREST_TYPES = {"Fixed", "Floating"}
 LOAN_TENURE_UNITS = {"Months", "Years"}
 LOAN_REPAYMENT_FREQUENCIES = {"Monthly", "Quarterly", "Half-Yearly", "Yearly", "Custom"}
 LOAN_SCHEDULE_STATUSES = {"Unpaid", "Paid", "Overdue", "Partially Paid"}
-STAKEHOLDER_PAYOUT_TYPES = {"Profit Distribution", "Dividend", "Capital Return", "Custom"}
+STAKEHOLDER_PAYOUT_TYPES = {"Profit Distribution", "Dividend", "Capital Return", "Custom", "Channel Partner Payout", "Channel Partner Commission"}
+PAYOUT_RECIPIENT_TYPES = {"Stakeholder", "Channel Partner"}
 STAKEHOLDER_PAYOUT_STATUSES = {
     "Draft",
     "Pending Stakeholder Approval",
@@ -1548,12 +1549,73 @@ def company_fund_available(db):
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
     ]))
     outflow_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": {"$in": ["Reserve Expense", "Stakeholder Payout"]}, **reserve_balance_match}},
+        {"$match": {"payout_type": {"$in": ["Reserve Expense", "Stakeholder Payout", "Channel Partner Payout"]}, **reserve_balance_match}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
     ]))
     inflow = inflow_doc[0]["total"] if inflow_doc else 0.0
     outflow = outflow_doc[0]["total"] if outflow_doc else 0.0
     return inflow - outflow
+
+
+def payout_recipient_payload(db, data, existing=None):
+    existing = existing or {}
+    recipient_type = data.get("recipient_type") or existing.get("recipient_type") or "Stakeholder"
+    if recipient_type not in PAYOUT_RECIPIENT_TYPES:
+        return None, "Select a valid payout recipient type."
+
+    if recipient_type == "Channel Partner":
+        partner_id = safe_int(data.get("partner_id", existing.get("partner_id")))
+        partner = db.treasury_partners.find_one({"id": partner_id, "is_active": {"$ne": False}})
+        if not partner:
+            return None, "Select an active channel partner."
+        name = partner.get("name") or partner.get("partner_name")
+        return {
+            "recipient_type": "Channel Partner",
+            "recipient_id": partner_id,
+            "recipient_name": name,
+            "partner_id": partner_id,
+            "partner_name": name,
+            "stakeholder_id": None,
+            "stakeholder_name": None,
+            "stakeholder_account": data.get("stakeholder_account", existing.get("stakeholder_account")),
+        }, None
+
+    stakeholder_id = safe_int(data.get("stakeholder_id", existing.get("stakeholder_id")))
+    stakeholder = db.treasury_stakeholders.find_one({"id": stakeholder_id, "is_active": {"$ne": False}})
+    if not stakeholder:
+        return None, "Select an active stakeholder."
+    name = stakeholder.get("name")
+    return {
+        "recipient_type": "Stakeholder",
+        "recipient_id": stakeholder_id,
+        "recipient_name": name,
+        "stakeholder_id": stakeholder_id,
+        "stakeholder_name": name,
+        "stakeholder_account": data.get("stakeholder_account", existing.get("stakeholder_account")) or stakeholder.get("payment_details"),
+        "partner_id": None,
+        "partner_name": None,
+    }, None
+
+
+def normalize_payout_recipient(doc):
+    if not doc:
+        return doc
+    doc.setdefault("recipient_type", "Stakeholder")
+    if doc.get("recipient_type") == "Channel Partner":
+        doc["recipient_name"] = doc.get("recipient_name") or doc.get("partner_name")
+        doc["recipient_id"] = doc.get("recipient_id") or doc.get("partner_id")
+    else:
+        doc["recipient_name"] = doc.get("recipient_name") or doc.get("stakeholder_name")
+        doc["recipient_id"] = doc.get("recipient_id") or doc.get("stakeholder_id")
+    return doc
+
+
+def can_manage_payout_approvals(user, db):
+    if not user:
+        return False
+    role = db.roles.find_one({"id": user.get("role_id")}, {"_id": 0, "name": 1}) if user.get("role_id") else None
+    is_admin = role and role.get("name") in ["Admin", "System Administrator"]
+    return bool(is_admin or user.get("has_treasury_access"))
 
 
 def create_or_update_payable_from_revenue(db, revenue_doc):
@@ -1594,9 +1656,67 @@ def create_or_update_payable_from_revenue(db, revenue_doc):
     return payload
 
 
+def payout_payable_source_module(payout):
+    return "Channel Partner Payout" if payout.get("recipient_type") == "Channel Partner" else "Stakeholder Payout"
+
+
+def create_or_update_payable_from_payout(db, payout):
+    if not payout or payout.get("status") not in {"Approved", "Pending Payment", "Partially Paid", "Paid"}:
+        return None
+    amount = parse_float(payout.get("amount"))
+    if amount <= 0:
+        return None
+    source_module = payout_payable_source_module(payout)
+    existing = db.payables.find_one({"source_module": source_module, "source_id": payout.get("id")})
+    if existing and existing.get("status") == "Paid":
+        return existing
+    paid_amount = parse_float((existing or {}).get("paid_amount"), payout.get("paid_amount"))
+    outstanding = max(0.0, amount - paid_amount)
+    status = "Paid" if outstanding <= 0.01 else ("Partially Paid" if paid_amount > 0 else "Pending")
+    payload = {
+        "source_module": source_module,
+        "source_id": payout.get("id"),
+        "source_reference": payout.get("payout_number") or f"SP-{payout.get('id')}",
+        "party_name": payout.get("recipient_name") or payout.get("partner_name") or payout.get("stakeholder_name") or "Payout Recipient",
+        "transaction_date": payout.get("payout_date") or datetime.now().strftime("%Y-%m-%d"),
+        "original_amount": amount,
+        "paid_amount": paid_amount,
+        "outstanding_amount": outstanding,
+        "payment_status": status,
+        "status": status,
+        "due_date": payout.get("payout_date"),
+        "remarks": payout.get("remarks") or payout.get("payout_type"),
+        "updated_at": datetime.now(),
+    }
+    if existing:
+        db.payables.update_one({"id": existing["id"]}, {"$set": payload})
+        db.stakeholder_payout_receipts.update_one(
+            {"id": payout.get("id")},
+            {"$set": {"payable_id": existing["id"], "status": status if status != "Pending" else "Pending Payment", "updated_at": datetime.now()}},
+        )
+        return db.payables.find_one({"id": existing["id"]})
+    payable_id = get_next_sequence_value("payables")
+    payload.update({
+        "id": payable_id,
+        "payable_number": f"PAY-{payable_id:05d}",
+        "created_at": datetime.now(),
+    })
+    db.payables.insert_one(payload)
+    db.stakeholder_payout_receipts.update_one(
+        {"id": payout.get("id")},
+        {"$set": {"payable_id": payable_id, "status": "Pending Payment", "updated_at": datetime.now()}},
+    )
+    return payload
+
+
 def sync_negative_revenue_payables(db):
     for revenue_doc in db.treasury_revenue.find({"amount": {"$lt": 0}}):
         create_or_update_payable_from_revenue(db, revenue_doc)
+
+
+def sync_approved_payout_payables(db):
+    for payout in db.stakeholder_payout_receipts.find({"status": {"$in": ["Approved", "Pending Payment", "Partially Paid", "Paid"]}}):
+        create_or_update_payable_from_payout(db, payout)
 
 
 def initialize_claim_approval_workflow(db, claim_id, actor=None):
@@ -1668,9 +1788,10 @@ def initialize_stakeholder_payout_approval_workflow(db, payout_id, actor=None):
     payout = db.stakeholder_payout_receipts.find_one({"id": payout_id})
     if not payout:
         return None
+    excluded_stakeholder_id = payout.get("stakeholder_id") if payout.get("recipient_type", "Stakeholder") == "Stakeholder" else None
     approvers = [
         approver for approver in active_claim_approvers(db)
-        if approver.get("id") != payout.get("stakeholder_id")
+        if approver.get("id") != excluded_stakeholder_id
     ]
     if not approvers:
         status = "Approved"
@@ -1725,7 +1846,7 @@ def initialize_stakeholder_payout_approval_workflow(db, payout_id, actor=None):
             create_system_notification(
                 db,
                 step.get("linked_user_id"),
-                "Stakeholder payout approval pending",
+                "Payout approval pending",
                 f"{payout.get('payout_number')} is waiting for your approval.",
                 "/treasury/stakeholder-payouts/approvals",
             )
@@ -4178,7 +4299,7 @@ def api_treasury_dashboard():
     reserve_accumulated = reserve_acc_doc[0]["total"] if reserve_acc_doc else 0.0
 
     reserve_spent_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": {"$in": ["Reserve Expense", "Stakeholder Payout"]}, **reserve_balance_match}},
+        {"$match": {"payout_type": {"$in": ["Reserve Expense", "Stakeholder Payout", "Channel Partner Payout"]}, **reserve_balance_match}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]))
     reserve_spent = reserve_spent_doc[0]["total"] if reserve_spent_doc else 0.0
@@ -4331,7 +4452,7 @@ def api_treasury_payment_stats():
         
     # 3. Reserve Ledger (settled allocations + manual reserve expenses only)
     reserve_ledger = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": {"$in": ["Reserve Fund", "Reserve Expense", "Stakeholder Payout"]}, **reserve_balance_match}},
+        {"$match": {"payout_type": {"$in": ["Reserve Fund", "Reserve Expense", "Stakeholder Payout", "Channel Partner Payout"]}, **reserve_balance_match}},
         {"$lookup": {"from": "treasury_revenue", "localField": "revenue_id", "foreignField": "id", "as": "rev"}},
         {"$unwind": {"path": "$rev", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
@@ -4360,6 +4481,7 @@ def api_treasury_payables():
     require_treasury_access()
     db = get_db()
     sync_negative_revenue_payables(db)
+    sync_approved_payout_payables(db)
     status = request.args.get("status")
     query = {}
     if status:
@@ -4407,10 +4529,18 @@ def api_treasury_payable_payment(payable_id):
         "created_at": datetime.now(),
         "created_by_id": user["id"],
     })
+    is_payout_payable = payable.get("source_module") in {"Stakeholder Payout", "Channel Partner Payout"}
+    treasury_payout_type = payable.get("source_module") if is_payout_payable else "Reserve Expense"
+    payout_source = db.stakeholder_payout_receipts.find_one({"id": payable.get("source_id")}) if is_payout_payable else None
     db.treasury_payouts.insert_one({
         "id": get_next_sequence_value("treasury_payouts"),
         "payable_id": payable_id,
-        "payout_type": "Reserve Expense",
+        "payout_type": treasury_payout_type,
+        "stakeholder_payout_id": payable.get("source_id") if is_payout_payable else None,
+        "stakeholder_id": (payout_source or {}).get("stakeholder_id"),
+        "stakeholder_name": (payout_source or {}).get("stakeholder_name"),
+        "partner_id": (payout_source or {}).get("partner_id"),
+        "partner_name": (payout_source or {}).get("partner_name"),
         "amount": payment_amount,
         "status": "Paid",
         "payout_date": payment_date,
@@ -4434,6 +4564,35 @@ def api_treasury_payable_payment(payable_id):
             "updated_at": datetime.now(),
         }},
     )
+    if is_payout_payable:
+        payout = payout_source or db.stakeholder_payout_receipts.find_one({"id": payable.get("source_id")})
+        payout_paid_amount = parse_float((payout or {}).get("paid_amount")) + payment_amount
+        payout_outstanding = max(0.0, parse_float((payout or {}).get("amount")) - payout_paid_amount)
+        payout_status = "Paid" if payout_outstanding <= 0.01 else "Partially Paid"
+        db.stakeholder_payout_payments.insert_one({
+            "id": get_next_sequence_value("stakeholder_payout_payments"),
+            "payout_id": payable.get("source_id"),
+            "payable_id": payable_id,
+            "payment_amount": payment_amount,
+            "payment_date": payment_date,
+            "bank_account_id": safe_int(data.get("bank_account_id")),
+            "payment_mode": data.get("payment_mode"),
+            "reference": data.get("reference"),
+            "remarks": data.get("remarks"),
+            "created_at": datetime.now(),
+            "created_by_id": user["id"],
+        })
+        db.stakeholder_payout_receipts.update_one(
+            {"id": payable.get("source_id")},
+            {"$set": {
+                "paid_amount": payout_paid_amount,
+                "outstanding_amount": payout_outstanding,
+                "status": payout_status,
+                "last_payment_id": payment_id,
+                "payable_id": payable_id,
+                "updated_at": datetime.now(),
+            }},
+        )
     log_treasury_action(user["id"], "Payable Paid", f"Paid {payment_amount:.2f} against {payable.get('payable_number')}.")
     return jsonify({"success": True, "status": status})
 
@@ -4601,11 +4760,10 @@ def api_treasury_stakeholder_payouts():
         data = request.get_json() or {}
         status = data.get("status", "Draft")
         if status not in {"Draft", "Submitted"}:
-            return jsonify({"error": "Stakeholder payout can only be created as Draft or Submitted."}), 400
-        stakeholder_id = safe_int(data.get("stakeholder_id"))
-        stakeholder = db.treasury_stakeholders.find_one({"id": stakeholder_id, "is_active": {"$ne": False}})
-        if not stakeholder:
-            return jsonify({"error": "Select an active stakeholder."}), 400
+            return jsonify({"error": "Payout can only be created as Draft or Submitted."}), 400
+        recipient, recipient_error = payout_recipient_payload(db, data)
+        if recipient_error:
+            return jsonify({"error": recipient_error}), 400
         payout_type = data.get("payout_type", "Profit Distribution")
         if payout_type not in STAKEHOLDER_PAYOUT_TYPES:
             return jsonify({"error": "Invalid payout type."}), 400
@@ -4616,9 +4774,7 @@ def api_treasury_stakeholder_payouts():
         doc = {
             "id": payout_id,
             "payout_number": data.get("payout_number") or f"SP-{datetime.now().strftime('%Y%m')}-{payout_id:04d}",
-            "stakeholder_id": stakeholder_id,
-            "stakeholder_name": stakeholder.get("name"),
-            "stakeholder_account": data.get("stakeholder_account") or stakeholder.get("payment_details"),
+            **recipient,
             "payout_date": data.get("payout_date") or datetime.now().strftime("%Y-%m-%d"),
             "payout_type": payout_type,
             "amount": amount,
@@ -4638,11 +4794,12 @@ def api_treasury_stakeholder_payouts():
         db.stakeholder_payout_receipts.insert_one(doc)
         if status == "Submitted":
             initialize_stakeholder_payout_approval_workflow(db, payout_id, user)
-        log_treasury_action(user["id"], "Created Stakeholder Payout", f"Created payout {doc['payout_number']} for {stakeholder.get('name')}.")
+        log_treasury_action(user["id"], "Created Payout", f"Created payout {doc['payout_number']} for {recipient.get('recipient_name')}.")
         saved = db.stakeholder_payout_receipts.find_one({"id": payout_id}, {"_id": 0})
-        return jsonify(json_ready({"payout": saved}))
+        return jsonify(json_ready({"payout": normalize_payout_recipient(saved)}))
 
     payouts = list(db.stakeholder_payout_receipts.find({}, {"_id": 0}).sort([("created_at", -1)]))
+    payouts = [normalize_payout_recipient(payout) for payout in payouts]
     return jsonify(json_ready({"payouts": payouts, "company_fund_available": company_fund_available(db)}))
 
 
@@ -4655,20 +4812,17 @@ def api_treasury_stakeholder_payout_detail(payout_id):
         abort(404)
     if request.method == "PUT":
         if payout.get("status") != "Draft":
-            return jsonify({"error": "Stakeholder payout cannot be edited after submission."}), 400
+            return jsonify({"error": "Payout cannot be edited after submission."}), 400
         data = request.get_json() or {}
-        stakeholder_id = safe_int(data.get("stakeholder_id", payout.get("stakeholder_id")))
-        stakeholder = db.treasury_stakeholders.find_one({"id": stakeholder_id, "is_active": {"$ne": False}})
-        if not stakeholder:
-            return jsonify({"error": "Select an active stakeholder."}), 400
+        recipient, recipient_error = payout_recipient_payload(db, data, payout)
+        if recipient_error:
+            return jsonify({"error": recipient_error}), 400
         amount = parse_float(data.get("amount"), payout.get("amount"))
         if amount <= 0:
             return jsonify({"error": "Payout amount must be greater than zero."}), 400
         status = data.get("status", payout.get("status"))
         update = {
-            "stakeholder_id": stakeholder_id,
-            "stakeholder_name": stakeholder.get("name"),
-            "stakeholder_account": data.get("stakeholder_account", payout.get("stakeholder_account")),
+            **recipient,
             "payout_date": data.get("payout_date", payout.get("payout_date")),
             "payout_type": data.get("payout_type", payout.get("payout_type")),
             "amount": amount,
@@ -4689,7 +4843,7 @@ def api_treasury_stakeholder_payout_detail(payout_id):
         return jsonify({"success": True})
     payments = list(db.stakeholder_payout_payments.find({"payout_id": payout_id}, {"_id": 0}).sort("payment_date", -1))
     approvals = list(db.stakeholder_payout_approvals.find({"payout_id": payout_id}, {"_id": 0}).sort([("approval_sequence", 1), ("id", 1)]))
-    return jsonify(json_ready({"payout": payout, "payments": payments, "approvals": approvals}))
+    return jsonify(json_ready({"payout": normalize_payout_recipient(payout), "payments": payments, "approvals": approvals}))
 
 
 @app.route("/api/treasury/stakeholder-payouts/<int:payout_id>/action", methods=["POST"])
@@ -4703,68 +4857,17 @@ def api_treasury_stakeholder_payout_action(payout_id):
     action = data.get("action")
     if action == "submit":
         if payout.get("status") != "Draft":
-            return jsonify({"error": "Only draft stakeholder payouts can be submitted."}), 400
+            return jsonify({"error": "Only draft payouts can be submitted."}), 400
         status = initialize_stakeholder_payout_approval_workflow(db, payout_id, user)
         return jsonify({"success": True, "status": status})
     if action == "cancel":
         if payout.get("status") != "Draft":
-            return jsonify({"error": "Stakeholder payout cannot be cancelled after submission."}), 400
+            return jsonify({"error": "Payout cannot be cancelled after submission."}), 400
         db.stakeholder_payout_receipts.update_one({"id": payout_id}, {"$set": {"status": "Cancelled", "updated_at": datetime.now()}})
         return jsonify({"success": True, "status": "Cancelled"})
     if action == "mark_paid":
-        if payout.get("status") not in {"Approved", "Pending Payment", "Partially Paid"}:
-            return jsonify({"error": "Only approved stakeholder payouts can be paid."}), 400
-        outstanding = parse_float(payout.get("outstanding_amount"), payout.get("amount"))
-        payment_amount = parse_float(data.get("payment_amount"), outstanding)
-        if payment_amount <= 0:
-            return jsonify({"error": "Payment amount must be greater than zero."}), 400
-        if payment_amount > outstanding + 0.01:
-            return jsonify({"error": "Overpayment is not allowed."}), 400
-        available = company_fund_available(db)
-        if payment_amount > available + 0.01:
-            return jsonify({"error": "Insufficient company fund for this payout."}), 400
-        payment_id = get_next_sequence_value("stakeholder_payout_payments")
-        payment_date = data.get("payment_date") or datetime.now().strftime("%Y-%m-%d")
-        db.stakeholder_payout_payments.insert_one({
-            "id": payment_id,
-            "payout_id": payout_id,
-            "payment_amount": payment_amount,
-            "payment_date": payment_date,
-            "bank_account_id": safe_int(data.get("bank_account_id") or payout.get("bank_account_id")),
-            "payment_mode": data.get("payment_mode") or payout.get("payment_mode"),
-            "reference": data.get("reference") or payout.get("reference"),
-            "remarks": data.get("remarks"),
-            "created_at": datetime.now(),
-            "created_by_id": user["id"],
-        })
-        movement_id = get_next_sequence_value("treasury_payouts")
-        db.treasury_payouts.insert_one({
-            "id": movement_id,
-            "payout_type": "Stakeholder Payout",
-            "stakeholder_id": payout.get("stakeholder_id"),
-            "stakeholder_payout_id": payout_id,
-            "amount": payment_amount,
-            "status": "Paid",
-            "payout_date": payment_date,
-            "description": f"Stakeholder payout {payout.get('payout_number')} paid",
-            "created_at": datetime.now(),
-        })
-        paid_amount = parse_float(payout.get("paid_amount")) + payment_amount
-        new_outstanding = max(0.0, parse_float(payout.get("amount")) - paid_amount)
-        status = "Paid" if new_outstanding <= 0.01 else "Partially Paid"
-        db.stakeholder_payout_receipts.update_one(
-            {"id": payout_id},
-            {"$set": {
-                "paid_amount": paid_amount,
-                "outstanding_amount": new_outstanding,
-                "status": status,
-                "last_payment_id": payment_id,
-                "updated_at": datetime.now(),
-            }},
-        )
-        log_treasury_action(user["id"], "Stakeholder Payout Paid", f"Paid {payment_amount:.2f} against {payout.get('payout_number')}.")
-        return jsonify({"success": True, "status": status})
-    return jsonify({"error": "Invalid stakeholder payout action."}), 400
+        return jsonify({"error": "Approved payouts must be paid from Treasury Payables."}), 400
+    return jsonify({"error": "Invalid payout action."}), 400
 
 
 @app.route("/api/treasury/stakeholder-payout-approvals/pending", methods=["GET"])
@@ -4772,14 +4875,21 @@ def api_pending_stakeholder_payout_approvals():
     if "user_id" not in session:
         abort(401)
     db = get_db()
+    user = get_current_user()
+    match = {"status": "Pending"}
+    if not can_manage_payout_approvals(user, db):
+        match["linked_user_id"] = session["user_id"]
     approvals = list(db.stakeholder_payout_approvals.aggregate([
-        {"$match": {"linked_user_id": session["user_id"], "status": "Pending"}},
+        {"$match": match},
         {"$lookup": {"from": "stakeholder_payout_receipts", "localField": "payout_id", "foreignField": "id", "as": "payout"}},
         {"$unwind": "$payout"},
         {"$match": {"payout.status": {"$regex": "^Pending"}}},
         {"$project": {"_id": 0, "payout._id": 0}},
         {"$sort": {"approval_sequence": 1, "created_at": 1}},
     ]))
+    for approval in approvals:
+        normalize_payout_recipient(approval.get("payout"))
+        approval["can_act"] = approval.get("linked_user_id") == user["id"]
     return jsonify(json_ready({"approvals": approvals}))
 
 
@@ -4829,7 +4939,9 @@ def api_stakeholder_payout_approval_action(approval_id):
         db.stakeholder_payout_receipts.update_one({"id": payout["id"]}, {"$set": {"status": status, "current_approval_sequence": next_sequence, "updated_at": now}})
         return jsonify({"success": True, "status": status})
     db.stakeholder_payout_receipts.update_one({"id": payout["id"]}, {"$set": {"status": "Approved", "approval_completed": True, "approved_at": now, "updated_at": now}})
-    return jsonify({"success": True, "status": "Approved"})
+    approved_payout = db.stakeholder_payout_receipts.find_one({"id": payout["id"]})
+    create_or_update_payable_from_payout(db, approved_payout)
+    return jsonify({"success": True, "status": "Pending Payment"})
 
 
 @app.route("/api/treasury/channel-partners", methods=["GET", "POST"])
