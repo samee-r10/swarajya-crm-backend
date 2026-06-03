@@ -984,6 +984,41 @@ def get_current_user():
     db = get_db()
     return db.app_users.find_one({"id": session["user_id"]})
 
+
+AUDIT_FIELD_KEYS = {
+    "_id",
+    "created_at",
+    "updated_at",
+    "modified_at",
+    "created_by_id",
+    "created_by_name",
+    "updated_by_id",
+    "updated_by_name",
+    "modified_by_id",
+    "modified_by_name",
+}
+
+
+def require_current_user():
+    """Return the logged-in user for manual writes, or reject unauthenticated changes."""
+    user = get_current_user()
+    if not user:
+        abort(401)
+    return user
+
+
+def audit_actor():
+    user = require_current_user()
+    return user, user["id"], user.get("full_name") or user.get("email") or "Unknown User"
+
+
+def merge_client_fields(target, data, protected_keys=None):
+    protected = set(protected_keys or set()) | AUDIT_FIELD_KEYS | {"id"}
+    for key, value in (data or {}).items():
+        if key not in target and key not in protected:
+            target[key] = value
+    return target
+
 def log_treasury_action(user_id, action, details=""):
     db = get_db()
     db.treasury_logs.insert_one({
@@ -1381,6 +1416,22 @@ def parse_float(value, default=0.0):
         return default
 
 
+def claim_gst_breakdown(base_amount, gst_percent=0.0, gst_amount=0.0, total_amount=0.0):
+    base = parse_float(base_amount)
+    percent = parse_float(gst_percent)
+    stored_gst = parse_float(gst_amount)
+    total = parse_float(total_amount)
+    if base <= 0:
+        return 0.0, 0.0, percent, 0.0
+    if percent > 0:
+        cgst = round(base * (percent / 100.0), 2)
+        return round(base, 2), cgst, percent, total or round(base + cgst, 2)
+    if stored_gst > 0:
+        percent = round((stored_gst / base) * 100.0, 2)
+        return round(base, 2), round(stored_gst, 2), percent, total or round(base + stored_gst, 2)
+    return round(base, 2), 0.0, 0.0, total or round(base, 2)
+
+
 def safe_int(value):
     if value in (None, ""):
         return None
@@ -1503,6 +1554,50 @@ def claim_summary(doc):
     }
 
 
+def claim_has_active_posted_transaction(db, claim):
+    tx_id = claim.get("posted_transaction_id")
+    if not tx_id:
+        return False
+    return bool(db.transactions.find_one({"id": tx_id, "status": {"$ne": "Reversed"}}))
+
+
+def release_claim_posting_if_reversed(db, tx):
+    if not tx or not tx.get("expense_claim_id"):
+        return
+    db.expense_claims.update_one(
+        {"id": tx.get("expense_claim_id"), "posted_transaction_id": tx.get("id")},
+        {
+            "$set": {
+                "status": "Approved",
+                "updated_at": datetime.now(),
+            },
+            "$unset": {
+                "posted_transaction_id": "",
+                "posted_at": "",
+                "posted_by": "",
+            },
+        },
+    )
+
+
+def reverse_payables_for_revenue(db, revenue_doc, transaction_id=None):
+    if not revenue_doc:
+        return
+    db.payables.update_many(
+        {"source_module": "Revenue Log", "source_id": revenue_doc.get("id"), "status": {"$ne": "Paid"}},
+        {
+            "$set": {
+                "status": "Reversed",
+                "payment_status": "Reversed",
+                "outstanding_amount": 0.0,
+                "reversed_at": datetime.now(),
+                "reversed_transaction_id": transaction_id,
+                "updated_at": datetime.now(),
+            }
+        },
+    )
+
+
 def active_claim_approvers(db):
     return list(
         db.treasury_stakeholders.aggregate([
@@ -1521,9 +1616,68 @@ def active_claim_approvers(db):
 
 
 def claim_pending_status(sequence):
-    if sequence in (1, 2, 3):
-        return f"Pending Approval Sequence {sequence}"
     return "Pending Stakeholder Approval"
+
+
+def approval_display_name(step):
+    return (
+        step.get("linked_user_name")
+        or step.get("action_by_name")
+        or step.get("stakeholder_name")
+        or step.get("email")
+        or "Assigned Approver"
+    )
+
+
+def pending_approval_steps(db, collection_name, record_field, record_id, sequence=None):
+    query = {record_field: record_id, "status": "Pending"}
+    if sequence is not None:
+        query["approval_sequence"] = sequence
+    return list(db[collection_name].aggregate([
+        {"$match": query},
+        {"$lookup": {"from": "app_users", "localField": "linked_user_id", "foreignField": "id", "as": "linked_user"}},
+        {"$unwind": {"path": "$linked_user", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {"linked_user_name": "$linked_user.full_name"}},
+        {"$project": {"linked_user": 0, "_id": 0}},
+        {"$sort": {"approval_sequence": 1, "id": 1}},
+    ]))
+
+
+def pending_approval_status(db, collection_name, record_field, record_id, sequence=None):
+    steps = pending_approval_steps(db, collection_name, record_field, record_id, sequence)
+    names = [approval_display_name(step) for step in steps]
+    if names:
+        return f"Pending Approval from {', '.join(names)}"
+    return claim_pending_status(sequence)
+
+
+def attach_approval_user_names(db, steps):
+    user_ids = [step.get("linked_user_id") for step in steps if step.get("linked_user_id")]
+    users = {
+        user["id"]: user
+        for user in db.app_users.find({"id": {"$in": user_ids}}, {"_id": 0, "id": 1, "full_name": 1, "email": 1})
+    } if user_ids else {}
+    for step in steps:
+        user = users.get(step.get("linked_user_id"))
+        if user:
+            step["linked_user_name"] = user.get("full_name")
+            step["approver_name"] = user.get("full_name") or step.get("stakeholder_name")
+        else:
+            step["approver_name"] = approval_display_name(step)
+    return steps
+
+
+def attach_pending_approval_display(db, doc, collection_name, record_field):
+    if not doc:
+        return doc
+    if str(doc.get("status", "")).startswith("Pending Approval") or doc.get("approval_required"):
+        sequence = doc.get("current_approval_sequence")
+        steps = pending_approval_steps(db, collection_name, record_field, doc.get("id"), sequence)
+        names = [approval_display_name(step) for step in steps]
+        if names:
+            doc["current_pending_approvers"] = names
+            doc["status"] = f"Pending Approval from {', '.join(names)}"
+    return doc
 
 
 def create_system_notification(db, user_id, title, message, link=None):
@@ -1714,6 +1868,37 @@ def sync_negative_revenue_payables(db):
         create_or_update_payable_from_revenue(db, revenue_doc)
 
 
+def sync_reversed_transaction_payables(db):
+    reversed_tx_ids = [
+        tx["id"]
+        for tx in db.transactions.find({"status": "Reversed"}, {"_id": 0, "id": 1})
+    ]
+    if not reversed_tx_ids:
+        return
+    reversed_revenues = list(
+        db.treasury_revenue.find({"transaction_id": {"$in": reversed_tx_ids}}, {"_id": 0, "id": 1, "transaction_id": 1})
+    )
+    for revenue_doc in reversed_revenues:
+        reverse_payables_for_revenue(db, revenue_doc, revenue_doc.get("transaction_id"))
+    orphaned_payables = db.payables.find({
+        "source_module": "Revenue Log",
+        "status": {"$nin": ["Paid", "Reversed"]},
+        "source_reference": {"$regex": r"^REV-"},
+    }, {"_id": 0, "id": 1, "source_id": 1})
+    for payable in orphaned_payables:
+        source_id = payable.get("source_id")
+        if source_id and not db.treasury_revenue.find_one({"id": source_id}):
+            db.payables.update_one(
+                {"id": payable["id"]},
+                {"$set": {
+                    "status": "Reversed",
+                    "payment_status": "Reversed",
+                    "outstanding_amount": 0.0,
+                    "updated_at": datetime.now(),
+                }},
+            )
+
+
 def sync_approved_payout_payables(db):
     for payout in db.stakeholder_payout_receipts.find({"status": {"$in": ["Approved", "Pending Payment", "Partially Paid", "Paid"]}}):
         create_or_update_payable_from_payout(db, payout)
@@ -1759,7 +1944,7 @@ def initialize_claim_approval_workflow(db, claim_id, actor=None):
     if steps:
         db.claim_approvals.insert_many(steps)
     first_sequence = steps[0]["approval_sequence"]
-    status = claim_pending_status(first_sequence)
+    status = pending_approval_status(db, "claim_approvals", "claim_id", claim_id, first_sequence)
     db.expense_claims.update_one(
         {"id": claim_id},
         {"$set": {
@@ -1828,7 +2013,7 @@ def initialize_stakeholder_payout_approval_workflow(db, payout_id, actor=None):
         })
     if steps:
         db.stakeholder_payout_approvals.insert_many(steps)
-    status = claim_pending_status(first_sequence)
+    status = pending_approval_status(db, "stakeholder_payout_approvals", "payout_id", payout_id, first_sequence)
     db.stakeholder_payout_receipts.update_one(
         {"id": payout_id},
         {"$set": {
@@ -2609,9 +2794,7 @@ def api_customers():
         if validation_error:
             return jsonify({"error": validation_error}), 400
         customer_id = get_next_sequence_value("customers")
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         
         insert_data = {
             "id": customer_id,
@@ -2640,9 +2823,7 @@ def api_customers():
             "modified_by_name": actor_name
         }
         # Merge all other dynamic custom or standard fields
-        for k, v in data.items():
-            if k not in insert_data:
-                insert_data[k] = v
+        merge_client_fields(insert_data, data)
                 
         db.customers.insert_one(insert_data)
         log_activity_async("Customers", "Customer", customer_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("company_name"))
@@ -2679,9 +2860,7 @@ def api_customer_detail(customer_id):
         validation_error = validate_profile_master_fields(db, data)
         if validation_error:
             return jsonify({"error": validation_error}), 400
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         update_data = {
             "company_name": data.get("company_name"),
             "contact_name": data.get("contact_name"),
@@ -2705,9 +2884,7 @@ def api_customer_detail(customer_id):
             "modified_by_name": actor_name
         }
         # Merge all other dynamic fields
-        for k, v in data.items():
-            if k not in update_data and k != "id" and k != "created_at":
-                update_data[k] = v
+        merge_client_fields(update_data, data)
                 
         old_customer = db.customers.find_one({"id": customer_id}, {"_id": 0})
         db.customers.update_one(
@@ -2741,9 +2918,7 @@ def api_opportunities():
     if request.method == "POST":
         data = request.get_json()
         opportunity_id = get_next_sequence_value("opportunities")
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         
         country = data.get("country") or data.get("country_c") or ""
         country_prefix = (country[:2].upper().ljust(2, 'X')) if country else "XX"
@@ -2782,9 +2957,7 @@ def api_opportunities():
             "modified_by_name": actor_name
         }
         # Merge other dynamic custom fields
-        for k, v in data.items():
-            if k not in insert_data:
-                insert_data[k] = v
+        merge_client_fields(insert_data, data)
                 
         db.opportunities.insert_one(insert_data)
         log_activity_async("Opportunities", "Opportunity", opportunity_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("opportunity_number"))
@@ -2833,9 +3006,7 @@ def api_opportunity_detail(opportunity_id):
     
     if request.method == "PUT":
         data = request.get_json()
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         update_data = {
             "title": data.get("title"),
             "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
@@ -2853,9 +3024,7 @@ def api_opportunity_detail(opportunity_id):
             "modified_by_name": actor_name
         }
         # Merge other dynamic custom fields
-        for k, v in data.items():
-            if k not in update_data and k != "id" and k != "created_at":
-                update_data[k] = v
+        merge_client_fields(update_data, data)
                 
         old_opportunity = db.opportunities.find_one({"id": opportunity_id}, {"_id": 0})
         db.opportunities.update_one(
@@ -2896,9 +3065,7 @@ def api_projects():
     if request.method == "POST":
         data = request.get_json()
         project_id = get_next_sequence_value("projects")
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         
         insert_data = {
             "id": project_id,
@@ -2922,9 +3089,7 @@ def api_projects():
             "modified_by_name": actor_name
         }
         # Merge other dynamic custom fields
-        for k, v in data.items():
-            if k not in insert_data:
-                insert_data[k] = v
+        merge_client_fields(insert_data, data)
                 
         db.projects.insert_one(insert_data)
         log_activity_async("Projects", "Project", project_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("project_name"))
@@ -2978,9 +3143,7 @@ def api_project_detail(project_id):
     
     if request.method == "PUT":
         data = request.get_json()
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         update_data = {
             "project_name": data.get("project_name"),
             "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
@@ -2999,9 +3162,7 @@ def api_project_detail(project_id):
             "modified_by_name": actor_name
         }
         # Merge other dynamic custom fields
-        for k, v in data.items():
-            if k not in update_data and k != "id" and k != "created_at":
-                update_data[k] = v
+        merge_client_fields(update_data, data)
                 
         old_project = db.projects.find_one({"id": project_id}, {"_id": 0})
         db.projects.update_one(
@@ -3054,9 +3215,7 @@ def api_finance_vendors():
         if category not in VENDOR_CATEGORIES:
             return jsonify({"error": "Vendor category must be Supply, Service, or Both."}), 400
         vendor_id = get_next_sequence_value("vendors")
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         
         insert_data = {
             "id": vendor_id,
@@ -3084,9 +3243,7 @@ def api_finance_vendors():
             "modified_by_name": actor_name
         }
         # Merge other dynamic custom fields
-        for k, v in data.items():
-            if k not in insert_data:
-                insert_data[k] = v
+        merge_client_fields(insert_data, data)
                 
         db.vendors.insert_one(insert_data)
         log_activity_async("Finance", "Vendor", vendor_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("name"))
@@ -3124,9 +3281,7 @@ def api_finance_vendor_detail(vendor_id):
         category = data.get("category") or "Both"
         if category not in VENDOR_CATEGORIES:
             return jsonify({"error": "Vendor category must be Supply, Service, or Both."}), 400
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         update_data = {
             "name": data.get("name"),
             "contact_person": data.get("contact_person"),
@@ -3149,9 +3304,7 @@ def api_finance_vendor_detail(vendor_id):
             "modified_by_name": actor_name
         }
         # Merge other dynamic custom fields
-        for k, v in data.items():
-            if k not in update_data and k != "id" and k != "created_at":
-                update_data[k] = v
+        merge_client_fields(update_data, data)
                 
         old_vendor = db.vendors.find_one({"id": vendor_id}, {"_id": 0})
         db.vendors.update_one(
@@ -3348,11 +3501,21 @@ def api_finance_transactions():
                 return jsonify({"error": "Select an approved employee claim before posting to GL 7010 - Employee Claims."}), 400
             linked_claim = db.expense_claims.find_one({
                 "id": expense_claim_id,
-                "status": "Approved",
-                "posted_transaction_id": {"$exists": False},
+                "status": {"$in": ["Approved", "Posted"]},
             })
-            if not linked_claim:
+            if not linked_claim or claim_has_active_posted_transaction(db, linked_claim):
                 return jsonify({"error": "Select an approved and unposted employee claim."}), 400
+            amount, cgst_amount, cgst_percent, total_amount = claim_gst_breakdown(
+                linked_claim.get("amount"),
+                linked_claim.get("gst_percent"),
+                linked_claim.get("gst_amount"),
+                linked_claim.get("total_claim_amount"),
+            )
+            igst_percent = 0.0
+            tds_percent = 0.0
+            igst_amount = 0.0
+            tds_amount = 0.0
+            category = linked_claim.get("expense_category") or category
         loan_account_id = safe_int(data.get("loan_account_id"))
         loan_schedule_id = safe_int(data.get("loan_schedule_id"))
         linked_loan = None
@@ -3378,9 +3541,7 @@ def api_finance_transactions():
                 if not linked_schedule:
                     return jsonify({"error": "Select a valid repayment schedule line for this loan."}), 400
             
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         insert_data = {
             "id": transaction_id,
             "account_id": account_id,
@@ -3417,9 +3578,7 @@ def api_finance_transactions():
             "modified_by_id": actor_id,
             "modified_by_name": actor_name
         }
-        for k, v in data.items():
-            if k not in insert_data:
-                insert_data[k] = v
+        merge_client_fields(insert_data, data)
 
         db.transactions.insert_one(insert_data)
         if category == "Loan Disbursement" and linked_loan:
@@ -3737,10 +3896,12 @@ def api_finance_transaction_reverse(transaction_id):
     log_activity_async("Finance", "Accounting Entry", transaction_id, "UPDATE", old_data=old_tx, new_data=new_tx, reference_number=new_tx.get("reference") if new_tx else None)
     if res.matched_count == 0:
         abort(404)
+    release_claim_posting_if_reversed(db, old_tx)
         
     # 2. Find and delete synced treasury revenue and its payouts immediately
     rev = db.treasury_revenue.find_one({"transaction_id": transaction_id})
     if rev:
+        reverse_payables_for_revenue(db, rev, transaction_id)
         db.treasury_revenue.delete_many({"transaction_id": transaction_id})
         db.treasury_payouts.delete_many({"revenue_id": rev["id"]})
         
@@ -3818,9 +3979,7 @@ def api_invoices():
         if not issue_date:
             issue_date = datetime.now().strftime("%Y-%m-%d")
             
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         total_amount = float(data.get("total_amount", 0))
         status = data.get("status", "Draft")
         amount_paid = normalize_invoice_amount_paid(status, data.get("amount_paid"), total_amount)
@@ -3884,9 +4043,7 @@ def api_invoice_detail(invoice_id):
     
     if request.method == "PUT":
         data = request.get_json()
-        actor = get_current_user()
-        actor_id = actor["id"] if actor else None
-        actor_name = actor.get("full_name", "Unknown") if actor else "System"
+        actor, actor_id, actor_name = audit_actor()
         issue_date = data.get("invoice_date") or data.get("issue_date")
         if not issue_date:
             issue_date = datetime.now().strftime("%Y-%m-%d")
@@ -4481,6 +4638,7 @@ def api_treasury_payables():
     require_treasury_access()
     db = get_db()
     sync_negative_revenue_payables(db)
+    sync_reversed_transaction_payables(db)
     sync_approved_payout_payables(db)
     status = request.args.get("status")
     query = {}
@@ -4488,7 +4646,7 @@ def api_treasury_payables():
         query["status"] = status
     payables = list(db.payables.find(query, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1)]))
     stats = {
-        "total_payables": sum(parse_float(p.get("original_amount")) for p in payables if p.get("status") != "Cancelled"),
+        "total_payables": sum(parse_float(p.get("original_amount")) for p in payables if p.get("status") not in {"Cancelled", "Reversed"}),
         "pending_payments": sum(parse_float(p.get("outstanding_amount")) for p in payables if p.get("status") in {"Pending", "Partially Paid"}),
         "paid_amount": sum(parse_float(p.get("paid_amount")) for p in payables),
         "company_fund_available": company_fund_available(db),
@@ -4503,7 +4661,7 @@ def api_treasury_payable_payment(payable_id):
     payable = db.payables.find_one({"id": payable_id})
     if not payable:
         abort(404)
-    if payable.get("status") in {"Paid", "Cancelled"}:
+    if payable.get("status") in {"Paid", "Cancelled", "Reversed"}:
         return jsonify({"error": "This payable is already closed."}), 400
     data = request.get_json() or {}
     outstanding = parse_float(payable.get("outstanding_amount"), payable.get("original_amount"))
@@ -4796,10 +4954,14 @@ def api_treasury_stakeholder_payouts():
             initialize_stakeholder_payout_approval_workflow(db, payout_id, user)
         log_treasury_action(user["id"], "Created Payout", f"Created payout {doc['payout_number']} for {recipient.get('recipient_name')}.")
         saved = db.stakeholder_payout_receipts.find_one({"id": payout_id}, {"_id": 0})
+        attach_pending_approval_display(db, saved, "stakeholder_payout_approvals", "payout_id")
         return jsonify(json_ready({"payout": normalize_payout_recipient(saved)}))
 
     payouts = list(db.stakeholder_payout_receipts.find({}, {"_id": 0}).sort([("created_at", -1)]))
-    payouts = [normalize_payout_recipient(payout) for payout in payouts]
+    payouts = [
+        normalize_payout_recipient(attach_pending_approval_display(db, payout, "stakeholder_payout_approvals", "payout_id"))
+        for payout in payouts
+    ]
     return jsonify(json_ready({"payouts": payouts, "company_fund_available": company_fund_available(db)}))
 
 
@@ -4843,6 +5005,8 @@ def api_treasury_stakeholder_payout_detail(payout_id):
         return jsonify({"success": True})
     payments = list(db.stakeholder_payout_payments.find({"payout_id": payout_id}, {"_id": 0}).sort("payment_date", -1))
     approvals = list(db.stakeholder_payout_approvals.find({"payout_id": payout_id}, {"_id": 0}).sort([("approval_sequence", 1), ("id", 1)]))
+    attach_approval_user_names(db, approvals)
+    attach_pending_approval_display(db, payout, "stakeholder_payout_approvals", "payout_id")
     return jsonify(json_ready({"payout": normalize_payout_recipient(payout), "payments": payments, "approvals": approvals}))
 
 
@@ -4888,7 +5052,9 @@ def api_pending_stakeholder_payout_approvals():
         {"$sort": {"approval_sequence": 1, "created_at": 1}},
     ]))
     for approval in approvals:
+        attach_approval_user_names(db, [approval])
         normalize_payout_recipient(approval.get("payout"))
+        attach_pending_approval_display(db, approval.get("payout"), "stakeholder_payout_approvals", "payout_id")
         approval["can_act"] = approval.get("linked_user_id") == user["id"]
     return jsonify(json_ready({"approvals": approvals}))
 
@@ -4930,12 +5096,14 @@ def api_stakeholder_payout_approval_action(approval_id):
         db.stakeholder_payout_receipts.update_one({"id": payout["id"]}, {"$set": {"status": "Rejected", "rejected_at": now, "rejected_by_id": user["id"], "updated_at": now}})
         return jsonify({"success": True, "status": "Rejected"})
     if db.stakeholder_payout_approvals.count_documents({"payout_id": payout["id"], "approval_sequence": approval.get("approval_sequence"), "status": "Pending"}):
-        return jsonify({"success": True, "status": payout.get("status")})
+        status = pending_approval_status(db, "stakeholder_payout_approvals", "payout_id", payout["id"], approval.get("approval_sequence"))
+        db.stakeholder_payout_receipts.update_one({"id": payout["id"]}, {"$set": {"status": status, "updated_at": now}})
+        return jsonify({"success": True, "status": status})
     next_step = db.stakeholder_payout_approvals.find_one({"payout_id": payout["id"], "status": "Waiting"}, sort=[("approval_sequence", 1), ("id", 1)])
     if next_step:
         next_sequence = int(next_step.get("approval_sequence") or 999)
-        status = claim_pending_status(next_sequence)
         db.stakeholder_payout_approvals.update_many({"payout_id": payout["id"], "approval_sequence": next_sequence, "status": "Waiting"}, {"$set": {"status": "Pending", "updated_at": now}})
+        status = pending_approval_status(db, "stakeholder_payout_approvals", "payout_id", payout["id"], next_sequence)
         db.stakeholder_payout_receipts.update_one({"id": payout["id"]}, {"$set": {"status": status, "current_approval_sequence": next_sequence, "updated_at": now}})
         return jsonify({"success": True, "status": status})
     db.stakeholder_payout_receipts.update_one({"id": payout["id"]}, {"$set": {"status": "Approved", "approval_completed": True, "approved_at": now, "updated_at": now}})
@@ -5011,7 +5179,7 @@ def api_expense_claims():
             return jsonify({"error": "Total claim amount must be greater than zero."}), 400
         claim_id = get_next_sequence_value("expense_claims")
         claim_number = data.get("claim_number") or f"CLM-{datetime.now().strftime('%Y%m')}-{claim_id:04d}"
-        actor = get_current_user()
+        actor = require_current_user()
         doc = {
             "id": claim_id,
             "claim_number": claim_number,
@@ -5031,14 +5199,15 @@ def api_expense_claims():
             "status": status,
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
-            "created_by_id": actor["id"] if actor else None,
-            "created_by_name": actor.get("full_name", "Unknown") if actor else "System",
+            "created_by_id": actor["id"],
+            "created_by_name": actor.get("full_name") or actor.get("email") or "Unknown User",
         }
         db.expense_claims.insert_one(doc)
         if status == "Submitted":
             initialize_claim_approval_workflow(db, claim_id, actor)
         log_activity_async("Finance", "Expense Claim", claim_id, "CREATE", new_data=doc, reference_number=claim_number)
         saved = db.expense_claims.find_one({"id": claim_id}, {"_id": 0})
+        attach_pending_approval_display(db, saved, "claim_approvals", "claim_id")
         return jsonify(json_ready({"claim": saved}))
 
     status = request.args.get("status")
@@ -5046,6 +5215,8 @@ def api_expense_claims():
     if status:
         query["status"] = status
     claims = list(db.expense_claims.find(query, {"_id": 0}).sort([("claim_date", -1), ("created_at", -1)]))
+    for claim in claims:
+        attach_pending_approval_display(db, claim, "claim_approvals", "claim_id")
     return jsonify(json_ready({"claims": [claim_summary(claim) for claim in claims]}))
 
 
@@ -5054,9 +5225,9 @@ def api_expense_claims_approved_unposted():
     require_finance_access()
     db = get_db()
     claims = list(db.expense_claims.find({
-        "status": "Approved",
-        "posted_transaction_id": {"$exists": False},
+        "status": {"$in": ["Approved", "Posted"]},
     }, {"_id": 0}).sort([("approved_at", 1), ("claim_date", 1)]))
+    claims = [claim for claim in claims if not claim_has_active_posted_transaction(db, claim)]
     return jsonify(json_ready({"claims": [claim_summary(claim) for claim in claims]}))
 
 
@@ -5074,6 +5245,9 @@ def api_pending_claim_approvals():
         {"$project": {"_id": 0, "claim._id": 0}},
         {"$sort": {"approval_sequence": 1, "created_at": 1}},
     ]))
+    for approval in approvals:
+        attach_approval_user_names(db, [approval])
+        attach_pending_approval_display(db, approval.get("claim"), "claim_approvals", "claim_id")
     return jsonify(json_ready({"approvals": approvals}))
 
 
@@ -5139,7 +5313,9 @@ def api_claim_approval_action(approval_id):
         "status": "Pending",
     })
     if remaining_current:
-        return jsonify({"success": True, "status": claim.get("status")})
+        status = pending_approval_status(db, "claim_approvals", "claim_id", claim["id"], approval.get("approval_sequence"))
+        db.expense_claims.update_one({"id": claim["id"]}, {"$set": {"status": status, "updated_at": now}})
+        return jsonify({"success": True, "status": status})
     next_step = db.claim_approvals.find_one(
         {"claim_id": claim["id"], "status": "Waiting"},
         sort=[("approval_sequence", 1), ("id", 1)],
@@ -5150,7 +5326,7 @@ def api_claim_approval_action(approval_id):
             {"claim_id": claim["id"], "approval_sequence": next_sequence, "status": "Waiting"},
             {"$set": {"status": "Pending", "updated_at": now}},
         )
-        status = claim_pending_status(next_sequence)
+        status = pending_approval_status(db, "claim_approvals", "claim_id", claim["id"], next_sequence)
         db.expense_claims.update_one(
             {"id": claim["id"]},
             {"$set": {"status": status, "current_approval_sequence": next_sequence, "updated_at": now}},
@@ -5218,6 +5394,7 @@ def api_expense_claim_detail(claim_id):
         new_claim = db.expense_claims.find_one({"id": claim_id})
         log_activity_async("Finance", "Expense Claim", claim_id, "UPDATE", old_data=old_claim, new_data=new_claim, reference_number=claim.get("claim_number"))
         return jsonify({"success": True})
+    attach_pending_approval_display(db, claim, "claim_approvals", "claim_id")
     return jsonify(json_ready({"claim": claim_summary(claim)}))
 
 
@@ -5270,18 +5447,25 @@ def api_expense_claim_action(claim_id):
     if action == "post":
         if claim.get("status") != "Approved":
             return jsonify({"error": "Only approved claims can be posted."}), 400
-        if claim.get("posted_transaction_id"):
+        if claim_has_active_posted_transaction(db, claim):
             return jsonify({"error": "This claim has already been posted."}), 400
         ensure_default_accounts(db)
         expense_account = db.accounts.find_one({"name": "Operating Expenses"}) or db.accounts.find_one({"type": "Expense"})
+        base_amount, cgst_amount, cgst_percent, total_claim_amount = claim_gst_breakdown(
+            claim.get("amount"),
+            claim.get("gst_percent"),
+            claim.get("gst_amount"),
+            claim.get("total_claim_amount"),
+        )
         tx = create_finance_transaction(db, {
             "account_id": expense_account.get("id") if expense_account else None,
             "transaction_date": data.get("posting_date") or claim.get("expense_date"),
             "description": f"Expense claim {claim.get('claim_number')}: {claim.get('expense_description')}",
             "type": "Expense",
-            "amount": claim.get("amount"),
-            "cgst_amount": claim.get("gst_amount"),
-            "total_amount": claim.get("total_claim_amount"),
+            "amount": base_amount,
+            "cgst_percent": cgst_percent,
+            "cgst_amount": cgst_amount,
+            "total_amount": total_claim_amount,
             "currency": data.get("currency") or "INR",
             "reference": claim.get("claim_number"),
             "category": claim.get("expense_category") or "Employee Expense Claim",
