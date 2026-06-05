@@ -1786,6 +1786,7 @@ def create_or_update_payable_from_revenue(db, revenue_doc):
         "source_module": "Revenue Log",
         "source_id": revenue_doc.get("id"),
         "source_reference": revenue_doc.get("revenue_id") or f"REV-{revenue_doc.get('id')}",
+        "transaction_id": revenue_doc.get("transaction_id"),
         "party_name": revenue_doc.get("vendor_name") or revenue_doc.get("employee_name") or revenue_doc.get("stakeholder_name") or revenue_doc.get("description") or "Company Expense",
         "transaction_date": revenue_doc.get("entry_date") or revenue_doc.get("date") or datetime.now().strftime("%Y-%m-%d"),
         "original_amount": amount,
@@ -4645,6 +4646,25 @@ def api_treasury_payables():
     if status:
         query["status"] = status
     payables = list(db.payables.find(query, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1)]))
+    for payable in payables:
+        latest_payment = db.payable_payments.find_one(
+            {"payable_id": payable.get("id")},
+            {"_id": 0},
+            sort=[("created_at", -1), ("id", -1)],
+        )
+        if latest_payment:
+            if not payable.get("last_payment_id"):
+                payable["last_payment_id"] = latest_payment.get("id")
+            if not payable.get("last_payment_reference"):
+                payable["last_payment_reference"] = latest_payment.get("reference")
+            if not payable.get("payment_reference"):
+                payable["payment_reference"] = latest_payment.get("reference")
+            if not payable.get("last_payment_date"):
+                payable["last_payment_date"] = latest_payment.get("payment_date")
+            if not payable.get("last_payment_amount"):
+                payable["last_payment_amount"] = latest_payment.get("payment_amount")
+            if not payable.get("last_payment_mode"):
+                payable["last_payment_mode"] = latest_payment.get("payment_mode")
     stats = {
         "total_payables": sum(parse_float(p.get("original_amount")) for p in payables if p.get("status") not in {"Cancelled", "Reversed"}),
         "pending_payments": sum(parse_float(p.get("outstanding_amount")) for p in payables if p.get("status") in {"Pending", "Partially Paid"}),
@@ -4675,6 +4695,7 @@ def api_treasury_payable_payment(payable_id):
         return jsonify({"error": "Insufficient company fund for this payment."}), 400
     payment_id = get_next_sequence_value("payable_payments")
     payment_date = data.get("payment_date") or datetime.now().strftime("%Y-%m-%d")
+    payment_reference = (data.get("reference") or "").strip()
     db.payable_payments.insert_one({
         "id": payment_id,
         "payable_id": payable_id,
@@ -4682,7 +4703,7 @@ def api_treasury_payable_payment(payable_id):
         "payment_date": payment_date,
         "bank_account_id": safe_int(data.get("bank_account_id")),
         "payment_mode": data.get("payment_mode"),
-        "reference": data.get("reference"),
+        "reference": payment_reference,
         "remarks": data.get("remarks"),
         "created_at": datetime.now(),
         "created_by_id": user["id"],
@@ -4702,6 +4723,7 @@ def api_treasury_payable_payment(payable_id):
         "amount": payment_amount,
         "status": "Paid",
         "payout_date": payment_date,
+        "reference": payment_reference,
         "description": f"Payable payment {payable.get('payable_number')} - {payable.get('source_reference')}",
         "created_at": datetime.now(),
         "created_by_id": user["id"],
@@ -4719,6 +4741,12 @@ def api_treasury_payable_payment(payable_id):
             "payment_mode": data.get("payment_mode"),
             "settlement_account": safe_int(data.get("bank_account_id")),
             "last_payment_id": payment_id,
+            "last_payment_reference": payment_reference,
+            "payment_reference": payment_reference,
+            "last_payment_date": payment_date,
+            "last_payment_amount": payment_amount,
+            "last_payment_mode": data.get("payment_mode"),
+            "last_payment_remarks": data.get("remarks"),
             "updated_at": datetime.now(),
         }},
     )
@@ -4735,7 +4763,7 @@ def api_treasury_payable_payment(payable_id):
             "payment_date": payment_date,
             "bank_account_id": safe_int(data.get("bank_account_id")),
             "payment_mode": data.get("payment_mode"),
-            "reference": data.get("reference"),
+            "reference": payment_reference,
             "remarks": data.get("remarks"),
             "created_at": datetime.now(),
             "created_by_id": user["id"],
@@ -4747,6 +4775,11 @@ def api_treasury_payable_payment(payable_id):
                 "outstanding_amount": payout_outstanding,
                 "status": payout_status,
                 "last_payment_id": payment_id,
+                "last_payment_reference": payment_reference,
+                "payment_reference": payment_reference,
+                "last_payment_date": payment_date,
+                "last_payment_amount": payment_amount,
+                "last_payment_mode": data.get("payment_mode"),
                 "payable_id": payable_id,
                 "updated_at": datetime.now(),
             }},
