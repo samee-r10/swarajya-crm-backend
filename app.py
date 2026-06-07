@@ -482,6 +482,20 @@ def seed_native_standard_fields():
             ("Owner", "owner", "Text", 0),
             ("Latest Update", "last_update", "Long Text", 0),
         ],
+        "products": [
+            ("Product Code", "product_code", "Text", 1),
+            ("Product Name", "product_name", "Text", 1),
+            ("Product Category", "product_category", "Text", 0),
+            ("Product Description", "product_description", "Long Text", 0),
+            ("Product Owner", "product_owner", "Text", 0),
+            ("Product Status", "product_status", "Dropdown", 1, '["Active", "Inactive"]'),
+            ("Launch Date", "launch_date", "Date", 0),
+            ("Product Type", "product_type", "Text", 0),
+            ("Product Manager", "product_manager", "Text", 0),
+            ("Product Revenue Account", "product_revenue_account", "Text", 0),
+            ("Product Expense Account", "product_expense_account", "Text", 0),
+            ("Remarks", "remarks", "Long Text", 0),
+        ],
         "vendors": [
             ("Name", "name", "Text", 1),
             ("Contact Person", "contact_person", "Text", 0),
@@ -496,6 +510,8 @@ def seed_native_standard_fields():
             ("Currency", "currency", "Text", 1),
             ("Type", "type", "Dropdown", 1, '["Income", "Expense"]'),
             ("Account", "account_id", "Number", 1),
+            ("Product", "product_id", "Number", 1),
+            ("Bank Account", "bank_account_id", "Number", 1),
             ("Customer", "customer_id", "Number", 0),
             ("Vendor", "vendor_id", "Number", 0),
             ("Category", "category", "Text", 0),
@@ -624,6 +640,7 @@ def init_database():
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Customer', 'plural_label': 'Customers', 'api_name': 'customers', 'is_standard': 1, 'storage_table': 'customers', 'description': 'Standard customer object.', 'created_at': datetime.now()},
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Opportunity', 'plural_label': 'Opportunities', 'api_name': 'opportunities', 'is_standard': 1, 'storage_table': 'opportunities', 'description': 'Standard sales opportunity object.', 'created_at': datetime.now()},
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Project', 'plural_label': 'Projects', 'api_name': 'projects', 'is_standard': 1, 'storage_table': 'projects', 'description': 'Standard delivery project object.', 'created_at': datetime.now()},
+        {'id': get_next_sequence_value('custom_objects'), 'label': 'Product', 'plural_label': 'Products', 'api_name': 'products', 'is_standard': 1, 'storage_table': 'products', 'description': 'Standard product object for product financial tracking.', 'created_at': datetime.now()},
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Vendor', 'plural_label': 'Vendors', 'api_name': 'vendors', 'is_standard': 1, 'storage_table': 'vendors', 'description': 'Standard vendor object for finance.', 'created_at': datetime.now()},
         {'id': get_next_sequence_value('custom_objects'), 'label': 'Transaction', 'plural_label': 'Transactions', 'api_name': 'transactions', 'is_standard': 1, 'storage_table': 'transactions', 'description': 'Standard transaction object for finance.', 'created_at': datetime.now()}
     ]
@@ -700,6 +717,13 @@ def init_database():
     db.vault_entries.create_index("category")
     db.vault_entries.create_index("title")
     db.bank_accounts.create_index("id", unique=True)
+    db.company_bank_accounts.create_index("id", unique=True)
+    db.company_bank_accounts.create_index("account_number", unique=True)
+    db.company_bank_transactions.create_index([("bank_account_id", 1), ("created_at", -1)])
+    db.fund_transfers.create_index("id", unique=True)
+    db.payee_bank_accounts.create_index("id", unique=True)
+    db.products.create_index("id", unique=True)
+    db.products.create_index("product_code", unique=True)
 
 
 @app.template_filter("date_or_dash")
@@ -1315,7 +1339,8 @@ def api_options():
     
     accounts = list(db.accounts.find({}, {"_id": 0}).sort("name", 1))
     vendors = list(db.vendors.find({}, {"_id": 0, "id": 1, "name": 1}).sort("name", 1))
-    projects_list = list(db.projects.find({}, {"_id": 0, "id": 1, "project_name": 1, "customer_id": 1}).sort("project_name", 1))
+    projects_list = list(db.projects.find({}, {"_id": 0, "id": 1, "project_name": 1, "customer_id": 1, "product_id": 1, "product_code": 1, "product_name": 1}).sort("project_name", 1))
+    products_list = list(db.products.find({"product_status": {"$ne": "Inactive"}}, {"_id": 0}).sort("product_name", 1))
     
     # Dynamically fetch picklists from custom_fields
     import json
@@ -1347,6 +1372,7 @@ def api_options():
                 "accounts": accounts,
                 "vendors": vendors,
                 "projects": projects_list,
+                "products": products_list,
                 "payment_terms": active_master_option_names(db, "payment-terms"),
                 "payment_modes": active_master_option_names(db, "payment-modes"),
                 "bank_accounts": list(
@@ -1454,6 +1480,8 @@ def create_finance_transaction(db, payload, actor=None):
         "customer_id": safe_int(payload.get("customer_id")),
         "vendor_id": safe_int(payload.get("vendor_id")),
         "project_id": safe_int(payload.get("project_id")),
+        "product_id": safe_int(payload.get("product_id")),
+        "bank_account_id": safe_int(payload.get("bank_account_id")),
         "invoice_id": safe_int(payload.get("invoice_id")),
         "invoice_number": payload.get("invoice_number"),
         "loan_account_id": safe_int(payload.get("loan_account_id")),
@@ -1484,8 +1512,172 @@ def create_finance_transaction(db, payload, actor=None):
         "modified_by_name": actor_name,
     }
     db.transactions.insert_one(doc)
+    if doc.get("bank_account_id"):
+        record_company_bank_movement(
+            db,
+            doc.get("bank_account_id"),
+            doc.get("type"),
+            total_amount,
+            direction="inflow" if doc.get("type") == "Income" else "outflow",
+            reference=doc.get("reference") or f"TXN-{transaction_id}",
+            description=doc.get("description") or f"Finance transaction #{transaction_id}",
+            movement_date=date_val,
+            currency=doc.get("currency"),
+            source_module="Finance Transaction",
+            source_id=transaction_id,
+            created_by_id=actor_id,
+        )
     log_activity_async("Finance", "Accounting Entry", transaction_id, "CREATE", new_data=doc, reference_number=doc.get("reference"))
     return doc
+
+
+def normalize_company_bank_account_payload(data, existing=None):
+    existing = existing or {}
+    account_name = (data.get("account_name") or data.get("beneficiary_name") or data.get("label") or existing.get("account_name") or "").strip()
+    bank_name = (data.get("bank_name") or existing.get("bank_name") or "").strip()
+    account_number = (data.get("account_number") or existing.get("account_number") or "").strip()
+    ifsc = (data.get("ifsc") or data.get("ifsc_code") or existing.get("ifsc") or existing.get("ifsc_code") or "").strip()
+    currency = (data.get("currency") or existing.get("currency") or "INR").strip()
+    return {
+        "account_number": account_number,
+        "account_name": account_name,
+        "beneficiary_name": data.get("beneficiary_name") or account_name,
+        "bank_name": bank_name,
+        "branch": data.get("branch", existing.get("branch", "")),
+        "ifsc": ifsc,
+        "ifsc_code": ifsc,
+        "currency": currency,
+        "opening_balance": parse_float(data.get("opening_balance"), existing.get("opening_balance", 0.0)),
+        "account_type": data.get("account_type", existing.get("account_type", "Current Account")),
+        "legal_entity": data.get("legal_entity", existing.get("legal_entity", "")),
+        "status": data.get("status", existing.get("status", "Active")),
+        "remarks": data.get("remarks", existing.get("remarks", "")),
+    }
+
+
+def company_bank_account_label(account):
+    if not account:
+        return "-"
+    tail = str(account.get("account_number") or "")[-4:]
+    parts = [account.get("account_name"), account.get("bank_name"), f"••{tail}" if tail else None]
+    return " · ".join([p for p in parts if p])
+
+
+def bank_account_current_balance(db, bank_account_id):
+    account = db.company_bank_accounts.find_one({"id": safe_int(bank_account_id)})
+    if not account:
+        return None
+    total_doc = list(db.company_bank_transactions.aggregate([
+        {"$match": {"bank_account_id": account["id"]}},
+        {"$group": {"_id": None, "inflow": {"$sum": "$inflow"}, "outflow": {"$sum": "$outflow"}}},
+    ]))
+    inflow = parse_float(total_doc[0].get("inflow")) if total_doc else 0.0
+    outflow = parse_float(total_doc[0].get("outflow")) if total_doc else 0.0
+    balance = parse_float(account.get("opening_balance")) + inflow - outflow
+    return round(balance, 2)
+
+
+def refresh_company_bank_balance(db, bank_account_id):
+    balance = bank_account_current_balance(db, bank_account_id)
+    if balance is None:
+        return None
+    db.company_bank_accounts.update_one(
+        {"id": safe_int(bank_account_id)},
+        {"$set": {"current_balance": balance, "updated_at": datetime.now()}},
+    )
+    return balance
+
+
+def record_company_bank_movement(db, bank_account_id, movement_type, amount, *, direction, reference=None, description=None, movement_date=None, currency="INR", source_module=None, source_id=None, created_by_id=None):
+    bank_account_id = safe_int(bank_account_id)
+    if not bank_account_id:
+        return None
+    account = db.company_bank_accounts.find_one({"id": bank_account_id, "status": {"$ne": "Inactive"}})
+    if not account:
+        raise ValueError("Select a valid Treasury bank account.")
+    amount = round(parse_float(amount), 2)
+    if amount <= 0:
+        raise ValueError("Bank movement amount must be greater than zero.")
+    if source_module and source_id is not None:
+        existing = db.company_bank_transactions.find_one({"source_module": source_module, "source_id": source_id, "bank_account_id": bank_account_id})
+        if existing:
+            return existing
+    current_balance = bank_account_current_balance(db, bank_account_id) or 0.0
+    inflow = amount if direction == "inflow" else 0.0
+    outflow = amount if direction == "outflow" else 0.0
+    if direction == "outflow" and amount > current_balance + 0.01:
+        raise ValueError(f"Insufficient balance in {company_bank_account_label(account)}.")
+    running_balance = round(current_balance + inflow - outflow, 2)
+    movement_id = get_next_sequence_value("company_bank_transactions")
+    doc = {
+        "id": movement_id,
+        "bank_account_id": bank_account_id,
+        "bank_account_name": company_bank_account_label(account),
+        "transaction_date": movement_date or datetime.now().strftime("%Y-%m-%d"),
+        "transaction_type": movement_type,
+        "reference": reference,
+        "description": description,
+        "currency": currency or account.get("currency") or "INR",
+        "inflow": inflow,
+        "outflow": outflow,
+        "running_balance": running_balance,
+        "source_module": source_module,
+        "source_id": source_id,
+        "created_at": datetime.now(),
+        "created_by_id": created_by_id,
+    }
+    db.company_bank_transactions.insert_one(doc)
+    db.company_bank_accounts.update_one(
+        {"id": bank_account_id},
+        {"$set": {"current_balance": running_balance, "updated_at": datetime.now()}},
+    )
+    return doc
+
+
+def sync_finance_transaction_bank_movement(db, transaction_doc, *, previous_doc=None, created_by_id=None):
+    transaction_id = transaction_doc.get("id")
+    affected_account_ids = set()
+    if previous_doc and previous_doc.get("bank_account_id"):
+        affected_account_ids.add(safe_int(previous_doc.get("bank_account_id")))
+    if transaction_doc.get("bank_account_id"):
+        affected_account_ids.add(safe_int(transaction_doc.get("bank_account_id")))
+    if transaction_id:
+        existing_movements = list(db.company_bank_transactions.find({"source_module": "Finance Transaction", "source_id": transaction_id}))
+        affected_account_ids.update(safe_int(item.get("bank_account_id")) for item in existing_movements if item.get("bank_account_id"))
+        db.company_bank_transactions.delete_many({"source_module": "Finance Transaction", "source_id": transaction_id})
+    for account_id in affected_account_ids:
+        if account_id:
+            refresh_company_bank_balance(db, account_id)
+    if transaction_doc.get("status") == "Reversed" or not transaction_doc.get("bank_account_id"):
+        return None
+    total_amount = parse_float(transaction_doc.get("total_amount") or transaction_doc.get("amount"))
+    movement = record_company_bank_movement(
+        db,
+        transaction_doc.get("bank_account_id"),
+        transaction_doc.get("type"),
+        total_amount,
+        direction="inflow" if transaction_doc.get("type") == "Income" else "outflow",
+        reference=transaction_doc.get("reference") or f"TXN-{transaction_id}",
+        description=transaction_doc.get("description") or f"Finance transaction #{transaction_id}",
+        movement_date=transaction_doc.get("transaction_date") or transaction_doc.get("date"),
+        currency=transaction_doc.get("currency"),
+        source_module="Finance Transaction",
+        source_id=transaction_id,
+        created_by_id=created_by_id,
+    )
+    affected_account_ids.add(safe_int(transaction_doc.get("bank_account_id")))
+    for account_id in affected_account_ids:
+        if account_id:
+            refresh_company_bank_balance(db, account_id)
+    return movement
+
+
+def company_bank_account_with_balance(db, account):
+    item = {k: v for k, v in account.items() if k != "_id"}
+    item["current_balance"] = refresh_company_bank_balance(db, item["id"])
+    item["available_balance"] = item["current_balance"]
+    item["label"] = company_bank_account_label(item)
+    return item
 
 
 def sync_transaction_to_treasury_revenue(db, transaction_doc):
@@ -1809,6 +2001,35 @@ def create_or_update_payable_from_revenue(db, revenue_doc):
     })
     db.payables.insert_one(payload)
     return payload
+
+
+def sync_revenue_settlement_from_payable(db, payable):
+    if not payable or payable.get("source_module") != "Revenue Log" or not payable.get("source_id"):
+        return None
+    update = {
+        "payable_id": payable.get("id"),
+        "payable_status": payable.get("status"),
+        "payable_paid_amount": parse_float(payable.get("paid_amount")),
+        "payable_outstanding_amount": parse_float(payable.get("outstanding_amount")),
+        "updated_at": datetime.now(),
+    }
+    if payable.get("status") == "Paid":
+        update.update({
+            "is_settled": True,
+            "settled_at": datetime.now(),
+            "settled_via": "Payables",
+            "settlement_account": payable.get("settlement_account"),
+            "settled_payment_reference": payable.get("last_payment_reference") or payable.get("payment_reference"),
+        })
+    else:
+        update.update({"is_settled": False})
+    db.treasury_revenue.update_one({"id": payable.get("source_id")}, {"$set": update})
+    return db.treasury_revenue.find_one({"id": payable.get("source_id")})
+
+
+def sync_revenue_settlements_from_payables(db):
+    for payable in db.payables.find({"source_module": "Revenue Log"}):
+        sync_revenue_settlement_from_payable(db, payable)
 
 
 def payout_payable_source_module(payout):
@@ -2236,12 +2457,19 @@ def api_finance_account_transactions(account_id):
         {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
         {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "products", "localField": "product_id", "foreignField": "id", "as": "product"}},
+        {"$unwind": {"path": "$product", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "company_bank_accounts", "localField": "bank_account_id", "foreignField": "id", "as": "bank_account"}},
+        {"$unwind": {"path": "$bank_account", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "invoices", "localField": "invoice_id", "foreignField": "id", "as": "invoice"}},
         {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
+            "product_name": "$product.product_name",
+            "product_code": "$product.product_code",
+            "bank_account_name": "$bank_account.label",
             "invoice_number": {"$ifNull": ["$invoice.invoice_number", "$invoice_number"]},
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]},
         }},
@@ -3060,6 +3288,88 @@ def api_opportunity_detail(opportunity_id):
         "fields": fields
     }))
 
+def normalize_product_payload(data):
+    return {
+        "product_code": (data.get("product_code") or data.get("code") or "").strip(),
+        "product_name": (data.get("product_name") or data.get("name") or "").strip(),
+        "product_category": (data.get("product_category") or data.get("category") or "").strip(),
+        "product_description": data.get("product_description") or data.get("description") or "",
+        "product_owner": data.get("product_owner") or data.get("owner") or "",
+        "product_status": data.get("product_status") or data.get("status") or "Active",
+        "launch_date": data.get("launch_date") or "",
+        "product_type": data.get("product_type") or "",
+        "product_manager": data.get("product_manager") or "",
+        "product_revenue_account": data.get("product_revenue_account") or "",
+        "product_expense_account": data.get("product_expense_account") or "",
+        "remarks": data.get("remarks") or "",
+    }
+
+
+@app.route("/api/products", methods=["GET", "POST"])
+def api_products():
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json() or {}
+        payload = normalize_product_payload(data)
+        if not payload["product_code"] or not payload["product_name"]:
+            return jsonify({"error": "Product Code and Product Name are required."}), 400
+        if db.products.find_one({"product_code": payload["product_code"]}):
+            return jsonify({"error": "Product Code already exists."}), 400
+        actor, actor_id, actor_name = audit_actor()
+        product_id = get_next_sequence_value("products")
+        insert_data = {
+            "id": product_id,
+            **payload,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+            "created_by_id": actor_id,
+            "created_by_name": actor_name,
+            "modified_by_id": actor_id,
+            "modified_by_name": actor_name,
+        }
+        merge_client_fields(insert_data, data)
+        db.products.insert_one(insert_data)
+        log_activity_async("Products", "Product", product_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("product_code"))
+        return jsonify(json_ready({"id": product_id, "product": db.products.find_one({"id": product_id}, {"_id": 0})}))
+
+    products = list(db.products.find({}, {"_id": 0}).sort("updated_at", -1))
+    product_obj = db.custom_objects.find_one({"api_name": "products"})
+    fields = get_fields_for_user(product_obj["id"]) if product_obj else []
+    return jsonify(json_ready({"products": products, "fields": fields}))
+
+
+@app.route("/api/products/<int:product_id>", methods=["GET", "PUT"])
+def api_product_detail(product_id):
+    db = get_db()
+    product = db.products.find_one({"id": product_id}, {"_id": 0})
+    if not product:
+        abort(404)
+    if request.method == "PUT":
+        data = request.get_json() or {}
+        payload = normalize_product_payload(data)
+        if not payload["product_code"] or not payload["product_name"]:
+            return jsonify({"error": "Product Code and Product Name are required."}), 400
+        duplicate = db.products.find_one({"product_code": payload["product_code"], "id": {"$ne": product_id}})
+        if duplicate:
+            return jsonify({"error": "Product Code already exists."}), 400
+        actor, actor_id, actor_name = audit_actor()
+        update_data = {
+            **payload,
+            "updated_at": datetime.now(),
+            "modified_by_id": actor_id,
+            "modified_by_name": actor_name,
+        }
+        merge_client_fields(update_data, data)
+        old_product = db.products.find_one({"id": product_id}, {"_id": 0})
+        db.products.update_one({"id": product_id}, {"$set": update_data})
+        new_product = db.products.find_one({"id": product_id}, {"_id": 0})
+        log_activity_async("Products", "Product", product_id, "UPDATE", old_data=old_product, new_data=new_product, reference_number=new_product.get("product_code"))
+        return jsonify(json_ready({"success": True, "product": new_product}))
+    product_obj = db.custom_objects.find_one({"api_name": "products"})
+    fields = get_fields_for_user(product_obj["id"]) if product_obj else []
+    return jsonify(json_ready({"product": product, "fields": fields}))
+
+
 @app.route("/api/projects", methods=["GET", "POST"])
 def api_projects():
     db = get_db()
@@ -3549,6 +3859,8 @@ def api_finance_transactions():
             "customer_id": customer_id,
             "vendor_id": int(data.get("vendor_id")) if data.get("vendor_id") else None,
             "project_id": int(data.get("project_id")) if data.get("project_id") else None,
+            "product_id": int(data.get("product_id")) if str(data.get("product_id") or "").isdigit() else data.get("product_id"),
+            "bank_account_id": None,
             "invoice_id": invoice_id,
             "invoice_number": invoice_number,
             "loan_account_id": loan_account_id,
@@ -3580,6 +3892,7 @@ def api_finance_transactions():
             "modified_by_name": actor_name
         }
         merge_client_fields(insert_data, data)
+        insert_data["bank_account_id"] = None
 
         db.transactions.insert_one(insert_data)
         if category == "Loan Disbursement" and linked_loan:
@@ -3629,6 +3942,10 @@ def api_finance_transactions():
         {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
         {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "products", "localField": "product_id", "foreignField": "id", "as": "product"}},
+        {"$unwind": {"path": "$product", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "company_bank_accounts", "localField": "bank_account_id", "foreignField": "id", "as": "bank_account"}},
+        {"$unwind": {"path": "$bank_account", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "invoices", "localField": "invoice_id", "foreignField": "id", "as": "invoice"}},
         {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
@@ -3636,10 +3953,13 @@ def api_finance_transactions():
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
+            "product_name": "$product.product_name",
+            "product_code": "$product.product_code",
+            "bank_account_name": "$bank_account.label",
             "invoice_number": {"$ifNull": ["$invoice.invoice_number", "$invoice_number"]},
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
         }},
-        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "invoice": 0, "_id": 0}},
+        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "product": 0, "bank_account": 0, "invoice": 0, "_id": 0}},
         {"$sort": {"transaction_date": -1, "created_at": -1, "id": -1}}
     ]))
     transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
@@ -3793,37 +4113,44 @@ def api_finance_transaction_detail(transaction_id):
                     return jsonify({"error": "Select a valid repayment schedule line for this loan."}), 400
 
         old_tx = db.transactions.find_one({"id": transaction_id})
-        db.transactions.update_one(
-            {"id": transaction_id},
-            {"$set": {
-                "account_id": account_id,
-                "customer_id": customer_id,
-                "vendor_id": int(data.get("vendor_id")) if data.get("vendor_id") else None,
-                "project_id": int(data.get("project_id")) if data.get("project_id") else None,
-                "invoice_id": invoice_id,
-                "invoice_number": invoice_number,
-                "loan_account_id": loan_account_id,
-                "loan_schedule_id": loan_schedule_id,
-                "expense_claim_id": expense_claim_id,
-                "attachments": data.get("attachments") or [],
-                "transaction_date": date_val,
-                "date": date_val,
-                "description": data.get("description"),
-                "type": data.get("type"),
-                "amount": amount,
-                "currency": data.get("currency"),
-                "reference": data.get("reference"),
-                "category": category,
-                "status": data.get("status"),
-                "cgst_percent": cgst_percent,
-                "cgst_amount": cgst_amount,
-                "igst_percent": igst_percent,
-                "igst_amount": igst_amount,
-                "tds_percent": tds_percent,
-                "tds_amount": tds_amount,
-                "total_amount": total_amount
-            }}
-        )
+        if not old_tx:
+            abort(404)
+        actor, actor_id, actor_name = audit_actor()
+        update_payload = {
+            "account_id": account_id,
+            "customer_id": customer_id,
+            "vendor_id": int(data.get("vendor_id")) if data.get("vendor_id") else None,
+            "project_id": int(data.get("project_id")) if data.get("project_id") else None,
+            "product_id": int(data.get("product_id")) if str(data.get("product_id") or "").isdigit() else data.get("product_id"),
+            "bank_account_id": None,
+            "invoice_id": invoice_id,
+            "invoice_number": invoice_number,
+            "loan_account_id": loan_account_id,
+            "loan_schedule_id": loan_schedule_id,
+            "expense_claim_id": expense_claim_id,
+            "attachments": data.get("attachments") or [],
+            "transaction_date": date_val,
+            "date": date_val,
+            "description": data.get("description"),
+            "type": data.get("type"),
+            "amount": amount,
+            "currency": data.get("currency"),
+            "reference": data.get("reference"),
+            "category": category,
+            "depreciation_value": float(data.get("depreciation_value") or 0) if category == "Fixed Assets" else None,
+            "status": data.get("status") or old_tx.get("status") or "Completed",
+            "cgst_percent": cgst_percent,
+            "cgst_amount": cgst_amount,
+            "igst_percent": igst_percent,
+            "igst_amount": igst_amount,
+            "tds_percent": tds_percent,
+            "tds_amount": tds_amount,
+            "total_amount": total_amount,
+            "updated_at": datetime.now(),
+            "modified_by_id": actor_id,
+            "modified_by_name": actor_name,
+        }
+        db.transactions.update_one({"id": transaction_id}, {"$set": update_payload})
         transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
         transaction_fields = get_fields_for_user(transaction_obj["id"]) if transaction_obj else []
         native_field_names = {field["api_name"] for field in transaction_fields if field.get("is_native")}
@@ -3835,6 +4162,7 @@ def api_finance_transaction_detail(transaction_id):
         if dynamic_update_data:
             db.transactions.update_one({"id": transaction_id}, {"$set": dynamic_update_data})
         new_tx = db.transactions.find_one({"id": transaction_id})
+        sync_finance_transaction_bank_movement(db, new_tx, previous_doc=old_tx, created_by_id=actor_id)
         if category == "Loan Repayment" and loan_schedule_id:
             linked_schedule = db.loan_repayment_schedules.find_one({"id": loan_schedule_id, "loan_id": loan_account_id})
             if linked_schedule:
@@ -3858,6 +4186,10 @@ def api_finance_transaction_detail(transaction_id):
         {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
         {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "products", "localField": "product_id", "foreignField": "id", "as": "product"}},
+        {"$unwind": {"path": "$product", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "company_bank_accounts", "localField": "bank_account_id", "foreignField": "id", "as": "bank_account"}},
+        {"$unwind": {"path": "$bank_account", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "invoices", "localField": "invoice_id", "foreignField": "id", "as": "invoice"}},
         {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
@@ -3865,10 +4197,13 @@ def api_finance_transaction_detail(transaction_id):
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
+            "product_name": "$product.product_name",
+            "product_code": "$product.product_code",
+            "bank_account_name": "$bank_account.label",
             "invoice_number": {"$ifNull": ["$invoice.invoice_number", "$invoice_number"]},
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
         }},
-        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "invoice": 0, "_id": 0}}
+        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "product": 0, "bank_account": 0, "invoice": 0, "_id": 0}}
     ]))
     if not transactions:
         abort(404)
@@ -3989,6 +4324,8 @@ def api_invoices():
             "invoice_number": invoice_number,
             "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
             "project_id": int(data.get("project_id")) if data.get("project_id") else None,
+            "product_id": int(data.get("product_id")) if str(data.get("product_id") or "").isdigit() else data.get("product_id"),
+            "invoice_type": data.get("invoice_type", "Normal Invoice"),
             "account_id": int(data.get("account_id")) if data.get("account_id") else None,
             "issue_date": issue_date,
             "due_date": data.get("due_date"),
@@ -4068,6 +4405,8 @@ def api_invoice_detail(invoice_id):
                 "invoice_number": data.get("invoice_number"),
                 "customer_id": int(data.get("customer_id")) if data.get("customer_id") else None,
                 "project_id": int(data.get("project_id")) if data.get("project_id") else None,
+                "product_id": int(data.get("product_id")) if str(data.get("product_id") or "").isdigit() else data.get("product_id"),
+                "invoice_type": data.get("invoice_type", "Normal Invoice"),
                 "account_id": int(data.get("account_id")) if data.get("account_id") else None,
                 "issue_date": issue_date,
                 "due_date": data.get("due_date"),
@@ -4445,6 +4784,7 @@ def api_treasury_dashboard():
     purge_orphaned_unsettled_transaction_revenue(db)
     purge_unsettled_revenue_payouts(db)
     normalize_stakeholder_flow_payouts(db)
+    sync_revenue_settlements_from_payables(db)
     
     # 1. Reserve Fund — only settled revenue allocations (+ manual reserve expenses)
     settled_revenue_ids = get_settled_revenue_ids(db)
@@ -4634,6 +4974,188 @@ def api_treasury_payment_stats():
     }))
 
 
+@app.route("/api/treasury/bank-accounts", methods=["GET", "POST"])
+def api_treasury_bank_accounts():
+    user = require_treasury_access()
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json() or {}
+        payload = normalize_company_bank_account_payload(data)
+        if not payload["account_number"] or not payload["account_name"] or not payload["bank_name"]:
+            return jsonify({"error": "Account Number, Account Name, and Bank Name are required."}), 400
+        if db.company_bank_accounts.find_one({"account_number": payload["account_number"]}):
+            return jsonify({"error": "A Treasury bank account with this account number already exists."}), 400
+        account_id = get_next_sequence_value("company_bank_accounts")
+        doc = {
+            "id": account_id,
+            **payload,
+            "current_balance": payload["opening_balance"],
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+            "created_by_id": user["id"],
+        }
+        db.company_bank_accounts.insert_one(doc)
+        log_treasury_action(user["id"], "Created Company Bank Account", f"Created {company_bank_account_label(doc)}.")
+        return jsonify(json_ready({"id": account_id, "bank_account": company_bank_account_with_balance(db, doc)}))
+
+    accounts = [company_bank_account_with_balance(db, account) for account in db.company_bank_accounts.find({}, {"_id": 0}).sort("account_name", 1)]
+    account_ids = [account["id"] for account in accounts]
+    tx_query = {"bank_account_id": {"$in": account_ids}} if account_ids else {}
+    transactions = list(db.company_bank_transactions.find(tx_query, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1), ("id", -1)]).limit(50))
+    stats = {
+        "available_balance": sum(parse_float(account.get("current_balance")) for account in accounts if account.get("status") != "Inactive"),
+        "total_inflow": sum(parse_float(tx.get("inflow")) for tx in db.company_bank_transactions.find({}, {"inflow": 1})),
+        "total_outflow": sum(parse_float(tx.get("outflow")) for tx in db.company_bank_transactions.find({}, {"outflow": 1})),
+        "pending_payables": sum(parse_float(p.get("outstanding_amount")) for p in db.payables.find({"status": {"$in": ["Pending", "Partially Paid"]}}, {"outstanding_amount": 1})),
+    }
+    return jsonify(json_ready({"bank_accounts": accounts, "stats": stats, "transactions": transactions}))
+
+
+@app.route("/api/treasury/bank-accounts/<int:bank_account_id>", methods=["GET", "PUT"])
+def api_treasury_bank_account_detail(bank_account_id):
+    user = require_treasury_access()
+    db = get_db()
+    account = db.company_bank_accounts.find_one({"id": bank_account_id})
+    if not account:
+        abort(404)
+    if request.method == "PUT":
+        data = request.get_json() or {}
+        payload = normalize_company_bank_account_payload(data, account)
+        duplicate = db.company_bank_accounts.find_one({"account_number": payload["account_number"], "id": {"$ne": bank_account_id}})
+        if duplicate:
+            return jsonify({"error": "A Treasury bank account with this account number already exists."}), 400
+        db.company_bank_accounts.update_one(
+            {"id": bank_account_id},
+            {"$set": {**payload, "updated_at": datetime.now(), "modified_by_id": user["id"]}},
+        )
+        updated = db.company_bank_accounts.find_one({"id": bank_account_id})
+        refresh_company_bank_balance(db, bank_account_id)
+        log_treasury_action(user["id"], "Updated Company Bank Account", f"Updated {company_bank_account_label(updated)}.")
+        return jsonify(json_ready({"success": True, "bank_account": company_bank_account_with_balance(db, updated)}))
+    transactions = list(db.company_bank_transactions.find({"bank_account_id": bank_account_id}, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1), ("id", -1)]))
+    return jsonify(json_ready({"bank_account": company_bank_account_with_balance(db, account), "transactions": transactions}))
+
+
+@app.route("/api/treasury/bank-accounts/<int:bank_account_id>/balance", methods=["GET"])
+def api_treasury_bank_account_balance(bank_account_id):
+    require_treasury_access()
+    db = get_db()
+    account = db.company_bank_accounts.find_one({"id": bank_account_id})
+    if not account:
+        abort(404)
+    balance = refresh_company_bank_balance(db, bank_account_id)
+    latest = db.company_bank_transactions.find_one({"bank_account_id": bank_account_id}, {"_id": 0}, sort=[("created_at", -1), ("id", -1)])
+    return jsonify(json_ready({
+        "bank_account": company_bank_account_with_balance(db, account),
+        "available_balance": balance,
+        "checked_at": datetime.now(),
+        "last_transaction": latest,
+    }))
+
+
+@app.route("/api/treasury/fund-transfers", methods=["GET", "POST"])
+def api_treasury_fund_transfers():
+    user = require_treasury_access()
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json() or {}
+        transfer_date = data.get("transfer_date") or datetime.now().strftime("%Y-%m-%d")
+        to_account_id = safe_int(data.get("to_bank_account_id"))
+        if data.get("transfer_all"):
+            if not to_account_id or not db.company_bank_accounts.find_one({"id": to_account_id, "status": {"$ne": "Inactive"}}):
+                return jsonify({"error": "Select a valid destination account."}), 400
+            transfer_docs = []
+            for source in db.company_bank_accounts.find({"id": {"$ne": to_account_id}, "status": {"$ne": "Inactive"}}):
+                balance = bank_account_current_balance(db, source["id"]) or 0.0
+                if balance <= 0.01:
+                    continue
+                transfer_id = get_next_sequence_value("fund_transfers")
+                transfer_number = f"IFT-{transfer_id:05d}"
+                out_doc = record_company_bank_movement(
+                    db, source["id"], "Internal Transfer", balance,
+                    direction="outflow", reference=transfer_number,
+                    description=f"Transfer all funds to {company_bank_account_label(db.company_bank_accounts.find_one({'id': to_account_id}))}",
+                    movement_date=transfer_date, source_module="Fund Transfer", source_id=f"{transfer_id}-OUT", created_by_id=user["id"],
+                )
+                in_doc = record_company_bank_movement(
+                    db, to_account_id, "Internal Transfer", balance,
+                    direction="inflow", reference=transfer_number,
+                    description=f"Transfer all funds from {company_bank_account_label(source)}",
+                    movement_date=transfer_date, source_module="Fund Transfer", source_id=f"{transfer_id}-IN", created_by_id=user["id"],
+                )
+                transfer_doc = {
+                    "id": transfer_id,
+                    "transfer_number": transfer_number,
+                    "transfer_date": transfer_date,
+                    "from_bank_account_id": source["id"],
+                    "from_bank_account_name": company_bank_account_label(source),
+                    "to_bank_account_id": to_account_id,
+                    "to_bank_account_name": in_doc.get("bank_account_name"),
+                    "transfer_amount": balance,
+                    "transaction_reference": data.get("transaction_reference") or transfer_number,
+                    "remarks": data.get("remarks") or "Transfer all available funds",
+                    "out_transaction_id": out_doc.get("id"),
+                    "in_transaction_id": in_doc.get("id"),
+                    "created_at": datetime.now(),
+                    "created_by_id": user["id"],
+                }
+                db.fund_transfers.insert_one(transfer_doc)
+                transfer_docs.append(transfer_doc)
+            log_treasury_action(user["id"], "Transferred All Funds", f"Moved funds from {len(transfer_docs)} account(s) to destination bank account {to_account_id}.")
+            return jsonify(json_ready({"success": True, "transfers": transfer_docs}))
+
+        from_account_id = safe_int(data.get("from_bank_account_id"))
+        amount = parse_float(data.get("transfer_amount") or data.get("amount"))
+        if not from_account_id or not to_account_id or amount <= 0:
+            return jsonify({"error": "From account, To account, and Transfer Amount are required."}), 400
+        if from_account_id == to_account_id:
+            return jsonify({"error": "Source and destination accounts must be different."}), 400
+        from_account = db.company_bank_accounts.find_one({"id": from_account_id, "status": {"$ne": "Inactive"}})
+        to_account = db.company_bank_accounts.find_one({"id": to_account_id, "status": {"$ne": "Inactive"}})
+        if not from_account or not to_account:
+            return jsonify({"error": "Select active source and destination bank accounts."}), 400
+        transfer_id = get_next_sequence_value("fund_transfers")
+        transfer_number = data.get("transfer_number") or f"IFT-{transfer_id:05d}"
+        try:
+            out_doc = record_company_bank_movement(
+                db, from_account_id, "Internal Transfer", amount,
+                direction="outflow", reference=transfer_number,
+                description=f"Internal transfer to {company_bank_account_label(to_account)}",
+                movement_date=transfer_date, source_module="Fund Transfer", source_id=f"{transfer_id}-OUT", created_by_id=user["id"],
+            )
+            in_doc = record_company_bank_movement(
+                db, to_account_id, "Internal Transfer", amount,
+                direction="inflow", reference=transfer_number,
+                description=f"Internal transfer from {company_bank_account_label(from_account)}",
+                movement_date=transfer_date, source_module="Fund Transfer", source_id=f"{transfer_id}-IN", created_by_id=user["id"],
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        transfer_doc = {
+            "id": transfer_id,
+            "transfer_number": transfer_number,
+            "transfer_date": transfer_date,
+            "from_bank_account_id": from_account_id,
+            "from_bank_account_name": company_bank_account_label(from_account),
+            "to_bank_account_id": to_account_id,
+            "to_bank_account_name": company_bank_account_label(to_account),
+            "transfer_amount": amount,
+            "transaction_reference": data.get("transaction_reference") or transfer_number,
+            "remarks": data.get("remarks"),
+            "out_transaction_id": out_doc.get("id"),
+            "in_transaction_id": in_doc.get("id"),
+            "created_at": datetime.now(),
+            "created_by_id": user["id"],
+        }
+        db.fund_transfers.insert_one(transfer_doc)
+        log_treasury_action(user["id"], "Internal Fund Transfer", f"Transferred {amount:.2f} from {company_bank_account_label(from_account)} to {company_bank_account_label(to_account)}.")
+        return jsonify(json_ready({"success": True, "transfer": transfer_doc}))
+
+    transfers = list(db.fund_transfers.find({}, {"_id": 0}).sort([("transfer_date", -1), ("created_at", -1), ("id", -1)]))
+    accounts = [company_bank_account_with_balance(db, account) for account in db.company_bank_accounts.find({"status": {"$ne": "Inactive"}}, {"_id": 0}).sort("account_name", 1)]
+    return jsonify(json_ready({"transfers": transfers, "bank_accounts": accounts}))
+
+
 @app.route("/api/treasury/payables", methods=["GET"])
 def api_treasury_payables():
     require_treasury_access()
@@ -4641,6 +5163,7 @@ def api_treasury_payables():
     sync_negative_revenue_payables(db)
     sync_reversed_transaction_payables(db)
     sync_approved_payout_payables(db)
+    sync_revenue_settlements_from_payables(db)
     status = request.args.get("status")
     query = {}
     if status:
@@ -4674,6 +5197,81 @@ def api_treasury_payables():
     return jsonify(json_ready({"payables": payables, "stats": stats}))
 
 
+def payee_bank_account_label(account):
+    if not account:
+        return ""
+    tail = str(account.get("account_number") or "")[-4:]
+    parts = [
+        account.get("owner_name"),
+        account.get("bank_name"),
+        f"••{tail}" if tail else account.get("upi_id"),
+    ]
+    return " · ".join([part for part in parts if part])
+
+
+@app.route("/api/treasury/payee-bank-accounts", methods=["GET", "POST"])
+def api_treasury_payee_bank_accounts():
+    require_treasury_access()
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json() or {}
+        owner_type = data.get("owner_type") or "Other"
+        if owner_type not in {"Stakeholder", "Channel Partner", "Employee", "Vendor", "Other"}:
+            return jsonify({"error": "Select a valid payee type."}), 400
+        owner_id = safe_int(data.get("owner_id"))
+        owner_name = (data.get("owner_name") or "").strip()
+        if owner_type == "Stakeholder" and owner_id:
+            owner = db.treasury_stakeholders.find_one({"id": owner_id})
+            owner_name = owner.get("name") if owner else owner_name
+        elif owner_type == "Channel Partner" and owner_id:
+            owner = db.treasury_partners.find_one({"id": owner_id})
+            owner_name = owner.get("name") if owner else owner_name
+        if not owner_name:
+            return jsonify({"error": "Payee name is required."}), 400
+        if not (data.get("account_number") or data.get("upi_id")):
+            return jsonify({"error": "Account number or UPI ID is required."}), 400
+        account_id = get_next_sequence_value("payee_bank_accounts")
+        doc = {
+            "id": account_id,
+            "owner_type": owner_type,
+            "owner_id": owner_id,
+            "owner_name": owner_name,
+            "account_name": data.get("account_name") or owner_name,
+            "account_number": data.get("account_number"),
+            "bank_name": data.get("bank_name"),
+            "branch": data.get("branch"),
+            "ifsc": data.get("ifsc") or data.get("ifsc_code"),
+            "ifsc_code": data.get("ifsc_code") or data.get("ifsc"),
+            "upi_id": data.get("upi_id"),
+            "status": data.get("status") or "Active",
+            "remarks": data.get("remarks"),
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        }
+        doc["label"] = payee_bank_account_label(doc)
+        db.payee_bank_accounts.insert_one(doc)
+        return jsonify(json_ready({"success": True, "account": {k: v for k, v in doc.items() if k != "_id"}}))
+
+    accounts = list(db.payee_bank_accounts.find({}, {"_id": 0}).sort([("owner_type", 1), ("owner_name", 1), ("created_at", -1)]))
+    for account in accounts:
+        account["label"] = account.get("label") or payee_bank_account_label(account)
+    stakeholders = list(db.treasury_stakeholders.find({"is_active": {"$ne": False}}, {"_id": 0, "id": 1, "name": 1}).sort("name", 1))
+    partners = list(db.treasury_partners.find({"is_active": {"$ne": False}}, {"_id": 0, "id": 1, "name": 1}).sort("name", 1))
+    employees = sorted({
+        (claim.get("employee_name") or "").strip()
+        for claim in db.expense_claims.find({}, {"employee_name": 1})
+        if (claim.get("employee_name") or "").strip()
+    })
+    return jsonify(json_ready({
+        "accounts": accounts,
+        "recipients": {
+            "stakeholders": stakeholders,
+            "partners": partners,
+            "employees": [{"name": name} for name in employees],
+        },
+    }))
+
+
 @app.route("/api/treasury/payables/<int:payable_id>/payments", methods=["POST"])
 def api_treasury_payable_payment(payable_id):
     user = require_treasury_access()
@@ -4690,9 +5288,21 @@ def api_treasury_payable_payment(payable_id):
         return jsonify({"error": "Payment amount must be greater than zero."}), 400
     if payment_amount > outstanding + 0.01:
         return jsonify({"error": "Overpayment is not allowed."}), 400
+    bank_account_id = safe_int(data.get("bank_account_id"))
+    if not bank_account_id:
+        return jsonify({"error": "Paid From Bank Account is required."}), 400
+    account_balance = bank_account_current_balance(db, bank_account_id)
+    if account_balance is None:
+        return jsonify({"error": "Select a valid Treasury bank account."}), 400
+    if payment_amount > account_balance + 0.01:
+        return jsonify({"error": "Insufficient balance in selected bank account."}), 400
     available = company_fund_available(db)
     if payment_amount > available + 0.01:
         return jsonify({"error": "Insufficient company fund for this payment."}), 400
+    recipient_account_id = safe_int(data.get("recipient_account_id"))
+    recipient_account = db.payee_bank_accounts.find_one({"id": recipient_account_id, "status": {"$ne": "Inactive"}}) if recipient_account_id else None
+    if not recipient_account:
+        return jsonify({"error": "Select the recipient account paid to."}), 400
     payment_id = get_next_sequence_value("payable_payments")
     payment_date = data.get("payment_date") or datetime.now().strftime("%Y-%m-%d")
     payment_reference = (data.get("reference") or "").strip()
@@ -4701,13 +5311,35 @@ def api_treasury_payable_payment(payable_id):
         "payable_id": payable_id,
         "payment_amount": payment_amount,
         "payment_date": payment_date,
-        "bank_account_id": safe_int(data.get("bank_account_id")),
+        "bank_account_id": bank_account_id,
+        "recipient_account_id": recipient_account_id,
+        "recipient_account_label": payee_bank_account_label(recipient_account),
+        "recipient_owner_type": recipient_account.get("owner_type"),
+        "recipient_owner_name": recipient_account.get("owner_name"),
         "payment_mode": data.get("payment_mode"),
         "reference": payment_reference,
         "remarks": data.get("remarks"),
         "created_at": datetime.now(),
         "created_by_id": user["id"],
     })
+    try:
+        record_company_bank_movement(
+            db,
+            bank_account_id,
+            "Payable Settlement",
+            payment_amount,
+            direction="outflow",
+            reference=payment_reference or f"PAY-{payment_id}",
+            description=f"Payable payment {payable.get('payable_number')} - {payable.get('source_reference')}",
+            movement_date=payment_date,
+            currency=payable.get("currency", "INR"),
+            source_module="Payable Payment",
+            source_id=payment_id,
+            created_by_id=user["id"],
+        )
+    except ValueError as exc:
+        db.payable_payments.delete_one({"id": payment_id})
+        return jsonify({"error": str(exc)}), 400
     is_payout_payable = payable.get("source_module") in {"Stakeholder Payout", "Channel Partner Payout"}
     treasury_payout_type = payable.get("source_module") if is_payout_payable else "Reserve Expense"
     payout_source = db.stakeholder_payout_receipts.find_one({"id": payable.get("source_id")}) if is_payout_payable else None
@@ -4739,7 +5371,11 @@ def api_treasury_payable_payment(payable_id):
             "status": status,
             "payment_status": status,
             "payment_mode": data.get("payment_mode"),
-            "settlement_account": safe_int(data.get("bank_account_id")),
+            "settlement_account": bank_account_id,
+            "recipient_account_id": recipient_account_id,
+            "recipient_account_label": payee_bank_account_label(recipient_account),
+            "recipient_owner_type": recipient_account.get("owner_type"),
+            "recipient_owner_name": recipient_account.get("owner_name"),
             "last_payment_id": payment_id,
             "last_payment_reference": payment_reference,
             "payment_reference": payment_reference,
@@ -4750,6 +5386,8 @@ def api_treasury_payable_payment(payable_id):
             "updated_at": datetime.now(),
         }},
     )
+    updated_payable = db.payables.find_one({"id": payable_id})
+    sync_revenue_settlement_from_payable(db, updated_payable)
     if is_payout_payable:
         payout = payout_source or db.stakeholder_payout_receipts.find_one({"id": payable.get("source_id")})
         payout_paid_amount = parse_float((payout or {}).get("paid_amount")) + payment_amount
@@ -4761,7 +5399,9 @@ def api_treasury_payable_payment(payable_id):
             "payable_id": payable_id,
             "payment_amount": payment_amount,
             "payment_date": payment_date,
-            "bank_account_id": safe_int(data.get("bank_account_id")),
+            "bank_account_id": bank_account_id,
+            "recipient_account_id": recipient_account_id,
+            "recipient_account_label": payee_bank_account_label(recipient_account),
             "payment_mode": data.get("payment_mode"),
             "reference": payment_reference,
             "remarks": data.get("remarks"),
@@ -4906,6 +5546,44 @@ def api_treasury_stakeholders():
         {"$sort": {"approval_sequence": 1, "created_at": -1}},
     ]))
     return jsonify(json_ready({"stakeholders": stakeholders}))
+
+@app.route("/api/treasury/stakeholders/<int:sid>/transactions", methods=["GET"])
+def api_treasury_stakeholder_transactions(sid):
+    require_treasury_access()
+    db = get_db()
+    stakeholder = db.treasury_stakeholders.find_one({"id": sid}, {"_id": 0})
+    if not stakeholder:
+        return jsonify({"error": "Stakeholder not found."}), 404
+    rows = list(db.treasury_payouts.aggregate([
+        {"$match": {"stakeholder_id": sid, "payout_type": {"$in": ["Stakeholder Contribution", "Stakeholder", "Stakeholder Payout"]}}},
+        {"$lookup": {"from": "treasury_revenue", "localField": "revenue_id", "foreignField": "id", "as": "rev"}},
+        {"$unwind": {"path": "$rev", "preserveNullAndEmptyArrays": True}},
+        {"$project": {"_id": 0, "id": 1, "payout_type": 1, "amount": 1, "status": 1, "payout_date": {"$ifNull": ["$payout_date", "$rev.entry_date"]}, "reference": 1, "description": 1, "revenue_id": 1, "transaction_id": "$rev.transaction_id", "created_at": 1}},
+        {"$sort": {"payout_date": -1, "created_at": -1, "id": -1}},
+    ]))
+    entries = []
+    for row in rows:
+        payout_type = row.get("payout_type")
+        direction = "in" if payout_type == "Stakeholder Contribution" else "out"
+        label = "Pay In" if direction == "in" else ("Payout" if payout_type == "Stakeholder Payout" else "Earning")
+        entries.append({
+            "id": row.get("id"),
+            "date": row.get("payout_date") or row.get("created_at"),
+            "entry_type": label,
+            "direction": direction,
+            "amount": row.get("amount"),
+            "status": row.get("status") or ("Received" if direction == "in" else "Pending"),
+            "reference": row.get("reference") or (f"REV-{row.get('revenue_id')}" if row.get("revenue_id") else ""),
+            "description": row.get("description"),
+            "transaction_id": row.get("transaction_id"),
+        })
+    totals = {
+        "pay_in": sum(parse_float(e.get("amount")) for e in entries if e.get("direction") == "in"),
+        "pay_out": sum(parse_float(e.get("amount")) for e in entries if e.get("direction") == "out" and e.get("status") == "Paid"),
+        "pending_out": sum(parse_float(e.get("amount")) for e in entries if e.get("direction") == "out" and e.get("status") != "Paid"),
+    }
+    return jsonify(json_ready({"stakeholder": stakeholder, "transactions": entries, "totals": totals}))
+
 
 @app.route("/api/treasury/stakeholders/<int:sid>", methods=["PUT"])
 def api_treasury_stakeholder_detail(sid):
@@ -5170,6 +5848,43 @@ def api_treasury_partners():
         
     partners = list(db.treasury_partners.find({}, {"_id": 0}))
     return jsonify(json_ready({"partners": partners}))
+
+@app.route("/api/treasury/channel-partners/<int:pid>/transactions", methods=["GET"])
+def api_treasury_partner_transactions(pid):
+    require_treasury_access()
+    db = get_db()
+    partner = db.treasury_partners.find_one({"id": pid}, {"_id": 0})
+    if not partner:
+        return jsonify({"error": "Channel partner not found."}), 404
+    rows = list(db.treasury_payouts.aggregate([
+        {"$match": {"partner_id": pid, "payout_type": {"$in": ["Channel Partner", "Channel Partner Payout"]}}},
+        {"$lookup": {"from": "treasury_revenue", "localField": "revenue_id", "foreignField": "id", "as": "rev"}},
+        {"$unwind": {"path": "$rev", "preserveNullAndEmptyArrays": True}},
+        {"$project": {"_id": 0, "id": 1, "payout_type": 1, "amount": 1, "status": 1, "payout_date": {"$ifNull": ["$payout_date", "$rev.entry_date"]}, "reference": 1, "description": 1, "revenue_id": 1, "transaction_id": "$rev.transaction_id", "created_at": 1}},
+        {"$sort": {"payout_date": -1, "created_at": -1, "id": -1}},
+    ]))
+    entries = []
+    for row in rows:
+        payout_type = row.get("payout_type")
+        label = "Payout" if payout_type == "Channel Partner Payout" else "Commission"
+        entries.append({
+            "id": row.get("id"),
+            "date": row.get("payout_date") or row.get("created_at"),
+            "entry_type": label,
+            "direction": "out",
+            "amount": row.get("amount"),
+            "status": row.get("status") or "Pending",
+            "reference": row.get("reference") or (f"REV-{row.get('revenue_id')}" if row.get("revenue_id") else ""),
+            "description": row.get("description"),
+            "transaction_id": row.get("transaction_id"),
+        })
+    totals = {
+        "pay_in": 0,
+        "pay_out": sum(parse_float(e.get("amount")) for e in entries if e.get("status") == "Paid"),
+        "pending_out": sum(parse_float(e.get("amount")) for e in entries if e.get("status") != "Paid"),
+    }
+    return jsonify(json_ready({"partner": partner, "transactions": entries, "totals": totals}))
+
 
 @app.route("/api/treasury/channel-partners/<int:pid>", methods=["PUT"])
 def api_treasury_partner_detail(pid):
@@ -5651,6 +6366,7 @@ def api_treasury_loan_disbursement(loan_id):
     tx = create_finance_transaction(db, {
         "account_id": safe_int(data.get("bank_account_id") or loan.get("bank_account_id")),
         "loan_account_id": loan_id,
+        "bank_account_id": safe_int(data.get("bank_account_id") or loan.get("bank_account_id")),
         "transaction_date": data.get("disbursement_date") or datetime.now().strftime("%Y-%m-%d"),
         "description": f"Loan disbursement {loan.get('loan_account_number')}",
         "type": "Income",
@@ -5890,6 +6606,10 @@ def api_treasury_revenue_update(revenue_id):
     if amount < 0:
         create_or_update_payable_from_revenue(db, rev)
         return jsonify({"error": "Expense entries are payable-managed. Open Payables and mark the payable as paid to deduct company fund."}), 400
+
+    bank_account_id = safe_int(data.get("bank_account_id"))
+    if not bank_account_id or not db.company_bank_accounts.find_one({"id": bank_account_id, "status": {"$ne": "Inactive"}}):
+        return jsonify({"error": "Select the bank account where this revenue was received."}), 400
     
     reserve_percentage = 100.0
     channel_partner_id = None
@@ -5906,6 +6626,7 @@ def api_treasury_revenue_update(revenue_id):
             "channel_partner_id": channel_partner_id,
             "partner_commission": partner_commission,
             "stakeholder_total": stakeholder_total,
+            "bank_account_id": bank_account_id,
             "is_settled": True,
             "settled_at": datetime.now(),
             "settled_by": user["id"],
@@ -5931,6 +6652,33 @@ def api_treasury_revenue_update(revenue_id):
             "description": f"Company fund allocation for REV-{revenue_id}",
             "created_at": datetime.now()
         })
+        transaction_id = rev.get("transaction_id")
+        if transaction_id:
+            existing_finance_movements = list(db.company_bank_transactions.find({"source_module": "Finance Transaction", "source_id": transaction_id}))
+            affected_account_ids = [safe_int(item.get("bank_account_id")) for item in existing_finance_movements if item.get("bank_account_id")]
+            if existing_finance_movements:
+                db.company_bank_transactions.delete_many({"source_module": "Finance Transaction", "source_id": transaction_id})
+                for affected_id in affected_account_ids:
+                    if affected_id:
+                        refresh_company_bank_balance(db, affected_id)
+                db.transactions.update_one({"id": transaction_id, "type": "Income"}, {"$set": {"bank_account_id": None, "updated_at": datetime.now()}})
+        try:
+            record_company_bank_movement(
+                db,
+                bank_account_id,
+                "Revenue Settlement",
+                abs(reserve_amount),
+                direction="inflow",
+                reference=rev.get("revenue_id") or f"REV-{revenue_id}",
+                description=rev.get("description") or f"Revenue settlement REV-{revenue_id}",
+                movement_date=entry_date,
+                currency="INR",
+                source_module="Treasury Revenue Settlement",
+                source_id=revenue_id,
+                created_by_id=user["id"],
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
     entry_kind = "company expense" if amount < 0 else "company fund receipt"
     log_treasury_action(
