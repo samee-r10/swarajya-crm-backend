@@ -3750,16 +3750,16 @@ def api_finance_transactions():
         seq = get_next_sequence_value("transactions")
         transaction_id = f"TXN{seq:03d}"
         
-        amount = float(data.get("amount") or 0)
+        amount = round(float(data.get("amount") or 0), 2)
         cgst_percent = float(data.get("cgst_percent") or 0)
         igst_percent = float(data.get("igst_percent") or 0)
         tds_percent = float(data.get("tds_percent") or 0)
         
-        cgst_amount = amount * (cgst_percent / 100.0)
-        igst_amount = amount * (igst_percent / 100.0)
-        tds_amount = amount * (tds_percent / 100.0)
+        cgst_amount = round(amount * (cgst_percent / 100.0), 2)
+        igst_amount = round(amount * (igst_percent / 100.0), 2)
+        tds_amount = round(amount * (tds_percent / 100.0), 2)
         
-        total_amount = amount + cgst_amount + igst_amount - tds_amount
+        total_amount = round(amount + cgst_amount + igst_amount - tds_amount, 2)
         
         date_val = data.get("transaction_date") or data.get("date")
         if not date_val:
@@ -4035,16 +4035,16 @@ def api_finance_transaction_detail(transaction_id):
 
     if request.method == "PUT":
         data = request.get_json()
-        amount = float(data.get("amount") or 0)
+        amount = round(float(data.get("amount") or 0), 2)
         cgst_percent = float(data.get("cgst_percent") or 0)
         igst_percent = float(data.get("igst_percent") or 0)
         tds_percent = float(data.get("tds_percent") or 0)
         
-        cgst_amount = amount * (cgst_percent / 100.0)
-        igst_amount = amount * (igst_percent / 100.0)
-        tds_amount = amount * (tds_percent / 100.0)
+        cgst_amount = round(amount * (cgst_percent / 100.0), 2)
+        igst_amount = round(amount * (igst_percent / 100.0), 2)
+        tds_amount = round(amount * (tds_percent / 100.0), 2)
         
-        total_amount = amount + cgst_amount + igst_amount - tds_amount
+        total_amount = round(amount + cgst_amount + igst_amount - tds_amount, 2)
         
         date_val = data.get("transaction_date") or data.get("date")
         if not date_val:
@@ -5299,10 +5299,19 @@ def api_treasury_payable_payment(payable_id):
     available = company_fund_available(db)
     if payment_amount > available + 0.01:
         return jsonify({"error": "Insufficient company fund for this payment."}), 400
+    recipient_owner_type = data.get("recipient_owner_type") or ""
+    recipient_owner_id = safe_int(data.get("recipient_owner_id"))
+    recipient_owner_name = (data.get("recipient_owner_name") or "").strip()
     recipient_account_id = safe_int(data.get("recipient_account_id"))
     recipient_account = db.payee_bank_accounts.find_one({"id": recipient_account_id, "status": {"$ne": "Inactive"}}) if recipient_account_id else None
-    if not recipient_account:
+    if recipient_account:
+        recipient_owner_type = recipient_account.get("owner_type")
+        recipient_owner_name = recipient_account.get("owner_name")
+    elif recipient_owner_type != "Vendor":
         return jsonify({"error": "Select the recipient account paid to."}), 400
+    elif not recipient_owner_name:
+        return jsonify({"error": "Select the vendor paid to."}), 400
+    recipient_account_label = payee_bank_account_label(recipient_account) if recipient_account else recipient_owner_name
     payment_id = get_next_sequence_value("payable_payments")
     payment_date = data.get("payment_date") or datetime.now().strftime("%Y-%m-%d")
     payment_reference = (data.get("reference") or "").strip()
@@ -5313,9 +5322,10 @@ def api_treasury_payable_payment(payable_id):
         "payment_date": payment_date,
         "bank_account_id": bank_account_id,
         "recipient_account_id": recipient_account_id,
-        "recipient_account_label": payee_bank_account_label(recipient_account),
-        "recipient_owner_type": recipient_account.get("owner_type"),
-        "recipient_owner_name": recipient_account.get("owner_name"),
+        "recipient_account_label": recipient_account_label,
+        "recipient_owner_type": recipient_owner_type,
+        "recipient_owner_id": recipient_owner_id,
+        "recipient_owner_name": recipient_owner_name,
         "payment_mode": data.get("payment_mode"),
         "reference": payment_reference,
         "remarks": data.get("remarks"),
@@ -5373,9 +5383,10 @@ def api_treasury_payable_payment(payable_id):
             "payment_mode": data.get("payment_mode"),
             "settlement_account": bank_account_id,
             "recipient_account_id": recipient_account_id,
-            "recipient_account_label": payee_bank_account_label(recipient_account),
-            "recipient_owner_type": recipient_account.get("owner_type"),
-            "recipient_owner_name": recipient_account.get("owner_name"),
+            "recipient_account_label": recipient_account_label,
+            "recipient_owner_type": recipient_owner_type,
+            "recipient_owner_id": recipient_owner_id,
+            "recipient_owner_name": recipient_owner_name,
             "last_payment_id": payment_id,
             "last_payment_reference": payment_reference,
             "payment_reference": payment_reference,
@@ -5401,7 +5412,7 @@ def api_treasury_payable_payment(payable_id):
             "payment_date": payment_date,
             "bank_account_id": bank_account_id,
             "recipient_account_id": recipient_account_id,
-            "recipient_account_label": payee_bank_account_label(recipient_account),
+            "recipient_account_label": recipient_account_label,
             "payment_mode": data.get("payment_mode"),
             "reference": payment_reference,
             "remarks": data.get("remarks"),
