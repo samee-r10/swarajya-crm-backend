@@ -691,6 +691,8 @@ def init_database():
             "is_active": 1,
             "has_treasury_access": 1,
             "has_finance_access": 1,
+            "has_hr_access": 1,
+            "hr_permissions": {},
             "has_vault_access": 1,
             "created_at": datetime.now()
         })
@@ -701,12 +703,14 @@ def init_database():
             db.app_users.update_one({"_id": admin["_id"]}, {"$set": {"password_hash": generate_password_hash("change123")}})
         db.app_users.update_one(
             {"_id": admin["_id"]},
-            {"$set": {"has_treasury_access": 1, "has_finance_access": 1, "has_vault_access": 1}},
+            {"$set": {"has_treasury_access": 1, "has_finance_access": 1, "has_hr_access": 1, "has_vault_access": 1}},
         )
 
     # Backfill module access flags for databases created before these modules existed.
     db.app_users.update_many({"has_treasury_access": {"$exists": False}}, {"$set": {"has_treasury_access": 0}})
     db.app_users.update_many({"has_finance_access": {"$exists": False}}, {"$set": {"has_finance_access": 0}})
+    db.app_users.update_many({"has_hr_access": {"$exists": False}}, {"$set": {"has_hr_access": 0}})
+    db.app_users.update_many({"hr_permissions": {"$exists": False}}, {"$set": {"hr_permissions": {}}})
     db.app_users.update_many({"has_vault_access": {"$exists": False}}, {"$set": {"has_vault_access": 0}})
 
     # Indexes
@@ -724,6 +728,13 @@ def init_database():
     db.payee_bank_accounts.create_index("id", unique=True)
     db.products.create_index("id", unique=True)
     db.products.create_index("product_code", unique=True)
+    db.hr_employees.create_index("id", unique=True)
+    db.hr_employees.create_index("employee_id", unique=True)
+    db.hr_employees.create_index("email")
+    db.hr_payroll.create_index("id", unique=True)
+    db.hr_payroll.create_index([("employee_record_id", 1), ("salary_year", 1), ("salary_month", 1)])
+    db.hr_salary_transactions.create_index("id", unique=True)
+    db.hr_settings.create_index("setting_key", unique=True)
 
 
 @app.template_filter("date_or_dash")
@@ -797,6 +808,8 @@ def api_auth_login():
             "is_active": 1 if user.get("is_active", 1) else 0,
             "has_treasury_access": 1 if is_admin else user.get("has_treasury_access", 0),
             "has_finance_access": 1 if is_admin else user.get("has_finance_access", 0),
+            "has_hr_access": 1 if is_admin else user.get("has_hr_access", 0),
+            "hr_permissions": user.get("hr_permissions") or {},
             "has_vault_access": 1 if is_admin else user.get("has_vault_access", 0),
             "requires_password_change": bool(user.get("requires_password_change", False))
         }
@@ -852,6 +865,8 @@ def api_profile():
         "is_active": 1 if user.get("is_active", 1) else 0,
         "has_treasury_access": 1 if is_admin else user.get("has_treasury_access", 0),
         "has_finance_access": 1 if is_admin else user.get("has_finance_access", 0),
+        "has_hr_access": 1 if is_admin else user.get("has_hr_access", 0),
+        "hr_permissions": user.get("hr_permissions") or {},
         "has_vault_access": 1 if is_admin else user.get("has_vault_access", 0),
         "requires_password_change": bool(user.get("requires_password_change", False))
     }
@@ -911,6 +926,21 @@ def require_finance_access():
     if not user or not user.get("has_finance_access"):
         abort(403)
     return user
+
+
+def require_hr_access(allow_self_service=False):
+    if "user_id" not in session:
+        abort(401)
+    db = get_db()
+    user = db.app_users.find_one({"id": session["user_id"]})
+    if not user:
+        abort(401)
+    role = db.roles.find_one({"id": user.get("role_id")})
+    is_admin = role and role.get("name") in ["Admin", "System Administrator"]
+    settings = db.hr_settings.find_one({"setting_key": "module_settings"}) or {}
+    if is_admin or user.get("has_hr_access") or allow_self_service and settings.get("self_access_enabled"):
+        return user
+    abort(403)
 
 
 def require_vault_access():
@@ -2706,6 +2736,8 @@ def api_setup_users():
             "is_active": data.get("is_active", True),
             "has_treasury_access": 1 if data.get("has_treasury_access") else 0,
             "has_finance_access": 1 if data.get("has_finance_access") else 0,
+            "has_hr_access": 1 if data.get("has_hr_access") else 0,
+            "hr_permissions": data.get("hr_permissions") or {},
             "has_vault_access": 1 if data.get("has_vault_access") else 0,
             "vault_access_code_hash": generate_password_hash(vault_access_code) if vault_access_code else None,
             "requires_password_change": True,
@@ -2750,6 +2782,8 @@ def api_setup_user(user_id):
             "is_active": data.get("is_active", True),
             "has_treasury_access": 1 if data.get("has_treasury_access") else 0,
             "has_finance_access": 1 if data.get("has_finance_access") else 0,
+            "has_hr_access": 1 if data.get("has_hr_access") else 0,
+            "hr_permissions": data.get("hr_permissions") or {},
             "has_vault_access": has_vault_access,
         }
         if data.get("password"):
@@ -3816,16 +3850,9 @@ def api_finance_transactions():
             })
             if not linked_claim or claim_has_active_posted_transaction(db, linked_claim):
                 return jsonify({"error": "Select an approved and unposted employee claim."}), 400
-            amount, cgst_amount, cgst_percent, total_amount = claim_gst_breakdown(
-                linked_claim.get("amount"),
-                linked_claim.get("gst_percent"),
-                linked_claim.get("gst_amount"),
-                linked_claim.get("total_claim_amount"),
-            )
-            igst_percent = 0.0
-            tds_percent = 0.0
-            igst_amount = 0.0
-            tds_amount = 0.0
+            claim_total = parse_float(linked_claim.get("total_claim_amount"), linked_claim.get("amount"))
+            if abs(total_amount - claim_total) > 0.01:
+                return jsonify({"error": "Base amount plus tax must equal the approved claim total."}), 400
             category = linked_claim.get("expense_category") or category
         loan_account_id = safe_int(data.get("loan_account_id"))
         loan_schedule_id = safe_int(data.get("loan_schedule_id"))
@@ -4093,6 +4120,13 @@ def api_finance_transaction_detail(transaction_id):
         )
         if is_employee_claim_account and not expense_claim_id:
             return jsonify({"error": "Select an approved employee claim before posting to GL 7010 - Employee Claims."}), 400
+        if is_employee_claim_account:
+            linked_claim = db.expense_claims.find_one({"id": expense_claim_id})
+            if not linked_claim:
+                return jsonify({"error": "Select a valid approved employee claim."}), 400
+            claim_total = parse_float(linked_claim.get("total_claim_amount"), linked_claim.get("amount"))
+            if abs(total_amount - claim_total) > 0.01:
+                return jsonify({"error": "Base amount plus tax must equal the approved claim total."}), 400
         loan_account_id = safe_int(data.get("loan_account_id"))
         loan_schedule_id = safe_int(data.get("loan_schedule_id"))
         if category in {"Loan Disbursement", "Loan Repayment"}:
@@ -4974,6 +5008,549 @@ def api_treasury_payment_stats():
     }))
 
 
+def hr_permissions_for_user(db, user):
+    role = db.roles.find_one({"id": user.get("role_id")})
+    if role and role.get("name") in ["Admin", "System Administrator"]:
+        return {"__admin__": True}
+    raw = user.get("hr_permissions") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    if user.get("has_hr_access"):
+        raw = {**raw, "view_hr_module": True}
+    return raw
+
+
+def user_has_hr_permission(db, user, permission):
+    permissions = hr_permissions_for_user(db, user)
+    return bool(permissions.get("__admin__") or permissions.get(permission))
+
+
+def can_view_all_hr_records(db, user):
+    permissions = hr_permissions_for_user(db, user)
+    if permissions.get("__admin__"):
+        return True
+    return any(permissions.get(key) for key in [
+        "manage_employee_master", "manage_contract_employees", "manage_interns",
+        "create_payroll", "edit_payroll", "approve_payroll", "post_salary_to_ledger",
+        "view_hr_reports", "manage_hr_settings",
+    ])
+
+
+def default_hr_settings():
+    return {
+        "company_name": "Company",
+        "company_address": "",
+        "company_logo_url": "",
+        "self_access_enabled": False,
+        "default_currency": "INR",
+    }
+
+
+def hr_settings_doc(db):
+    existing = db.hr_settings.find_one({"setting_key": "module_settings"}, {"_id": 0}) or {}
+    return {**default_hr_settings(), **existing, "setting_key": "module_settings"}
+
+
+def user_matches_hr_employee(user, employee):
+    user_id = str(user.get("id") or "")
+    user_email = str(user.get("email") or "").lower()
+    user_employee_id = str(user.get("employee_id") or user.get("employee_code") or "").lower()
+    user_name = str(user.get("full_name") or "").lower()
+    employee_user_id = str(employee.get("user_id") or employee.get("employee_user_id") or "")
+    employee_email = str(employee.get("email") or "").lower()
+    employee_id = str(employee.get("employee_id") or "").lower()
+    employee_name = str(employee.get("full_name") or "").lower()
+    return bool(
+        (user_id and employee_user_id == user_id) or
+        (user_email and employee_email == user_email) or
+        (user_employee_id and employee_id == user_employee_id) or
+        (user_name and employee_name == user_name)
+    )
+
+
+def hr_employee_for_payroll(db, record):
+    return db.hr_employees.find_one({
+        "$or": [
+            {"id": record.get("employee_record_id")},
+            {"employee_id": record.get("employee_id")},
+        ]
+    }) or {}
+
+
+def user_matches_hr_payroll(db, user, record):
+    employee = hr_employee_for_payroll(db, record)
+    if user_matches_hr_employee(user, employee):
+        return True
+    user_email = str(user.get("email") or "").lower()
+    user_employee_id = str(user.get("employee_id") or user.get("employee_code") or "").lower()
+    user_name = str(user.get("full_name") or "").lower()
+    record_email = str(record.get("employee_email") or "").lower()
+    record_employee_id = str(record.get("employee_id") or "").lower()
+    record_name = str(record.get("employee_name") or "").lower()
+    return bool(
+        (user_email and record_email == user_email) or
+        (user_employee_id and record_employee_id == user_employee_id) or
+        (user_name and record_name == user_name)
+    )
+
+
+def employee_management_permission(db, user, employee):
+    employment_type = employee.get("employment_type")
+    if employment_type == "Contract Employee":
+        return user_has_hr_permission(db, user, "manage_contract_employees")
+    if employment_type == "Intern":
+        return user_has_hr_permission(db, user, "manage_interns")
+    return user_has_hr_permission(db, user, "manage_employee_master")
+
+
+def normalize_hr_employee_payload(data, existing=None):
+    existing = existing or {}
+    return {
+        "employee_id": (data.get("employee_id") or existing.get("employee_id") or "").strip(),
+        "full_name": (data.get("full_name") or existing.get("full_name") or "").strip(),
+        "email": (data.get("email") or existing.get("email") or "").strip(),
+        "mobile": data.get("mobile", existing.get("mobile", "")),
+        "employment_type": data.get("employment_type", existing.get("employment_type", "Permanent Employee")),
+        "department": data.get("department", existing.get("department", "")),
+        "designation": data.get("designation", existing.get("designation", "")),
+        "date_of_joining": data.get("date_of_joining", existing.get("date_of_joining", "")),
+        "date_of_exit": data.get("date_of_exit", existing.get("date_of_exit", "")),
+        "reporting_manager": data.get("reporting_manager", existing.get("reporting_manager", "")),
+        "work_location": data.get("work_location", existing.get("work_location", "")),
+        "status": data.get("status", existing.get("status", "Active")),
+        "pan": data.get("pan", existing.get("pan", "")),
+        "id_proof": data.get("id_proof", existing.get("id_proof", "")),
+        "emergency_contact": data.get("emergency_contact", existing.get("emergency_contact", "")),
+        "address": data.get("address", existing.get("address", "")),
+        "documents": data.get("documents", existing.get("documents", "")),
+        "remarks": data.get("remarks", existing.get("remarks", "")),
+        "bank_details": data.get("bank_details", existing.get("bank_details")),
+        "salary_structure": data.get("salary_structure", existing.get("salary_structure")),
+        "user_id": data.get("user_id", existing.get("user_id")),
+        "employee_user_id": data.get("employee_user_id", existing.get("employee_user_id")),
+    }
+
+
+def normalize_hr_payroll_payload(data, existing=None):
+    existing = existing or {}
+    payload = {
+        "employee_record_id": data.get("employee_record_id", existing.get("employee_record_id")),
+        "employee_id": data.get("employee_id", existing.get("employee_id", "")),
+        "employee_name": data.get("employee_name", existing.get("employee_name", "")),
+        "employee_email": data.get("employee_email", existing.get("employee_email", "")),
+        "employment_type": data.get("employment_type", existing.get("employment_type", "")),
+        "department": data.get("department", existing.get("department", "")),
+        "designation": data.get("designation", existing.get("designation", "")),
+        "salary_month": data.get("salary_month", existing.get("salary_month", "")),
+        "salary_year": int(data.get("salary_year") or existing.get("salary_year") or datetime.now().year),
+        "basic_salary": parse_float(data.get("basic_salary"), existing.get("basic_salary", 0)),
+        "hra": parse_float(data.get("hra"), existing.get("hra", 0)),
+        "allowances": parse_float(data.get("allowances"), existing.get("allowances", 0)),
+        "bonus": parse_float(data.get("bonus"), existing.get("bonus", 0)),
+        "reimbursement": parse_float(data.get("reimbursement"), existing.get("reimbursement", 0)),
+        "deductions": parse_float(data.get("deductions"), existing.get("deductions", 0)),
+        "tds": parse_float(data.get("tds"), existing.get("tds", 0)),
+        "advance_adjustment": parse_float(data.get("advance_adjustment"), existing.get("advance_adjustment", 0)),
+        "payment_status": data.get("payment_status", existing.get("payment_status", "Pending")),
+        "payment_date": data.get("payment_date", existing.get("payment_date", "")),
+        "paid_from_bank_account_id": data.get("paid_from_bank_account_id", existing.get("paid_from_bank_account_id", "")),
+        "payment_mode": data.get("payment_mode", existing.get("payment_mode", "")),
+        "transaction_reference": data.get("transaction_reference", existing.get("transaction_reference", "")),
+        "ledger_transaction_id": data.get("ledger_transaction_id", existing.get("ledger_transaction_id", "")),
+        "salary_payable_id": data.get("salary_payable_id", existing.get("salary_payable_id")),
+        "salary_payable_number": data.get("salary_payable_number", existing.get("salary_payable_number", "")),
+        "salary_payable_status": data.get("salary_payable_status", existing.get("salary_payable_status", "")),
+        "remarks": data.get("remarks", existing.get("remarks", "")),
+        "status": data.get("status", existing.get("status", "Draft")),
+    }
+    payload["net_payable_salary"] = parse_float(
+        data.get("net_payable_salary"),
+        payload["basic_salary"] + payload["hra"] + payload["allowances"] + payload["bonus"] + payload["reimbursement"] - payload["deductions"] - payload["tds"] - payload["advance_adjustment"],
+    )
+    return payload
+
+
+def next_employee_code(db):
+    return f"EMP-{get_next_sequence_value('hr_employee_codes'):04d}"
+
+
+def upsert_hr_employee(db, data, user, existing=None):
+    payload = normalize_hr_employee_payload(data, existing)
+    if not payload["employee_id"]:
+        payload["employee_id"] = next_employee_code(db)
+    if not payload["full_name"]:
+        return None, ("Employee name is required.", 400)
+    duplicate_query = {"employee_id": payload["employee_id"]}
+    if existing:
+        duplicate_query["id"] = {"$ne": existing.get("id")}
+    duplicate = db.hr_employees.find_one(duplicate_query)
+    if duplicate:
+        return None, ("Employee ID already exists.", 400)
+    now = datetime.now()
+    if existing:
+        update = {**payload, "updated_at": now, "modified_by_id": user["id"]}
+        db.hr_employees.update_one({"id": existing["id"]}, {"$set": update})
+        return db.hr_employees.find_one({"id": existing["id"]}, {"_id": 0}), None
+    record_id = data.get("id") or get_next_sequence_value("hr_employees")
+    doc = {"id": record_id, **payload, "created_at": now, "updated_at": now, "created_by_id": user["id"]}
+    db.hr_employees.insert_one(doc)
+    return db.hr_employees.find_one({"id": record_id}, {"_id": 0}), None
+
+
+def upsert_hr_payroll_record(db, data, user, existing=None):
+    payload = normalize_hr_payroll_payload(data, existing)
+    if not payload["employee_id"] and not payload["employee_record_id"]:
+        return None, ("Employee is required for payroll.", 400)
+    if not payload["salary_month"] or not payload["salary_year"]:
+        return None, ("Salary month and year are required.", 400)
+    now = datetime.now()
+    if existing:
+        update = {**payload, "updated_at": now, "modified_by_id": user["id"]}
+        db.hr_payroll.update_one({"id": existing["id"]}, {"$set": update})
+        return db.hr_payroll.find_one({"id": existing["id"]}, {"_id": 0}), None
+    record_id = data.get("id") or f"payroll-{get_next_sequence_value('hr_payroll')}"
+    doc = {"id": record_id, **payload, "created_at": now, "updated_at": now, "created_by_id": user["id"]}
+    db.hr_payroll.update_one({"id": record_id}, {"$setOnInsert": doc}, upsert=True)
+    return db.hr_payroll.find_one({"id": record_id}, {"_id": 0}), None
+
+
+def create_or_update_payable_from_salary_batch(db, salary_transaction):
+    amount = parse_float(salary_transaction.get("total_amount") or salary_transaction.get("amount"))
+    if amount <= 0:
+        return None
+    source_id = salary_transaction.get("id")
+    existing = db.payables.find_one({"source_module": "HR Salary", "source_id": source_id})
+    if existing and existing.get("status") == "Paid":
+        return existing
+    paid_amount = parse_float((existing or {}).get("paid_amount"))
+    outstanding = max(0.0, amount - paid_amount)
+    status = "Paid" if outstanding <= 0.01 else ("Partially Paid" if paid_amount > 0 else "Pending")
+    payload = {
+        "source_module": "HR Salary",
+        "source_id": source_id,
+        "source_reference": salary_transaction.get("reference") or salary_transaction.get("transaction_reference") or source_id,
+        "party_name": salary_transaction.get("party_name") or f"Salary Payable - {salary_transaction.get('salary_month')} {salary_transaction.get('salary_year')}",
+        "transaction_date": salary_transaction.get("transaction_date") or datetime.now().strftime("%Y-%m-%d"),
+        "original_amount": amount,
+        "paid_amount": paid_amount,
+        "outstanding_amount": outstanding,
+        "payment_status": status,
+        "status": status,
+        "due_date": salary_transaction.get("transaction_date"),
+        "currency": salary_transaction.get("currency") or "INR",
+        "remarks": salary_transaction.get("description") or "Payroll salary payable",
+        "updated_at": datetime.now(),
+    }
+    if existing:
+        db.payables.update_one({"id": existing["id"]}, {"$set": payload})
+        return db.payables.find_one({"id": existing["id"]})
+    payable_id = get_next_sequence_value("payables")
+    payload.update({
+        "id": payable_id,
+        "payable_number": f"PAY-{payable_id:05d}",
+        "created_at": datetime.now(),
+    })
+    db.payables.insert_one(payload)
+    return payload
+
+
+@app.route("/api/hr/employees", methods=["GET", "POST"])
+def api_hr_employees():
+    user = require_hr_access(allow_self_service=True)
+    db = get_db()
+    if request.method == "POST":
+        data = request.get_json() or {}
+        if not employee_management_permission(db, user, data):
+            abort(403)
+        saved, error = upsert_hr_employee(db, data, user)
+        if error:
+            return jsonify({"error": error[0]}), error[1]
+        log_activity_async("HR", "Employee", saved["id"], "CREATE", new_data=saved, reference_number=saved.get("employee_id"))
+        return jsonify(json_ready({"employee": saved, "id": saved["id"]}))
+    employees = list(db.hr_employees.find({}, {"_id": 0}).sort([("full_name", 1), ("employee_id", 1)]))
+    if not can_view_all_hr_records(db, user):
+        employees = [employee for employee in employees if user_matches_hr_employee(user, employee)]
+    return jsonify(json_ready({"employees": employees}))
+
+
+@app.route("/api/hr/employees/bulk", methods=["POST"])
+def api_hr_employees_bulk():
+    user = require_hr_access()
+    db = get_db()
+    records = (request.get_json() or {}).get("employees") or []
+    saved = []
+    for item in records:
+        if not employee_management_permission(db, user, item):
+            continue
+        existing = db.hr_employees.find_one({"$or": [{"id": item.get("id")}, {"employee_id": item.get("employee_id")}]})
+        record, error = upsert_hr_employee(db, item, user, existing)
+        if not error and record:
+            saved.append(record)
+    return jsonify(json_ready({"employees": saved}))
+
+
+@app.route("/api/hr/employees/<employee_id>", methods=["GET", "PUT"])
+def api_hr_employee_detail(employee_id):
+    user = require_hr_access(allow_self_service=True)
+    db = get_db()
+    lookup_id = int(employee_id) if str(employee_id).isdigit() else employee_id
+    employee = db.hr_employees.find_one({"id": lookup_id}) or db.hr_employees.find_one({"employee_id": employee_id})
+    if not employee:
+        abort(404)
+    if not can_view_all_hr_records(db, user) and not user_matches_hr_employee(user, employee):
+        abort(403)
+    if request.method == "PUT":
+        data = request.get_json() or {}
+        target = normalize_hr_employee_payload(data, employee)
+        if not employee_management_permission(db, user, target):
+            abort(403)
+        old_employee = dict(employee)
+        saved, error = upsert_hr_employee(db, data, user, employee)
+        if error:
+            return jsonify({"error": error[0]}), error[1]
+        log_activity_async("HR", "Employee", saved["id"], "UPDATE", old_data=old_employee, new_data=saved, reference_number=saved.get("employee_id"))
+        return jsonify(json_ready({"employee": saved}))
+    employee.pop("_id", None)
+    return jsonify(json_ready({"employee": employee}))
+
+
+@app.route("/api/hr/payroll", methods=["GET"])
+def api_hr_payroll():
+    user = require_hr_access(allow_self_service=True)
+    db = get_db()
+    records = list(db.hr_payroll.find({}, {"_id": 0}).sort([("salary_year", -1), ("salary_month", -1), ("employee_name", 1)]))
+    if not can_view_all_hr_records(db, user):
+        records = [record for record in records if user_matches_hr_payroll(db, user, record)]
+    return jsonify(json_ready({"payroll": records}))
+
+
+@app.route("/api/hr/payroll/bulk", methods=["POST"])
+def api_hr_payroll_bulk():
+    user = require_hr_access()
+    db = get_db()
+    if not user_has_hr_permission(db, user, "create_payroll"):
+        abort(403)
+    records = (request.get_json() or {}).get("records") or []
+    saved = []
+    for item in records:
+        existing = db.hr_payroll.find_one({"id": item.get("id")})
+        record, error = upsert_hr_payroll_record(db, item, user, existing)
+        if not error and record:
+            saved.append(record)
+    return jsonify(json_ready({"payroll": saved}))
+
+
+@app.route("/api/hr/payroll/<record_id>", methods=["PUT", "DELETE"])
+def api_hr_payroll_detail(record_id):
+    user = require_hr_access()
+    db = get_db()
+    record = db.hr_payroll.find_one({"id": record_id})
+    if not record:
+        abort(404)
+    if request.method == "DELETE":
+        if not user_has_hr_permission(db, user, "edit_payroll"):
+            abort(403)
+        if record.get("payment_status") == "Paid" or record.get("ledger_transaction_id"):
+            return jsonify({"error": "Paid or posted payroll records cannot be deleted."}), 400
+        linked_transaction = db.hr_salary_transactions.find_one({"hr_payroll_record_ids": record_id})
+        if linked_transaction:
+            return jsonify({"error": "Payroll records linked to salary payments cannot be deleted."}), 400
+        db.hr_payroll.delete_one({"id": record_id})
+        log_activity_async("HR", "Payroll", record_id, "DELETE", old_data=record, reference_number=record.get("employee_id"))
+        return jsonify({"success": True})
+    if not user_has_hr_permission(db, user, "edit_payroll") and not user_has_hr_permission(db, user, "approve_payroll"):
+        abort(403)
+    old_record = dict(record)
+    saved, error = upsert_hr_payroll_record(db, request.get_json() or {}, user, record)
+    if error:
+        return jsonify({"error": error[0]}), error[1]
+    log_activity_async("HR", "Payroll", saved["id"], "UPDATE", old_data=old_record, new_data=saved, reference_number=saved.get("employee_id"))
+    return jsonify(json_ready({"payroll_record": saved}))
+
+
+@app.route("/api/hr/payroll/finalize", methods=["POST"])
+def api_hr_payroll_finalize():
+    user = require_hr_access()
+    db = get_db()
+    if not user_has_hr_permission(db, user, "approve_payroll"):
+        abort(403)
+    data = request.get_json() or {}
+    record_ids = data.get("record_ids") or []
+    query = {"id": {"$in": record_ids}} if record_ids else {"salary_month": data.get("month"), "salary_year": int(data.get("year") or 0)}
+    db.hr_payroll.update_many(query, {"$set": {"status": "Finalized", "updated_at": datetime.now(), "finalized_by_id": user["id"]}})
+    records = list(db.hr_payroll.find(query, {"_id": 0}))
+    return jsonify(json_ready({"payroll": records}))
+
+
+@app.route("/api/hr/salary-transactions", methods=["GET"])
+def api_hr_salary_transactions():
+    require_hr_access()
+    db = get_db()
+    transactions = list(db.hr_salary_transactions.find({}, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1)]))
+    return jsonify(json_ready({"transactions": transactions}))
+
+
+@app.route("/api/hr/salary-ledger-accounts", methods=["GET"])
+def api_hr_salary_ledger_accounts():
+    user = require_hr_access()
+    db = get_db()
+    if not user_has_hr_permission(db, user, "post_salary_to_ledger"):
+        abort(403)
+    ensure_default_accounts(db)
+    accounts = [
+        account for account in db.accounts.find({}, {"_id": 0}).sort([("gl_code", 1), ("name", 1)])
+        if account_available_for_transaction(account, "Expense")
+    ]
+    return jsonify(json_ready({"accounts": accounts}))
+
+
+@app.route("/api/hr/salary-transactions/bulk", methods=["POST"])
+def api_hr_salary_transactions_bulk():
+    user = require_hr_access()
+    db = get_db()
+    if not user_has_hr_permission(db, user, "post_salary_to_ledger"):
+        abort(403)
+    records = (request.get_json() or {}).get("transactions") or []
+    saved = []
+    for item in records:
+        record_id = item.get("id") or f"salary-ledger-{get_next_sequence_value('hr_salary_transactions')}"
+        doc = {**item, "id": record_id, "updated_at": datetime.now(), "created_by_id": user["id"]}
+        db.hr_salary_transactions.update_one({"id": record_id}, {"$set": doc, "$setOnInsert": {"created_at": datetime.now()}}, upsert=True)
+        saved.append(db.hr_salary_transactions.find_one({"id": record_id}, {"_id": 0}))
+    return jsonify(json_ready({"transactions": saved}))
+
+
+@app.route("/api/hr/salary-payments", methods=["POST"])
+def api_hr_salary_payments():
+    user = require_hr_access()
+    db = get_db()
+    if not user_has_hr_permission(db, user, "post_salary_to_ledger"):
+        abort(403)
+    data = request.get_json() or {}
+    transaction = data.get("transaction") or {}
+    record_id = transaction.get("id") or f"salary-ledger-{get_next_sequence_value('hr_salary_transactions')}"
+    tx_doc = {
+        **transaction,
+        "id": record_id,
+        "status": transaction.get("status") or "Pending Payable",
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+        "created_by_id": user["id"],
+    }
+    db.hr_salary_transactions.update_one({"id": record_id}, {"$set": tx_doc}, upsert=True)
+    saved_transaction = db.hr_salary_transactions.find_one({"id": record_id}, {"_id": 0})
+    payable = create_or_update_payable_from_salary_batch(db, saved_transaction)
+    saved_payroll = []
+    for item in data.get("payroll_records") or []:
+        item = {
+            **item,
+            "ledger_transaction_id": record_id,
+            "salary_payable_id": payable.get("id") if payable else None,
+            "salary_payable_number": payable.get("payable_number") if payable else None,
+            "salary_payable_status": payable.get("status") if payable else "Pending",
+        }
+        existing = db.hr_payroll.find_one({"id": item.get("id")})
+        record, error = upsert_hr_payroll_record(db, item, user, existing)
+        if not error and record:
+            saved_payroll.append(record)
+    return jsonify(json_ready({"transaction": saved_transaction, "payable": payable, "payroll": saved_payroll}))
+
+
+@app.route("/api/hr/salary-ledger-payments", methods=["POST"])
+def api_hr_salary_ledger_payments():
+    user = require_hr_access()
+    db = get_db()
+    if not user_has_hr_permission(db, user, "post_salary_to_ledger"):
+        abort(403)
+    data = request.get_json() or {}
+    transaction = data.get("transaction") or {}
+    payroll_records = data.get("payroll_records") or []
+    record_ids = [item.get("id") for item in payroll_records if item.get("id")]
+    if not record_ids:
+        return jsonify({"error": "Select at least one finalized unpaid salary record."}), 400
+    account_id = safe_int(transaction.get("account_id"))
+    if not account_id:
+        return jsonify({"error": "Select the GL account for salary posting."}), 400
+    ensure_default_accounts(db)
+    account = db.accounts.find_one({"id": account_id})
+    if not account_available_for_transaction(account, "Expense"):
+        return jsonify({"error": "Select an active expense GL account for salary posting."}), 400
+    total_amount = parse_float(transaction.get("total_amount") or transaction.get("amount"))
+    if total_amount <= 0:
+        return jsonify({"error": "Salary posting amount must be greater than zero."}), 400
+    existing_transaction = db.hr_salary_transactions.find_one({"hr_payroll_record_ids": {"$in": record_ids}})
+    if existing_transaction:
+        return jsonify({"error": "Duplicate salary posting prevented for this salary period."}), 400
+    record_id = transaction.get("id") or f"salary-ledger-{get_next_sequence_value('hr_salary_transactions')}"
+    reference = transaction.get("reference") or transaction.get("transaction_reference") or f"SAL-PAYABLE-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    tx_doc = {
+        **transaction,
+        "id": record_id,
+        "reference": reference,
+        "transaction_reference": reference,
+        "status": "Pending Payable",
+        "transaction_type": "Salary Payable",
+        "category": "Payroll / Salary Payable",
+        "account_id": account_id,
+        "account_name": account.get("name"),
+        "gl_code": account.get("gl_code"),
+        "amount": total_amount,
+        "total_amount": total_amount,
+        "hr_payroll_record_ids": record_ids,
+        "employee_bifurcation": [],
+        "outflow": 0,
+        "debit": total_amount,
+        "updated_at": datetime.now(),
+        "created_at": datetime.now(),
+        "created_by_id": user["id"],
+    }
+    db.hr_salary_transactions.update_one({"id": record_id}, {"$set": tx_doc}, upsert=True)
+    saved_transaction = db.hr_salary_transactions.find_one({"id": record_id}, {"_id": 0})
+    payable = create_or_update_payable_from_salary_batch(db, saved_transaction)
+    db.hr_payroll.update_many(
+        {"id": {"$in": record_ids}},
+        {"$set": {
+            "transaction_reference": reference,
+            "ledger_transaction_id": record_id,
+            "salary_payable_id": payable.get("id") if payable else None,
+            "salary_payable_number": payable.get("payable_number") if payable else None,
+            "salary_payable_status": payable.get("status") if payable else "Pending",
+            "updated_at": datetime.now(),
+        }},
+    )
+    saved_payroll = list(db.hr_payroll.find({"id": {"$in": record_ids}}, {"_id": 0}))
+    return jsonify(json_ready({"transaction": saved_transaction, "payable": payable, "payroll": saved_payroll}))
+
+
+@app.route("/api/hr/settings", methods=["GET", "PUT"])
+def api_hr_settings():
+    user = require_hr_access(allow_self_service=True)
+    db = get_db()
+    if request.method == "PUT":
+        if not user_has_hr_permission(db, user, "manage_hr_settings"):
+            abort(403)
+        data = request.get_json() or {}
+        payload = {
+            **default_hr_settings(),
+            "company_name": data.get("company_name", "Company"),
+            "company_address": data.get("company_address", ""),
+            "company_logo_url": data.get("company_logo_url", ""),
+            "self_access_enabled": bool(data.get("self_access_enabled")),
+            "default_currency": data.get("default_currency", "INR") or "INR",
+            "setting_key": "module_settings",
+            "updated_at": datetime.now(),
+            "updated_by_id": user["id"],
+        }
+        db.hr_settings.update_one({"setting_key": "module_settings"}, {"$set": payload}, upsert=True)
+        return jsonify(json_ready({"settings": hr_settings_doc(db)}))
+    return jsonify(json_ready({"settings": hr_settings_doc(db)}))
+
+
 @app.route("/api/treasury/bank-accounts", methods=["GET", "POST"])
 def api_treasury_bank_accounts():
     user = require_treasury_access()
@@ -5288,6 +5865,7 @@ def api_treasury_payable_payment(payable_id):
         return jsonify({"error": "Payment amount must be greater than zero."}), 400
     if payment_amount > outstanding + 0.01:
         return jsonify({"error": "Overpayment is not allowed."}), 400
+    is_salary_payable = payable.get("source_module") == "HR Salary"
     bank_account_id = safe_int(data.get("bank_account_id"))
     if not bank_account_id:
         return jsonify({"error": "Paid From Bank Account is required."}), 400
@@ -5304,14 +5882,20 @@ def api_treasury_payable_payment(payable_id):
     recipient_owner_name = (data.get("recipient_owner_name") or "").strip()
     recipient_account_id = safe_int(data.get("recipient_account_id"))
     recipient_account = db.payee_bank_accounts.find_one({"id": recipient_account_id, "status": {"$ne": "Inactive"}}) if recipient_account_id else None
-    if recipient_account:
+    if is_salary_payable:
+        recipient_owner_type = recipient_owner_type or "Employee"
+        recipient_owner_name = recipient_owner_name or payable.get("party_name") or "Salary Payable"
+        recipient_account_id = None
+        recipient_account_label = recipient_owner_name
+    elif recipient_account:
         recipient_owner_type = recipient_account.get("owner_type")
         recipient_owner_name = recipient_account.get("owner_name")
     elif recipient_owner_type != "Vendor":
         return jsonify({"error": "Select the recipient account paid to."}), 400
     elif not recipient_owner_name:
         return jsonify({"error": "Select the vendor paid to."}), 400
-    recipient_account_label = payee_bank_account_label(recipient_account) if recipient_account else recipient_owner_name
+    if not is_salary_payable:
+        recipient_account_label = payee_bank_account_label(recipient_account) if recipient_account else recipient_owner_name
     payment_id = get_next_sequence_value("payable_payments")
     payment_date = data.get("payment_date") or datetime.now().strftime("%Y-%m-%d")
     payment_reference = (data.get("reference") or "").strip()
@@ -5399,6 +5983,22 @@ def api_treasury_payable_payment(payable_id):
     )
     updated_payable = db.payables.find_one({"id": payable_id})
     sync_revenue_settlement_from_payable(db, updated_payable)
+    if is_salary_payable:
+        salary_transaction = db.hr_salary_transactions.find_one({"id": payable.get("source_id")}, {"_id": 0})
+        payroll_ids = (salary_transaction or {}).get("hr_payroll_record_ids") or []
+        if payroll_ids:
+            db.hr_payroll.update_many(
+                {"id": {"$in": payroll_ids}},
+                {"$set": {
+                    "payment_status": status,
+                    "payment_date": payment_date,
+                    "transaction_reference": payment_reference or payable.get("source_reference"),
+                    "salary_payable_status": status,
+                    "salary_payable_id": payable_id,
+                    "salary_payable_number": payable.get("payable_number"),
+                    "updated_at": datetime.now(),
+                }},
+            )
     if is_payout_payable:
         payout = payout_source or db.stakeholder_payout_receipts.find_one({"id": payable.get("source_id")})
         payout_paid_amount = parse_float((payout or {}).get("paid_amount")) + payment_amount
@@ -5928,12 +6528,10 @@ def api_expense_claims():
         status = data.get("status", "Draft")
         if status not in {"Draft", "Submitted"}:
             return jsonify({"error": "Claims can only be created as Draft or Submitted."}), 400
-        amount = parse_float(data.get("amount"))
-        gst_percent = parse_float(data.get("gst_percent"))
-        gst_amount = parse_float(data.get("gst_amount"), amount * (gst_percent / 100.0))
-        if gst_percent:
-            gst_amount = round(amount * (gst_percent / 100.0), 2)
-        total_claim_amount = parse_float(data.get("total_claim_amount"), amount + gst_amount)
+        amount = parse_float(data.get("amount") or data.get("total_claim_amount"))
+        gst_percent = 0.0
+        gst_amount = 0.0
+        total_claim_amount = amount
         if total_claim_amount <= 0:
             return jsonify({"error": "Total claim amount must be greater than zero."}), 400
         claim_id = get_next_sequence_value("expense_claims")
@@ -6124,11 +6722,9 @@ def api_expense_claim_detail(claim_id):
         status = data.get("status", claim.get("status"))
         if status not in EXPENSE_CLAIM_STATUSES:
             return jsonify({"error": "Invalid claim status."}), 400
-        amount = parse_float(data.get("amount"), claim.get("amount"))
-        gst_percent = parse_float(data.get("gst_percent"), claim.get("gst_percent"))
-        gst_amount = parse_float(data.get("gst_amount"), claim.get("gst_amount"))
-        if gst_percent:
-            gst_amount = round(amount * (gst_percent / 100.0), 2)
+        amount = parse_float(data.get("amount") or data.get("total_claim_amount"), claim.get("amount"))
+        gst_percent = 0.0
+        gst_amount = 0.0
         update_data = {
             "employee_name": (data.get("employee_name", claim.get("employee_name")) or "").strip(),
             "department": (data.get("department", claim.get("department")) or "").strip(),
@@ -6139,7 +6735,7 @@ def api_expense_claim_detail(claim_id):
             "amount": amount,
             "gst_percent": gst_percent,
             "gst_amount": gst_amount,
-            "total_claim_amount": parse_float(data.get("total_claim_amount"), amount + gst_amount),
+            "total_claim_amount": amount,
             "payment_mode": data.get("payment_mode", claim.get("payment_mode")),
             "attachment": data.get("attachment", claim.get("attachment")),
             "remarks": data.get("remarks", claim.get("remarks")),
