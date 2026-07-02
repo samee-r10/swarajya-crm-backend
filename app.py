@@ -25,7 +25,7 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from werkzeug.security import check_password_hash as werkzeug_check_password_hash
 from werkzeug.security import generate_password_hash as werkzeug_generate_password_hash
 from werkzeug.local import LocalProxy
-
+# test
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
