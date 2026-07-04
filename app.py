@@ -577,6 +577,51 @@ DEFAULT_ACCOUNTS = [
 ]
 
 
+def account_identity_key(account):
+    gl_code = str(account.get("gl_code") or "").strip().lower()
+    name = str(account.get("name") or "").strip().lower()
+    return gl_code or name
+
+
+def dedupe_accounts(accounts):
+    unique_accounts = []
+    seen_keys = set()
+    for account in accounts:
+        key = account_identity_key(account)
+        if key and key in seen_keys:
+            continue
+        if key:
+            seen_keys.add(key)
+        unique_accounts.append(account)
+    return unique_accounts
+
+
+def account_list(db, query=None, projection=None, sort=None):
+    cursor = db.accounts.find(query or {}, projection or {"_id": 0})
+    if sort:
+        cursor = cursor.sort(sort)
+    return dedupe_accounts(list(cursor))
+
+
+def repair_duplicate_account_ids(db):
+    duplicate_groups = db.accounts.aggregate([
+        {"$match": {"id": {"$ne": None}}},
+        {"$group": {"_id": "$id", "ids": {"$push": "$_id"}, "count": {"$sum": 1}}},
+        {"$match": {"count": {"$gt": 1}}},
+    ])
+    for group in duplicate_groups:
+        duplicate_docs = list(db.accounts.find({"_id": {"$in": group["ids"]}}).sort([
+            ("is_system_default", -1),
+            ("created_at", 1),
+            ("_id", 1),
+        ]))
+        for duplicate_doc in duplicate_docs[1:]:
+            db.accounts.update_one(
+                {"_id": duplicate_doc["_id"]},
+                {"$set": {"id": get_next_sequence_value("accounts"), "updated_at": datetime.now()}},
+            )
+
+
 def ensure_default_accounts(db):
     for account in DEFAULT_ACCOUNTS:
         existing = db.accounts.find_one({"name": account["name"]})
@@ -623,6 +668,8 @@ def ensure_default_accounts(db):
             updates["show_in_expense"] = visibility["show_in_expense"]
         if updates:
             db.accounts.update_one({"id": account["id"]}, {"$set": updates})
+
+    repair_duplicate_account_ids(db)
 
 
 def init_database():
@@ -1367,7 +1414,7 @@ def api_options():
         {"$sort": {"company_name": 1, "title": 1}}
     ]))
     
-    accounts = list(db.accounts.find({}, {"_id": 0}).sort("name", 1))
+    accounts = account_list(db, sort=[("name", 1)])
     vendors = list(db.vendors.find({}, {"_id": 0, "id": 1, "name": 1}).sort("name", 1))
     projects_list = list(db.projects.find({}, {"_id": 0, "id": 1, "project_name": 1, "customer_id": 1, "product_id": 1, "product_code": 1, "product_name": 1}).sort("project_name", 1))
     products_list = list(db.products.find({"product_status": {"$ne": "Inactive"}}, {"_id": 0}).sort("product_name", 1))
@@ -2478,9 +2525,16 @@ def api_finance_account_transactions(account_id):
     account = db.accounts.find_one({"id": account_id}, {"_id": 0})
     if not account:
         abort(404)
+    account_ids = [account_id]
+    if account.get("gl_code"):
+        account_ids = [
+            doc["id"]
+            for doc in db.accounts.find({"gl_code": account.get("gl_code")}, {"id": 1, "_id": 0})
+            if doc.get("id") is not None
+        ]
 
     transactions = list(db.transactions.aggregate([
-        {"$match": {"account_id": account_id}},
+        {"$match": {"account_id": {"$in": account_ids}}},
         {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
         {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "vendors", "localField": "vendor_id", "foreignField": "id", "as": "vendor"}},
@@ -2494,6 +2548,10 @@ def api_finance_account_transactions(account_id):
         {"$lookup": {"from": "invoices", "localField": "invoice_id", "foreignField": "id", "as": "invoice"}},
         {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
+            "account_name": account.get("name"),
+            "gl_code": account.get("gl_code"),
+            "gl_account_number": account.get("gl_code"),
+            "gl_account_name": account.get("name"),
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
@@ -3751,7 +3809,12 @@ def api_finance_dashboard():
         {"$limit": 6},
         {"$lookup": {"from": "accounts", "localField": "account_id", "foreignField": "id", "as": "account"}},
         {"$unwind": {"path": "$account", "preserveNullAndEmptyArrays": True}},
-        {"$addFields": {"account_name": "$account.name"}},
+        {"$addFields": {
+            "account_name": "$account.name",
+            "gl_code": "$account.gl_code",
+            "gl_account_number": "$account.gl_code",
+            "gl_account_name": "$account.name",
+        }},
         {"$project": {"account": 0, "_id": 0}}
     ]))
     
@@ -3779,6 +3842,7 @@ def api_finance_dashboard():
 def api_finance_transactions():
     require_finance_access()
     db = get_db()
+    ensure_default_accounts(db)
     if request.method == "POST":
         data = request.get_json()
         seq = get_next_sequence_value("transactions")
@@ -3977,6 +4041,9 @@ def api_finance_transactions():
         {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
             "account_name": "$account.name",
+            "gl_code": "$account.gl_code",
+            "gl_account_number": "$account.gl_code",
+            "gl_account_name": "$account.name",
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
@@ -4005,6 +4072,9 @@ def api_finance_fixed_assets():
         {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
             "account_name": "$account.name",
+            "gl_code": "$account.gl_code",
+            "gl_account_number": "$account.gl_code",
+            "gl_account_name": "$account.name",
             "vendor_name": "$vendor.name",
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
         }},
@@ -4023,6 +4093,7 @@ def api_finance_fixed_assets():
 def api_finance_transaction_detail(transaction_id):
     require_finance_access()
     db = get_db()
+    ensure_default_accounts(db)
     
     if request.method == "DELETE":
         old_tx = db.transactions.find_one({"id": transaction_id})
@@ -4228,6 +4299,9 @@ def api_finance_transaction_detail(transaction_id):
         {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
             "account_name": "$account.name",
+            "gl_code": "$account.gl_code",
+            "gl_account_number": "$account.gl_code",
+            "gl_account_name": "$account.name",
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
@@ -4284,33 +4358,49 @@ def api_finance_transaction_reverse(transaction_id):
 def build_invoice_payment_details(bank_doc, invoice_number):
     if not bank_doc:
         return None
+    beneficiary_name = bank_doc.get("beneficiary_name") or bank_doc.get("account_name") or bank_doc.get("label") or ""
+    ifsc_code = bank_doc.get("ifsc_code") or bank_doc.get("ifsc") or ""
     return {
-        "label": bank_doc.get("label"),
-        "beneficiary_name": bank_doc.get("beneficiary_name", ""),
+        "label": bank_doc.get("label") or company_bank_account_label(bank_doc),
+        "beneficiary_name": beneficiary_name,
         "bank_name": bank_doc.get("bank_name", ""),
         "account_number": bank_doc.get("account_number", ""),
-        "ifsc_code": bank_doc.get("ifsc_code", ""),
+        "ifsc_code": ifsc_code,
         "payment_reference": invoice_number or "",
     }
+
+
+def find_invoice_bank_account(db, bank_account_id):
+    if not bank_account_id:
+        return None
+    bank_id = int(bank_account_id)
+    return (
+        db.company_bank_accounts.find_one({"id": bank_id}, {"_id": 0})
+        or db.bank_accounts.find_one({"id": bank_id}, {"_id": 0})
+    )
 
 
 def snapshot_invoice_payment_details(db, bank_account_id, invoice_number):
     if not bank_account_id:
         return None
-    bank = db.bank_accounts.find_one({"id": int(bank_account_id)}, {"_id": 0})
+    bank = find_invoice_bank_account(db, bank_account_id)
     return build_invoice_payment_details(bank, invoice_number)
 
 
 def attach_invoice_payment_details(inv_dict, db):
     snap = inv_dict.get("payment_details_snapshot")
+    bank_id = inv_dict.get("bank_account_id")
+    if bank_id and db.company_bank_accounts.find_one({"id": int(bank_id)}, {"id": 1, "_id": 0}):
+        bank = find_invoice_bank_account(db, bank_id)
+        inv_dict["payment_details"] = build_invoice_payment_details(bank, inv_dict.get("invoice_number"))
+        return
     if snap:
         details = dict(snap)
         details["payment_reference"] = inv_dict.get("invoice_number") or details.get("payment_reference", "")
         inv_dict["payment_details"] = details
         return
-    bank_id = inv_dict.get("bank_account_id")
     if bank_id:
-        bank = db.bank_accounts.find_one({"id": int(bank_id)}, {"_id": 0})
+        bank = find_invoice_bank_account(db, bank_id)
         inv_dict["payment_details"] = build_invoice_payment_details(bank, inv_dict.get("invoice_number"))
     else:
         inv_dict["payment_details"] = None
@@ -4733,6 +4823,9 @@ def api_gl_report():
         {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
             "account_name": "$account.name",
+            "gl_code": "$account.gl_code",
+            "gl_account_number": "$account.gl_code",
+            "gl_account_name": "$account.name",
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
@@ -5403,7 +5496,7 @@ def api_hr_salary_ledger_accounts():
         abort(403)
     ensure_default_accounts(db)
     accounts = [
-        account for account in db.accounts.find({}, {"_id": 0}).sort([("gl_code", 1), ("name", 1)])
+        account for account in account_list(db, sort=[("gl_code", 1), ("name", 1)])
         if account_available_for_transaction(account, "Expense")
     ]
     return jsonify(json_ready({"accounts": accounts}))
