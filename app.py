@@ -19,7 +19,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from pymongo.errors import ConnectionFailure
 from dotenv import dotenv_values, load_dotenv
-from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, session, url_for
 from flask_cors import CORS
 from itsdangerous import BadSignature, URLSafeSerializer
 from werkzeug.security import check_password_hash as werkzeug_check_password_hash
@@ -54,7 +54,12 @@ ALLOWED_ORIGINS = [
     "https://swarajya-crm-frontend.vercel.app",
     "https://crm.swarajyaconsultancy.in"
 ]
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=True,
+    expose_headers=["Content-Type", "Content-Disposition", "Content-Length", "Accept-Ranges"],
+)
 
 # ── Session cookie settings ────────────────────────────────────────────────────
 # Production Vercel apps are cross-site and need SameSite=None + Secure.
@@ -343,7 +348,7 @@ def upload_file_to_cloudinary(file_storage, folder="crm-documents"):
     except urllib.error.URLError as exc:
         raise ValueError(f"Cloudinary upload failed: {exc.reason}") from exc
 
-    return {
+    document = {
         "name": file_storage.filename,
         "type": content_type,
         "size": uploaded.get("bytes", len(file_bytes)),
@@ -357,6 +362,26 @@ def upload_file_to_cloudinary(file_storage, folder="crm-documents"):
         "created_at": datetime.now(),
         "provider": "cloudinary",
     }
+    document["preview_url"] = document_preview_url(document)
+    return document
+
+
+def is_pdf_document(document):
+    content_type = str((document or {}).get("type") or "").lower()
+    name = str((document or {}).get("name") or (document or {}).get("url") or "").lower()
+    return content_type == "application/pdf" or name.endswith(".pdf")
+
+
+def document_preview_url(document):
+    source_url = (document or {}).get("secure_url") or (document or {}).get("url")
+    if not source_url:
+        return ""
+    params = {"url": source_url}
+    if (document or {}).get("name"):
+        params["name"] = document.get("name")
+    if (document or {}).get("type"):
+        params["type"] = document.get("type")
+    return f"/api/uploads/preview?{urllib.parse.urlencode(params)}"
 
 
 def slugify_api_name(value, suffix=""):
@@ -1004,7 +1029,7 @@ def require_vault_access():
 
 @app.route("/api/uploads/cloudinary", methods=["POST"])
 def api_cloudinary_upload():
-    require_finance_access()
+    require_current_user()
     upload = request.files.get("file")
     folder_context = request.form.get("folder") or "finance-documents"
     try:
@@ -1012,6 +1037,54 @@ def api_cloudinary_upload():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify(json_ready({"document": document}))
+
+
+@app.route("/api/uploads/preview", methods=["GET"])
+def api_upload_preview():
+    if "user_id" not in session:
+        abort(401)
+    source_url = request.args.get("url") or ""
+    parsed = urllib.parse.urlparse(source_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return jsonify({"error": "A valid HTTPS document URL is required."}), 400
+    allowed_hosts = {"res.cloudinary.com"}
+    if parsed.netloc not in allowed_hosts and not parsed.netloc.endswith(".cloudinary.com"):
+        return jsonify({"error": "Unsupported document provider."}), 400
+
+    filename = request.args.get("name") or os.path.basename(parsed.path) or "document"
+    requested_type = request.args.get("type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    if requested_type.lower() == "application/octet-stream" and filename.lower().endswith(".pdf"):
+        requested_type = "application/pdf"
+
+    headers = {"User-Agent": "SwarajyaCRM/1.0"}
+    range_header = request.headers.get("Range")
+    if range_header:
+        headers["Range"] = range_header
+    upstream_request = urllib.request.Request(source_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(upstream_request, timeout=30) as upstream:
+            data = upstream.read()
+            upstream_headers = upstream.headers
+            status_code = upstream.getcode() or 200
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="ignore")
+        return jsonify({"error": "Unable to load document preview.", "detail": detail or exc.reason}), exc.code
+    except urllib.error.URLError as exc:
+        return jsonify({"error": f"Unable to load document preview: {exc.reason}"}), 502
+
+    content_type = upstream_headers.get("Content-Type") or requested_type
+    if filename.lower().endswith(".pdf") or requested_type.lower() == "application/pdf":
+        content_type = "application/pdf"
+    disposition = "inline"
+    safe_filename = filename.replace('"', "")
+    response = Response(data, status=status_code, content_type=content_type)
+    response.headers["Content-Disposition"] = f'{disposition}; filename="{safe_filename}"'
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Accept-Ranges"] = upstream_headers.get("Accept-Ranges", "bytes")
+    for header in ("Content-Length", "Content-Range"):
+        if upstream_headers.get(header):
+            response.headers[header] = upstream_headers.get(header)
+    return response
 
 
 def require_vault_unlocked():
@@ -1345,6 +1418,7 @@ def log_activity_async(module_name, entity_name, record_id, action_type, old_dat
 
 def dashboard_payload():
     db = get_db()
+    user = get_current_user()
     
     metrics = {
         "customers": db.customers.count_documents({}),
@@ -1356,25 +1430,6 @@ def dashboard_payload():
         ])),
         "active_projects": db.projects.count_documents({"status": {"$in": ["Planning", "In Progress", "Blocked"]}}),
     }
-    
-    recent_opportunities = list(db.opportunities.aggregate([
-        {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
-        {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
-        {"$addFields": {"company_name": "$customer.company_name"}},
-        {"$project": {"_id": 0, "customer": 0}},
-        {"$sort": {"updated_at": -1}},
-        {"$limit": 6}
-    ]))
-    
-    upcoming_projects = list(db.projects.aggregate([
-        {"$match": {"status": {"$ne": "Delivered"}}},
-        {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
-        {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
-        {"$addFields": {"company_name": "$customer.company_name"}},
-        {"$project": {"_id": 0, "customer": 0}},
-        {"$sort": {"delivery_timeline": 1}},
-        {"$limit": 6}
-    ]))
     
     opportunities_by_stage = list(db.opportunities.aggregate([
         {"$group": {"_id": "$stage", "count": {"$sum": 1}}},
@@ -1388,8 +1443,7 @@ def dashboard_payload():
     
     return {
         "metrics": metrics,
-        "recent_opportunities": recent_opportunities,
-        "upcoming_projects": upcoming_projects,
+        "pending_approvals": pending_approval_summary(db, user),
         "opportunities_by_stage": opportunities_by_stage,
         "pipeline_value_by_stage": pipeline_value_by_stage,
         "currency_symbols": CURRENCY_SYMBOLS,
@@ -1399,6 +1453,20 @@ def dashboard_payload():
 @app.route("/api/dashboard")
 def api_dashboard():
     return jsonify(json_ready(dashboard_payload()))
+
+
+@app.route("/api/approvals/summary", methods=["GET"])
+def api_approval_summary():
+    user = require_current_user()
+    db = get_db()
+    return jsonify(json_ready({"pending_approvals": pending_approval_summary(db, user)}))
+
+
+@app.route("/api/approvals/pending", methods=["GET"])
+def api_pending_approval_center():
+    user = require_current_user()
+    db = get_db()
+    return jsonify(json_ready({"approvals": pending_approval_items(db, user)}))
 
 
 @app.route("/api/options")
@@ -1757,19 +1825,59 @@ def company_bank_account_with_balance(db, account):
     return item
 
 
+NON_REVENUE_INFLOW_CATEGORIES = {
+    "capital contribution",
+    "internal transfer",
+    "loan disbursement",
+}
+
+
+def is_revenue_log_transaction(transaction_doc):
+    if not transaction_doc or transaction_doc.get("status") == "Reversed":
+        return False
+    if transaction_doc.get("type") != "Income":
+        return False
+    amount = parse_float(transaction_doc.get("total_amount") or transaction_doc.get("amount"))
+    if amount <= 0:
+        return False
+    category = str(transaction_doc.get("category") or "").strip().lower()
+    return category not in NON_REVENUE_INFLOW_CATEGORIES
+
+
+def revenue_log_visible_match():
+    return {
+        "amount": {"$gte": 0},
+        "revenue_type": {"$nin": ["Company Expense", "Loan Disbursement", "Loan Repayment", "Internal Transfer"]},
+    }
+
+
+def remove_unsettled_transaction_revenue(db, transaction_id):
+    if not transaction_id:
+        return
+    stale_rows = list(
+        db.treasury_revenue.find(
+            {"transaction_id": transaction_id, "is_settled": {"$ne": True}},
+            {"_id": 0, "id": 1},
+        )
+    )
+    stale_ids = [row["id"] for row in stale_rows]
+    if stale_ids:
+        db.treasury_revenue.delete_many({"id": {"$in": stale_ids}})
+        db.treasury_payouts.delete_many({"revenue_id": {"$in": stale_ids}})
+
+
 def sync_transaction_to_treasury_revenue(db, transaction_doc):
     existing = db.treasury_revenue.find_one({"transaction_id": transaction_doc["id"]})
+    if not is_revenue_log_transaction(transaction_doc):
+        if existing and not existing.get("is_settled"):
+            remove_unsettled_transaction_revenue(db, transaction_doc.get("id"))
+        return existing
     if existing and existing.get("is_settled"):
         return existing
     amount = parse_float(transaction_doc.get("total_amount") or transaction_doc.get("amount"))
-    if transaction_doc.get("type") == "Expense":
-        amount = -abs(amount)
-        revenue_type = transaction_doc.get("category") or "Company Expense"
-        reserve_percentage = 100.0
-    else:
-        amount = abs(amount)
-        revenue_type = transaction_doc.get("category") or "Loan Disbursement"
-        reserve_percentage = 100.0
+    amount = abs(amount)
+    revenue_type = transaction_doc.get("category") or "Sales Income"
+    reserve_percentage = 100.0
     reserve_amount = amount * (reserve_percentage / 100.0)
     stakeholder_total = 0.0
     entry_date = transaction_doc.get("transaction_date") or datetime.now().strftime("%Y-%m-%d")
@@ -1792,8 +1900,6 @@ def sync_transaction_to_treasury_revenue(db, transaction_doc):
     if existing:
         db.treasury_revenue.update_one({"id": existing["id"]}, {"$set": payload})
         updated = db.treasury_revenue.find_one({"id": existing["id"]})
-        if amount < 0:
-            create_or_update_payable_from_revenue(db, updated)
         return updated
     rev_id = get_next_sequence_value("treasury_revenue")
     payload.update({
@@ -1802,8 +1908,6 @@ def sync_transaction_to_treasury_revenue(db, transaction_doc):
         "created_at": datetime.now(),
     })
     db.treasury_revenue.insert_one(payload)
-    if amount < 0:
-        create_or_update_payable_from_revenue(db, payload)
     return payload
 
 
@@ -2041,6 +2145,109 @@ def can_manage_payout_approvals(user, db):
     return bool(is_admin or user.get("has_treasury_access"))
 
 
+def pending_approval_summary(db, user):
+    if not user:
+        return {
+            "total": 0,
+            "breakdown": {"claims": 0, "stakeholder_payouts": 0, "cp_payments": 0},
+            "approval_center_url": "/approvals",
+        }
+    user_id = user.get("id")
+    claim_rows = list(db.claim_approvals.aggregate([
+        {"$match": {"linked_user_id": user_id, "status": "Pending"}},
+        {"$lookup": {"from": "expense_claims", "localField": "claim_id", "foreignField": "id", "as": "claim"}},
+        {"$unwind": "$claim"},
+        {"$match": {"claim.status": {"$regex": "^Pending"}}},
+        {"$count": "count"},
+    ]))
+    claims = claim_rows[0]["count"] if claim_rows else 0
+    payout_pipeline = [
+        {"$match": {"linked_user_id": user_id, "status": "Pending"}},
+        {"$lookup": {"from": "stakeholder_payout_receipts", "localField": "payout_id", "foreignField": "id", "as": "payout"}},
+        {"$unwind": "$payout"},
+        {"$match": {"payout.status": {"$regex": "^Pending"}}},
+        {"$group": {
+            "_id": {
+                "$cond": [
+                    {"$or": [
+                        {"$eq": ["$payout.recipient_type", "Channel Partner"]},
+                        {"$in": ["$payout.payout_type", ["Channel Partner Payout", "Channel Partner Commission"]]},
+                    ]},
+                    "cp_payments",
+                    "stakeholder_payouts",
+                ]
+            },
+            "count": {"$sum": 1},
+        }},
+    ]
+    payout_counts = {row["_id"]: row["count"] for row in db.stakeholder_payout_approvals.aggregate(payout_pipeline)}
+    breakdown = {
+        "claims": claims,
+        "stakeholder_payouts": payout_counts.get("stakeholder_payouts", 0),
+        "cp_payments": payout_counts.get("cp_payments", 0),
+    }
+    return {
+        "total": sum(breakdown.values()),
+        "breakdown": breakdown,
+        "approval_center_url": "/approvals",
+    }
+
+
+def pending_approval_items(db, user):
+    if not user:
+        return []
+    user_id = user.get("id")
+    claim_rows = list(db.claim_approvals.aggregate([
+        {"$match": {"linked_user_id": user_id, "status": "Pending"}},
+        {"$lookup": {"from": "expense_claims", "localField": "claim_id", "foreignField": "id", "as": "claim"}},
+        {"$unwind": "$claim"},
+        {"$match": {"claim.status": {"$regex": "^Pending"}}},
+        {"$project": {"_id": 0, "claim._id": 0}},
+        {"$sort": {"approval_sequence": 1, "created_at": 1}},
+    ]))
+    payout_rows = list(db.stakeholder_payout_approvals.aggregate([
+        {"$match": {"linked_user_id": user_id, "status": "Pending"}},
+        {"$lookup": {"from": "stakeholder_payout_receipts", "localField": "payout_id", "foreignField": "id", "as": "payout"}},
+        {"$unwind": "$payout"},
+        {"$match": {"payout.status": {"$regex": "^Pending"}}},
+        {"$project": {"_id": 0, "payout._id": 0}},
+        {"$sort": {"approval_sequence": 1, "created_at": 1}},
+    ]))
+    items = []
+    for approval in claim_rows:
+        attach_approval_user_names(db, [approval])
+        claim = approval.get("claim") or {}
+        items.append({
+            "key": f"claim-{approval.get('id')}",
+            "kind": "claim",
+            "type": "Claim",
+            "reference": claim.get("claim_number") or f"Claim #{approval.get('claim_id')}",
+            "party": claim.get("employee_name"),
+            "amount": claim.get("total_claim_amount") or claim.get("amount"),
+            "sequence": approval.get("approval_sequence"),
+            "status": claim.get("status") or "Pending",
+            "to": "/claims/approvals",
+            "approval": approval,
+        })
+    for approval in payout_rows:
+        attach_approval_user_names(db, [approval])
+        payout = normalize_payout_recipient(approval.get("payout") or {})
+        is_cp = payout.get("recipient_type") == "Channel Partner" or payout.get("payout_type") in {"Channel Partner Payout", "Channel Partner Commission"}
+        items.append({
+            "key": f"payout-{approval.get('id')}",
+            "kind": "cp_payment" if is_cp else "stakeholder_payout",
+            "type": "CP Payment" if is_cp else "Stakeholder Payout",
+            "reference": payout.get("payout_number") or f"Payout #{approval.get('payout_id')}",
+            "party": payout.get("recipient_name") or payout.get("partner_name") or payout.get("stakeholder_name"),
+            "amount": payout.get("amount"),
+            "sequence": approval.get("approval_sequence"),
+            "status": payout.get("status") or "Pending",
+            "to": "/treasury/stakeholder-payouts/approvals",
+            "approval": approval,
+        })
+    return sorted(items, key=lambda item: (item.get("sequence") or 999, item.get("reference") or ""))
+
+
 def create_or_update_payable_from_revenue(db, revenue_doc):
     amount = abs(parse_float(revenue_doc.get("amount")))
     if amount <= 0:
@@ -2163,8 +2370,7 @@ def create_or_update_payable_from_payout(db, payout):
 
 
 def sync_negative_revenue_payables(db):
-    for revenue_doc in db.treasury_revenue.find({"amount": {"$lt": 0}}):
-        create_or_update_payable_from_revenue(db, revenue_doc)
+    return
 
 
 def sync_reversed_transaction_payables(db):
@@ -7161,8 +7367,12 @@ def api_treasury_revenue():
         data = request.get_json() or {}
         
         amount = float(data.get("amount", 0))
+        if amount <= 0:
+            return jsonify({"error": "Revenue Log accepts only positive revenue or income entries."}), 400
         entry_date = data.get("entry_date", datetime.now().strftime("%Y-%m-%d"))
         revenue_type = data.get("revenue_type", "Sales Income")
+        if str(revenue_type).strip().lower() in NON_REVENUE_INFLOW_CATEGORIES or revenue_type in {"Company Expense", "Loan Repayment"}:
+            return jsonify({"error": "This entry type belongs in its source module, not Revenue Log."}), 400
         project_id = data.get("project_id")
         if project_id: project_id = int(project_id)
         
@@ -7203,10 +7413,13 @@ def api_treasury_revenue():
     purge_unsettled_revenue_payouts(db)
     normalize_stakeholder_flow_payouts(db)
 
-    # Auto-sync ledger transactions from db.transactions (only active ones, not Reversed)
-    all_txns = list(db.transactions.find({"status": {"$ne": "Reversed"}}))
+    # Auto-sync only active business revenue ledger transactions.
+    all_txns = list(db.transactions.find({"status": {"$ne": "Reversed"}, "type": "Income"}))
     
     for t in all_txns:
+        if not is_revenue_log_transaction(t):
+            remove_unsettled_transaction_revenue(db, t.get("id"))
+            continue
         existing = db.treasury_revenue.find_one({"transaction_id": t["id"]})
         amount = float(t.get("total_amount") or t.get("amount") or 0.0)
         txn_currency = (t.get("currency") or "INR").upper()
@@ -7215,23 +7428,12 @@ def api_treasury_revenue():
             rate = conversion_rates.get(txn_currency, 95.0)
             amount = amount * rate
             
-        is_expense = t.get("type") == "Expense"
-        
-        # Expenses flow as negative in amounts, Incomes as positive
-        if is_expense:
-            amount = -abs(amount)
-            reserve_percentage = 100.0
-            reserve_amount = amount
-            partner_commission = 0.0
-            stakeholder_total = 0.0
-            revenue_type = "Company Expense"
-        else:
-            amount = abs(amount)
-            reserve_percentage = 100.0
-            reserve_amount = amount
-            partner_commission = 0.0
-            stakeholder_total = 0.0
-            revenue_type = "Sales Income"
+        amount = abs(amount)
+        reserve_percentage = 100.0
+        reserve_amount = amount
+        partner_commission = 0.0
+        stakeholder_total = 0.0
+        revenue_type = t.get("category") or "Sales Income"
             
         entry_date = t.get("transaction_date") or t.get("date") or datetime.now().strftime("%Y-%m-%d")
         if not existing:
@@ -7256,8 +7458,6 @@ def api_treasury_revenue():
                 "is_settled": False,
                 "created_at": datetime.now()
             })
-            if amount < 0:
-                create_or_update_payable_from_revenue(db, db.treasury_revenue.find_one({"id": rev_id}))
         elif not existing.get("is_settled"):
             db.treasury_revenue.update_one(
                 {"id": existing["id"]},
@@ -7276,10 +7476,9 @@ def api_treasury_revenue():
                     "updated_at": datetime.now()
                 }}
             )
-            if amount < 0:
-                create_or_update_payable_from_revenue(db, db.treasury_revenue.find_one({"id": existing["id"]}))
                         
     revenues = list(db.treasury_revenue.aggregate([
+        {"$match": revenue_log_visible_match()},
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
         {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {"project_name": "$project.project_name"}},
