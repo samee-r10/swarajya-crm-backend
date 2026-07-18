@@ -2599,6 +2599,29 @@ def account_available_for_transaction(account, transaction_type):
     return False
 
 
+def get_matching_account_ids(db, account_id):
+    if not account_id:
+        return []
+    try:
+        acc_id = int(account_id)
+    except (ValueError, TypeError):
+        return []
+    target = db.accounts.find_one({"id": acc_id})
+    if not target:
+        return [acc_id]
+    match_query = {}
+    gl_code = target.get("gl_code")
+    name = target.get("name")
+    if gl_code:
+        match_query["gl_code"] = str(gl_code).strip()
+    elif name:
+        match_query["name"] = {"$regex": f"^{re.escape(str(name).strip())}$", "$options": "i"}
+    if match_query:
+        matching_accounts = list(db.accounts.find(match_query))
+        return [acc["id"] for acc in matching_accounts if "id" in acc]
+    return [acc_id]
+
+
 INVOICE_RECEIPT_STATUSES = ["Approved", "Partially Paid", "Paid"]
 APPROVED_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid"}
 POST_APPROVAL_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid", "Cancelled"}
@@ -2787,8 +2810,9 @@ def api_finance_receivable_invoices():
         "status": {"$in": INVOICE_RECEIPT_STATUSES},
     }
     if account_id:
+        matching_ids = get_matching_account_ids(db, account_id)
         query["$or"] = [
-            {"account_id": int(account_id)},
+            {"account_id": {"$in": matching_ids}},
             {"account_id": {"$exists": False}},
             {"account_id": None},
         ]
@@ -4083,12 +4107,13 @@ def api_finance_transactions():
                 return jsonify({"error": "Customer is required for Sales Revenue receipts."}), 400
             if not invoice_id:
                 return jsonify({"error": "Invoice number is required for Sales Revenue receipts."}), 400
+            matching_ids = get_matching_account_ids(db, account_id)
             invoice = db.invoices.find_one({
                 "id": invoice_id,
                 "customer_id": customer_id,
                 "status": {"$in": INVOICE_RECEIPT_STATUSES},
                 "$or": [
-                    {"account_id": account_id},
+                    {"account_id": {"$in": matching_ids}},
                     {"account_id": {"$exists": False}},
                     {"account_id": None},
                 ],
@@ -4368,12 +4393,13 @@ def api_finance_transaction_detail(transaction_id):
                 return jsonify({"error": "Customer is required for Sales Revenue receipts."}), 400
             if not invoice_id:
                 return jsonify({"error": "Invoice number is required for Sales Revenue receipts."}), 400
+            matching_ids = get_matching_account_ids(db, account_id)
             invoice = db.invoices.find_one({
                 "id": invoice_id,
                 "customer_id": customer_id,
                 "status": {"$in": INVOICE_RECEIPT_STATUSES},
                 "$or": [
-                    {"account_id": account_id},
+                    {"account_id": {"$in": matching_ids}},
                     {"account_id": {"$exists": False}},
                     {"account_id": None},
                 ],
