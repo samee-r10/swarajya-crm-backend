@@ -6846,8 +6846,11 @@ def api_treasury_partner_detail(pid):
 
 @app.route("/api/finance/expense-claims", methods=["GET", "POST"])
 def api_expense_claims():
-    require_finance_access()
+    # Any authenticated user can create or view their own claims.
+    # Finance users can view all claims.
+    actor = require_current_user()
     db = get_db()
+    has_finance = bool(actor.get("has_finance_access"))
     if request.method == "POST":
         data = request.get_json() or {}
         status = data.get("status", "Draft")
@@ -6861,7 +6864,6 @@ def api_expense_claims():
             return jsonify({"error": "Total claim amount must be greater than zero."}), 400
         claim_id = get_next_sequence_value("expense_claims")
         claim_number = data.get("claim_number") or f"CLM-{datetime.now().strftime('%Y%m')}-{claim_id:04d}"
-        actor = require_current_user()
         doc = {
             "id": claim_id,
             "claim_number": claim_number,
@@ -6896,6 +6898,9 @@ def api_expense_claims():
     query = {}
     if status:
         query["status"] = status
+    # Non-finance users only see their own claims
+    if not has_finance:
+        query["created_by_id"] = actor["id"]
     claims = list(db.expense_claims.find(query, {"_id": 0}).sort([("claim_date", -1), ("created_at", -1)]))
     for claim in claims:
         attach_pending_approval_display(db, claim, "claim_approvals", "claim_id")
@@ -7035,11 +7040,15 @@ def api_claim_approval_action(approval_id):
 
 @app.route("/api/finance/expense-claims/<int:claim_id>", methods=["GET", "PUT"])
 def api_expense_claim_detail(claim_id):
-    require_finance_access()
+    # Any authenticated user can view/edit their own claim; finance users can access all claims.
+    actor = require_current_user()
     db = get_db()
+    has_finance = bool(actor.get("has_finance_access"))
     claim = db.expense_claims.find_one({"id": claim_id}, {"_id": 0})
     if not claim:
         abort(404)
+    if not has_finance and claim.get("created_by_id") != actor["id"]:
+        abort(403)
     if request.method == "PUT":
         if claim.get("status") not in CLAIM_EDITABLE_STATUSES:
             return jsonify({"error": "Claims cannot be edited after submission for approval."}), 400
@@ -7070,7 +7079,7 @@ def api_expense_claim_detail(claim_id):
         old_claim = db.expense_claims.find_one({"id": claim_id})
         db.expense_claims.update_one({"id": claim_id}, {"$set": update_data})
         if status == "Submitted" and claim.get("status") != "Submitted":
-            initialize_claim_approval_workflow(db, claim_id, get_current_user())
+            initialize_claim_approval_workflow(db, claim_id, actor)
         new_claim = db.expense_claims.find_one({"id": claim_id})
         log_activity_async("Finance", "Expense Claim", claim_id, "UPDATE", old_data=old_claim, new_data=new_claim, reference_number=claim.get("claim_number"))
         return jsonify({"success": True})
@@ -7080,14 +7089,23 @@ def api_expense_claim_detail(claim_id):
 
 @app.route("/api/finance/expense-claims/<int:claim_id>/action", methods=["POST"])
 def api_expense_claim_action(claim_id):
-    require_finance_access()
+    # Submit and cancel: any authenticated owner of the claim.
+    # All other actions (approve, reject, review, post, settle): finance users only.
+    actor = require_current_user()
     db = get_db()
+    has_finance = bool(actor.get("has_finance_access"))
     claim = db.expense_claims.find_one({"id": claim_id})
     if not claim:
         abort(404)
     data = request.get_json() or {}
     action = data.get("action")
-    actor = get_current_user()
+
+    # Non-finance users may only submit or cancel their own draft claims
+    if not has_finance:
+        if action not in {"submit", "cancel"}:
+            abort(403)
+        if claim.get("created_by_id") != actor["id"]:
+            abort(403)
 
     def set_status(status, extra=None):
         update = {"status": status, "updated_at": datetime.now()}
