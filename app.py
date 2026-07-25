@@ -1832,6 +1832,119 @@ NON_REVENUE_INFLOW_CATEGORIES = {
 }
 
 
+def is_expense_log_transaction(transaction_doc):
+    if not transaction_doc or transaction_doc.get("status") == "Reversed":
+        return False
+    if transaction_doc.get("type") != "Expense":
+        return False
+    amount = parse_float(transaction_doc.get("total_amount") or transaction_doc.get("amount"))
+    if amount <= 0:
+        return False
+    category = str(transaction_doc.get("category") or "").strip()
+    if category.lower() in {"internal transfer"}:
+        return False
+    return True
+
+
+def sync_transaction_to_expense_log(db, transaction_doc):
+    existing = db.expense_log.find_one({"transaction_id": transaction_doc["id"]})
+    if not is_expense_log_transaction(transaction_doc):
+        if existing:
+            db.expense_log.update_one({"id": existing["id"]}, {"$set": {"payment_status": "Reversed", "payable_status": "Closed", "updated_at": datetime.now()}})
+        return existing
+
+    amount = parse_float(transaction_doc.get("amount") or 0.0)
+    cgst_amount = parse_float(transaction_doc.get("cgst_amount") or 0.0)
+    igst_amount = parse_float(transaction_doc.get("igst_amount") or 0.0)
+    tds_amount = parse_float(transaction_doc.get("tds_amount") or 0.0)
+    tax_amount = cgst_amount + igst_amount
+    total_amount = parse_float(transaction_doc.get("total_amount") or (amount + tax_amount - tds_amount))
+
+    account = db.accounts.find_one({"id": transaction_doc.get("account_id")}) if transaction_doc.get("account_id") else None
+    vendor = db.vendors.find_one({"id": transaction_doc.get("vendor_id")}) if transaction_doc.get("vendor_id") else None
+    project = db.projects.find_one({"id": transaction_doc.get("project_id")}) if transaction_doc.get("project_id") else None
+    
+    product_id = transaction_doc.get("product_id")
+    product_name = None
+    if product_id:
+        try:
+            prod_query_id = int(product_id)
+        except Exception:
+            prod_query_id = product_id
+        product = db.products.find_one({"id": prod_query_id})
+        if product:
+            product_name = product.get("product_name")
+
+    payload = {
+        "expense_date": transaction_doc.get("transaction_date") or transaction_doc.get("date"),
+        "transaction_id": transaction_doc["id"],
+        "source_module": "Transaction Ledger",
+        "expense_category": transaction_doc.get("category"),
+        "vendor_id": transaction_doc.get("vendor_id"),
+        "vendor_name": vendor.get("name") if vendor else None,
+        "employee_name": transaction_doc.get("employee_name") or (transaction_doc.get("created_by_name") if transaction_doc.get("expense_claim_id") else None),
+        "customer_id": transaction_doc.get("customer_id"),
+        "project_id": transaction_doc.get("project_id"),
+        "project_name": project.get("project_name") if project else None,
+        "product_id": product_id,
+        "product_name": product_name,
+        "account_id": transaction_doc.get("account_id"),
+        "gl_code": account.get("gl_code") if account else None,
+        "gl_account_name": account.get("name") if account else None,
+        "description": transaction_doc.get("description"),
+        "amount": amount,
+        "tax_amount": tax_amount,
+        "total_amount": total_amount,
+        "currency": transaction_doc.get("currency", "USD"),
+        "updated_at": datetime.now(),
+    }
+
+    if existing:
+        db.expense_log.update_one({"id": existing["id"]}, {"$set": payload})
+        return db.expense_log.find_one({"id": existing["id"]})
+    
+    seq = get_next_sequence_value("expense_log")
+    payload.update({
+        "id": seq,
+        "expense_number": f"EXP-{seq:04d}",
+        "payment_status": "Pending",
+        "payable_status": "Not Created",
+        "payable_id": None,
+        "created_by_id": transaction_doc.get("created_by_id"),
+        "created_by_name": transaction_doc.get("created_by_name"),
+        "created_at": datetime.now(),
+    })
+    db.expense_log.insert_one(payload)
+    return payload
+
+
+def update_expense_log_payment_status(db, payable):
+    if payable.get("source_module") != "Expense Log":
+        return
+    expense_id = payable.get("source_id")
+    expense = db.expense_log.find_one({"id": expense_id})
+    if not expense:
+        return
+    
+    payable_status = "Payable Created"
+    if payable.get("status") == "Paid":
+        payment_status = "Paid"
+        payable_status = "Closed"
+    elif payable.get("status") == "Partially Paid":
+        payment_status = "Partially Paid"
+    else:
+        payment_status = "Pending"
+
+    db.expense_log.update_one(
+        {"id": expense_id},
+        {"$set": {
+            "payment_status": payment_status,
+            "payable_status": payable_status,
+            "updated_at": datetime.now()
+        }}
+    )
+
+
 def is_revenue_log_transaction(transaction_doc):
     if not transaction_doc or transaction_doc.get("status") == "Reversed":
         return False
@@ -4252,6 +4365,14 @@ def api_finance_transactions():
                 }},
             )
             sync_transaction_to_treasury_revenue(db, insert_data)
+        if transaction_type == "Expense":
+            sync_transaction_to_expense_log(db, insert_data)
+        elif transaction_type == "Income":
+            # Only trigger sync_transaction_to_treasury_revenue if it is not handled specially by loan/claims,
+            # or if it was, they already triggered it. Let's make sure it's synced if not matched above.
+            if not ((category == "Loan Disbursement" and linked_loan) or (category == "Loan Repayment" and linked_schedule) or linked_claim):
+                sync_transaction_to_treasury_revenue(db, insert_data)
+
         log_activity_async("Finance", "Accounting Entry", transaction_id, "CREATE", new_data=insert_data, reference_number=data.get("reference"))
         return jsonify({"id": transaction_id})
         
@@ -4510,6 +4631,8 @@ def api_finance_transaction_detail(transaction_id):
                 )
         if category in {"Loan Disbursement", "Loan Repayment"} or db.treasury_revenue.find_one({"transaction_id": transaction_id}):
             sync_transaction_to_treasury_revenue(db, new_tx)
+        if new_tx.get("type") == "Expense" or db.expense_log.find_one({"transaction_id": transaction_id}):
+            sync_transaction_to_expense_log(db, new_tx)
         log_activity_async("Finance", "Accounting Entry", transaction_id, "UPDATE", old_data=old_tx, new_data=new_tx, reference_number=new_tx.get("reference"))
         return jsonify({"success": True})
         
@@ -4581,6 +4704,24 @@ def api_finance_transaction_reverse(transaction_id):
         db.treasury_revenue.delete_many({"transaction_id": transaction_id})
         db.treasury_payouts.delete_many({"revenue_id": rev["id"]})
         
+    # Sync status to expense log if it was an expense
+    if old_tx and old_tx.get("type") == "Expense":
+        sync_transaction_to_expense_log(db, new_tx)
+        # Also mark linked payable as reversed if one exists
+        db.payables.update_many(
+            {"source_module": "Expense Log", "source_reference": old_tx.get("id"), "status": {"$ne": "Paid"}},
+            {
+                "$set": {
+                    "status": "Reversed",
+                    "payment_status": "Reversed",
+                    "outstanding_amount": 0.0,
+                    "reversed_at": datetime.now(),
+                    "reversed_transaction_id": transaction_id,
+                    "updated_at": datetime.now(),
+                }
+            }
+        )
+
     # 3. Log administrative action
     user = get_current_user()
     log_treasury_action(user["id"], "Reverse Entry", f"Reversed transaction ledger entry #{transaction_id} and cancelled synced treasury splits.")
@@ -6199,9 +6340,10 @@ def api_treasury_payable_payment(payable_id):
         return jsonify({"error": "Select a valid Treasury bank account."}), 400
     if payment_amount > account_balance + 0.01:
         return jsonify({"error": "Insufficient balance in selected bank account."}), 400
-    available = company_fund_available(db)
-    if payment_amount > available + 0.01:
-        return jsonify({"error": "Insufficient company fund for this payment."}), 400
+    if payable.get("source_module") != "Expense Log":
+        available = company_fund_available(db)
+        if payment_amount > available + 0.01:
+            return jsonify({"error": "Insufficient company fund for this payment."}), 400
     recipient_owner_type = data.get("recipient_owner_type") or ""
     recipient_owner_id = safe_int(data.get("recipient_owner_id"))
     recipient_owner_name = (data.get("recipient_owner_name") or "").strip()
@@ -6259,26 +6401,31 @@ def api_treasury_payable_payment(payable_id):
     except ValueError as exc:
         db.payable_payments.delete_one({"id": payment_id})
         return jsonify({"error": str(exc)}), 400
-    is_payout_payable = payable.get("source_module") in {"Stakeholder Payout", "Channel Partner Payout"}
-    treasury_payout_type = payable.get("source_module") if is_payout_payable else "Reserve Expense"
-    payout_source = db.stakeholder_payout_receipts.find_one({"id": payable.get("source_id")}) if is_payout_payable else None
-    db.treasury_payouts.insert_one({
-        "id": get_next_sequence_value("treasury_payouts"),
-        "payable_id": payable_id,
-        "payout_type": treasury_payout_type,
-        "stakeholder_payout_id": payable.get("source_id") if is_payout_payable else None,
-        "stakeholder_id": (payout_source or {}).get("stakeholder_id"),
-        "stakeholder_name": (payout_source or {}).get("stakeholder_name"),
-        "partner_id": (payout_source or {}).get("partner_id"),
-        "partner_name": (payout_source or {}).get("partner_name"),
-        "amount": payment_amount,
-        "status": "Paid",
-        "payout_date": payment_date,
-        "reference": payment_reference,
-        "description": f"Payable payment {payable.get('payable_number')} - {payable.get('source_reference')}",
-        "created_at": datetime.now(),
-        "created_by_id": user["id"],
-    })
+    if payable.get("source_module") != "Expense Log":
+        is_payout_payable = payable.get("source_module") in {"Stakeholder Payout", "Channel Partner Payout"}
+        treasury_payout_type = payable.get("source_module") if is_payout_payable else "Reserve Expense"
+        payout_source = db.stakeholder_payout_receipts.find_one({"id": payable.get("source_id")}) if is_payout_payable else None
+        db.treasury_payouts.insert_one({
+            "id": get_next_sequence_value("treasury_payouts"),
+            "payable_id": payable_id,
+            "payout_type": treasury_payout_type,
+            "stakeholder_payout_id": payable.get("source_id") if is_payout_payable else None,
+            "stakeholder_id": (payout_source or {}).get("stakeholder_id"),
+            "stakeholder_name": (payout_source or {}).get("stakeholder_name"),
+            "partner_id": (payout_source or {}).get("partner_id"),
+            "partner_name": (payout_source or {}).get("partner_name"),
+            "amount": payment_amount,
+            "status": "Paid",
+            "payout_date": payment_date,
+            "reference": payment_reference,
+            "description": f"Payable payment {payable.get('payable_number')} - {payable.get('source_reference')}",
+            "created_at": datetime.now(),
+            "created_by_id": user["id"],
+        })
+    else:
+        payout_source = None
+        is_payout_payable = False
+
     paid_amount = parse_float(payable.get("paid_amount")) + payment_amount
     new_outstanding = max(0.0, parse_float(payable.get("original_amount")) - paid_amount)
     status = "Paid" if new_outstanding <= 0.01 else "Partially Paid"
@@ -6307,7 +6454,10 @@ def api_treasury_payable_payment(payable_id):
         }},
     )
     updated_payable = db.payables.find_one({"id": payable_id})
-    sync_revenue_settlement_from_payable(db, updated_payable)
+    if payable.get("source_module") == "Expense Log":
+        update_expense_log_payment_status(db, updated_payable)
+    else:
+        sync_revenue_settlement_from_payable(db, updated_payable)
     if is_salary_payable:
         salary_transaction = db.hr_salary_transactions.find_one({"id": payable.get("source_id")}, {"_id": 0})
         payroll_ids = (salary_transaction or {}).get("hr_payroll_record_ids") or []
@@ -7927,6 +8077,325 @@ def api_vault_entry_detail(entry_id):
     new_data["has_password"] = bool(new_doc.get("password_encrypted"))
     log_activity_async("Vault", "Credential", entry_id, "UPDATE", old_data=old_data, new_data=new_data, reference_number=title)
     return jsonify({"ok": True})
+
+
+@app.route("/api/treasury/expense-log", methods=["GET"])
+def api_treasury_expense_log():
+    require_treasury_access()
+    db = get_db()
+    
+    # Filtering parameters
+    query = {}
+    
+    # 1. Date filter (YYYY-MM-DD range or specific)
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    if start_date and end_date:
+        query["expense_date"] = {"$gte": start_date, "$lte": end_date}
+    elif start_date:
+        query["expense_date"] = {"$gte": start_date}
+    elif end_date:
+        query["expense_date"] = {"$lte": end_date}
+
+    # 2. Dropdown filters
+    vendor_id = request.args.get("vendor_id")
+    if vendor_id and vendor_id != "all":
+        query["vendor_id"] = int(vendor_id)
+        
+    employee_name = request.args.get("employee_name")
+    if employee_name and employee_name != "all":
+        query["employee_name"] = employee_name
+
+    product_id = request.args.get("product_id")
+    if product_id and product_id != "all":
+        try:
+            prod_val = int(product_id)
+        except Exception:
+            prod_val = product_id
+        query["product_id"] = prod_val
+
+    project_id = request.args.get("project_id")
+    if project_id and project_id != "all":
+        query["project_id"] = int(project_id)
+
+    expense_category = request.args.get("expense_category")
+    if expense_category and expense_category != "all":
+        query["expense_category"] = expense_category
+
+    gl_code = request.args.get("gl_code")
+    if gl_code and gl_code != "all":
+        query["gl_code"] = gl_code
+
+    payment_status = request.args.get("payment_status")
+    if payment_status and payment_status != "all":
+        query["payment_status"] = payment_status
+
+    payable_status = request.args.get("payable_status")
+    if payable_status and payable_status != "all":
+        query["payable_status"] = payable_status
+
+    # 3. Text Search
+    search = (request.args.get("search") or "").strip()
+    if search:
+        query["$or"] = [
+            {"expense_number": {"$regex": search, "$options": "i"}},
+            {"vendor_name": {"$regex": search, "$options": "i"}},
+            {"employee_name": {"$regex": search, "$options": "i"}},
+            {"description": {"$regex": search, "$options": "i"}},
+            {"transaction_id": {"$regex": search, "$options": "i"}},
+        ]
+
+    expenses = list(db.expense_log.find(query, {"_id": 0}).sort([("expense_date", -1), ("created_at", -1)]))
+    
+    # For action links, lookup attachments from the transaction
+    for exp in expenses:
+        txn_id = exp.get("transaction_id")
+        if txn_id:
+            txn = db.transactions.find_one({"id": txn_id}, {"attachments": 1})
+            exp["attachments"] = txn.get("attachments") if txn else []
+        else:
+            exp["attachments"] = []
+
+    # Get dropdown options lists
+    vendors = list(db.vendors.find({}, {"id": 1, "name": 1, "_id": 0}).sort("name", 1))
+    employees = sorted(list({e for e in db.expense_log.distinct("employee_name") if e}))
+    products = list(db.products.find({}, {"id": 1, "product_name": 1, "_id": 0}).sort("product_name", 1))
+    projects = list(db.projects.find({}, {"id": 1, "project_name": 1, "_id": 0}).sort("project_name", 1))
+    categories = sorted(list({c for c in db.expense_log.distinct("expense_category") if c}))
+    gl_accounts = list(db.accounts.find({"type": "Expense"}, {"gl_code": 1, "name": 1, "_id": 0}).sort("gl_code", 1))
+
+    return jsonify(json_ready({
+        "expenses": expenses,
+        "filters": {
+            "vendors": vendors,
+            "employees": [{"name": e} for e in employees],
+            "products": products,
+            "projects": projects,
+            "categories": categories,
+            "gl_accounts": gl_accounts
+        }
+    }))
+
+
+@app.route("/api/treasury/expense-log/<int:expense_id>", methods=["GET"])
+def api_treasury_expense_detail(expense_id):
+    require_treasury_access()
+    db = get_db()
+    expense = db.expense_log.find_one({"id": expense_id}, {"_id": 0})
+    if not expense:
+        abort(404)
+        
+    txn_id = expense.get("transaction_id")
+    if txn_id:
+        txn = db.transactions.find_one({"id": txn_id}, {"attachments": 1})
+        expense["attachments"] = txn.get("attachments") if txn else []
+    else:
+        expense["attachments"] = []
+
+    return jsonify(json_ready({"expense": expense}))
+
+
+@app.route("/api/treasury/expense-log/<int:expense_id>/create-payable", methods=["POST"])
+def api_treasury_expense_create_payable(expense_id):
+    require_treasury_access()
+    db = get_db()
+    expense = db.expense_log.find_one({"id": expense_id})
+    if not expense:
+        abort(404)
+    if expense.get("payable_status") != "Not Created":
+        return jsonify({"error": "Payable has already been created for this expense."}), 400
+
+    payable_id = get_next_sequence_value("payables")
+    payable_number = f"PAY-{payable_id:05d}"
+    
+    party_name = expense.get("vendor_name") or expense.get("employee_name") or "Expense Vendor/Employee"
+    
+    # Save payable
+    db.payables.insert_one({
+        "id": payable_id,
+        "payable_number": payable_number,
+        "source_module": "Expense Log",
+        "source_id": expense_id,
+        "source_reference": expense.get("transaction_id") or f"EXP-{expense_id}",
+        "party_name": party_name,
+        "transaction_date": expense.get("expense_date"),
+        "original_amount": expense.get("total_amount"),
+        "outstanding_amount": expense.get("total_amount"),
+        "paid_amount": 0.0,
+        "payment_status": "Pending",
+        "status": "Pending",
+        "remarks": expense.get("description") or f"Linked to Expense Log #{expense.get('expense_number')}",
+        "created_at": datetime.now(),
+        "updated_at": datetime.now()
+    })
+    
+    # Update expense log
+    db.expense_log.update_one(
+        {"id": expense_id},
+        {"$set": {
+            "payable_status": "Payable Created",
+            "payable_id": payable_id,
+            "updated_at": datetime.now()
+        }}
+    )
+    
+    user = get_current_user()
+    log_treasury_action(user["id"], "Create Payable", f"Created payable {payable_number} for Expense Log {expense.get('expense_number')}.")
+    
+    return jsonify({"success": True, "payable_id": payable_id, "payable_number": payable_number})
+
+
+@app.route("/api/treasury/expense-log/dashboard", methods=["GET"])
+def api_treasury_expense_dashboard():
+    require_treasury_access()
+    db = get_db()
+    
+    expenses = list(db.expense_log.find({"payment_status": {"$ne": "Reversed"}}))
+    
+    total_expenses = sum(parse_float(e.get("total_amount")) for e in expenses)
+    pending_expenses = sum(parse_float(e.get("total_amount")) for e in expenses if e.get("payment_status") == "Pending")
+    awaiting_payable = len([e for e in expenses if e.get("payable_status") == "Not Created"])
+    
+    # Find pending/partially paid payables outstanding amount for Expense Log source
+    pending_payables_amount = sum(
+        parse_float(p.get("outstanding_amount")) 
+        for p in db.payables.find({"source_module": "Expense Log", "status": {"$in": ["Pending", "Partially Paid"]}})
+    )
+    
+    partially_paid = len([e for e in expenses if e.get("payment_status") == "Partially Paid"])
+    paid_expenses = len([e for e in expenses if e.get("payment_status") == "Paid"])
+    
+    # Monthly Expense Calculation
+    this_month_prefix = datetime.now().strftime("%Y-%m")
+    monthly_expense = sum(parse_float(e.get("total_amount")) for e in expenses if str(e.get("expense_date")).startswith(this_month_prefix))
+    
+    outstanding_amount = sum(parse_float(e.get("total_amount")) - parse_float(db.payables.find_one({"source_module": "Expense Log", "source_id": e.get("id")}, {"paid_amount": 1}).get("paid_amount") if db.payables.find_one({"source_module": "Expense Log", "source_id": e.get("id")}) else 0) for e in expenses if e.get("payment_status") != "Paid")
+
+    return jsonify(json_ready({
+        "total_expenses": total_expenses,
+        "pending_expenses": pending_expenses,
+        "awaiting_payable": awaiting_payable,
+        "pending_payables_amount": pending_payables_amount,
+        "partially_paid": partially_paid,
+        "paid_expenses": paid_expenses,
+        "monthly_expense": monthly_expense,
+        "outstanding_amount": outstanding_amount
+    }))
+
+
+@app.route("/api/treasury/expense-log/reports/<report_type>", methods=["GET"])
+def api_treasury_expense_reports(report_type):
+    require_treasury_access()
+    db = get_db()
+    
+    # Filter parameter
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    match_clause = {"payment_status": {"$ne": "Reversed"}}
+    if start_date and end_date:
+        match_clause["expense_date"] = {"$gte": start_date, "$lte": end_date}
+    elif start_date:
+        match_clause["expense_date"] = {"$gte": start_date}
+    elif end_date:
+        match_clause["expense_date"] = {"$lte": end_date}
+
+    expenses = list(db.expense_log.find(match_clause, {"_id": 0}))
+    
+    if report_type == "register":
+        return jsonify(json_ready({"data": expenses}))
+        
+    elif report_type == "by-category":
+        data = {}
+        for e in expenses:
+            cat = e.get("expense_category") or "Uncategorized"
+            data[cat] = data.get(cat, 0.0) + parse_float(e.get("total_amount"))
+        return jsonify(json_ready({"data": [{"category": k, "amount": v} for k, v in data.items()]}))
+
+    elif report_type == "by-vendor":
+        data = {}
+        for e in expenses:
+            vendor = e.get("vendor_name") or "No Vendor"
+            data[vendor] = data.get(vendor, 0.0) + parse_float(e.get("total_amount"))
+        return jsonify(json_ready({"data": [{"vendor": k, "amount": v} for k, v in data.items()]}))
+
+    elif report_type == "by-employee":
+        data = {}
+        for e in expenses:
+            emp = e.get("employee_name") or "No Employee"
+            data[emp] = data.get(emp, 0.0) + parse_float(e.get("total_amount"))
+        return jsonify(json_ready({"data": [{"employee": k, "amount": v} for k, v in data.items()]}))
+
+    elif report_type == "by-product":
+        data = {}
+        for e in expenses:
+            prod = e.get("product_name") or "No Product"
+            data[prod] = data.get(prod, 0.0) + parse_float(e.get("total_amount"))
+        return jsonify(json_ready({"data": [{"product": k, "amount": v} for k, v in data.items()]}))
+
+    elif report_type == "by-project":
+        data = {}
+        for e in expenses:
+            proj = e.get("project_name") or "No Project"
+            data[proj] = data.get(proj, 0.0) + parse_float(e.get("total_amount"))
+        return jsonify(json_ready({"data": [{"project": k, "amount": v} for k, v in data.items()]}))
+
+    elif report_type == "by-gl-account":
+        data = {}
+        for e in expenses:
+            gl = f"{e.get('gl_code') or 'N/A'} - {e.get('gl_account_name') or 'N/A'}"
+            data[gl] = data.get(gl, 0.0) + parse_float(e.get("total_amount"))
+        return jsonify(json_ready({"data": [{"gl_account": k, "amount": v} for k, v in data.items()]}))
+
+    elif report_type == "outstanding":
+        data = []
+        for e in expenses:
+            if e.get("payment_status") != "Paid":
+                paid = 0.0
+                pay = db.payables.find_one({"source_module": "Expense Log", "source_id": e["id"]})
+                if pay:
+                    paid = parse_float(pay.get("paid_amount"))
+                outstanding = max(0.0, parse_float(e.get("total_amount")) - paid)
+                if outstanding > 0.01:
+                    data.append({
+                        "expense_number": e.get("expense_number"),
+                        "expense_date": e.get("expense_date"),
+                        "vendor_employee": e.get("vendor_name") or e.get("employee_name") or "N/A",
+                        "total_amount": e.get("total_amount"),
+                        "paid_amount": paid,
+                        "outstanding_amount": outstanding
+                    })
+        return jsonify(json_ready({"data": data}))
+
+    elif report_type == "vs-revenue":
+        # Load all revenues in same range
+        rev_query = {}
+        if start_date and end_date:
+            rev_query["entry_date"] = {"$gte": start_date, "$lte": end_date}
+        elif start_date:
+            rev_query["entry_date"] = {"$gte": start_date}
+        elif end_date:
+            rev_query["entry_date"] = {"$lte": end_date}
+            
+        revenues = list(db.treasury_revenue.find(rev_query))
+        total_rev = sum(parse_float(r.get("amount")) for r in revenues)
+        total_exp = sum(parse_float(e.get("total_amount")) for e in expenses)
+        return jsonify(json_ready({
+            "data": [
+                {"label": "Revenue", "amount": total_rev},
+                {"label": "Expenses", "amount": total_exp}
+            ]
+        }))
+
+    elif report_type == "monthly-trend":
+        # Group by Month
+        data = {}
+        for e in expenses:
+            m = str(e.get("expense_date"))[:7] # YYYY-MM
+            data[m] = data.get(m, 0.0) + parse_float(e.get("total_amount"))
+        sorted_months = sorted(data.keys())
+        return jsonify(json_ready({"data": [{"month": m, "amount": data[m]} for m in sorted_months]}))
+
+    return jsonify({"error": "Invalid report type"}), 400
 
 
 @app.route("/api/vault/logs", methods=["GET"])
