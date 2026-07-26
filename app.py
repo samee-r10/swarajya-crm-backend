@@ -5173,7 +5173,7 @@ def api_gl_report():
             else:
                 opening_balance -= amt_usd
                 
-    # 2. Fetch period transactions
+    # 2. Fetch period transactions from main finance transactions
     period_query = {"status": {"$ne": "Reversed"}}
     if account_id:
         period_query["account_id"] = int(account_id)
@@ -5194,6 +5194,8 @@ def api_gl_report():
         {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
         {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "products", "localField": "product_id", "foreignField": "id", "as": "product"}},
+        {"$unwind": {"path": "$product", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
             "account_name": "$account.name",
             "gl_code": "$account.gl_code",
@@ -5202,11 +5204,52 @@ def api_gl_report():
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
+            "product_name": "$product.product_name",
+            "product_code": "$product.product_code",
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
         }},
-        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "_id": 0}},
+        {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "product": 0, "_id": 0}},
         {"$sort": {"transaction_date": 1}}
     ]))
+
+    # 2b. Fetch salary transactions from hr_salary_transactions and merge into GL
+    salary_date_query = {}
+    if start_date and end_date:
+        salary_date_query["transaction_date"] = {"$gte": start_date, "$lte": end_date}
+    elif start_date:
+        salary_date_query["transaction_date"] = {"$gte": start_date}
+    elif end_date:
+        salary_date_query["transaction_date"] = {"$lte": end_date}
+
+    salary_transactions_raw = list(db.hr_salary_transactions.find(
+        salary_date_query if salary_date_query else {}, {"_id": 0}
+    ))
+
+    for st in salary_transactions_raw:
+        txn_account_id = safe_int(st.get("account_id"))
+        # If a specific account filter is active, skip salary txns not tied to that account
+        if account_id and txn_account_id != int(account_id):
+            continue
+        sal_account = db.accounts.find_one({"id": txn_account_id}, {"_id": 0}) if txn_account_id else None
+        # Normalise the salary entry into a GL-compatible format
+        sal_entry = {
+            **st,
+            "type": "Expense",
+            "status": st.get("status") or "Pending Payable",
+            "gl_account_number": (sal_account or {}).get("gl_code") or st.get("gl_code"),
+            "gl_account_name": (sal_account or {}).get("name") or st.get("account_name"),
+            "source_module": "HR Salary",
+            "description": st.get("description") or st.get("category") or "Salary Payable",
+            "transaction_date": st.get("transaction_date") or str(st.get("created_at", ""))[:10],
+            "date": st.get("transaction_date") or str(st.get("created_at", ""))[:10],
+            "currency": st.get("currency") or "INR",
+            "amount": parse_float(st.get("total_amount") or st.get("amount")),
+            "total_amount": parse_float(st.get("total_amount") or st.get("amount")),
+        }
+        transactions.append(sal_entry)
+
+    # Sort all entries together by transaction_date
+    transactions.sort(key=lambda t: (t.get("transaction_date") or t.get("date") or ""))
     
     # 3. Calculate running balance and debit/credit columns (normalized to USD)
     entries = []
@@ -6349,9 +6392,14 @@ def api_treasury_payable_payment(payable_id):
     recipient_owner_name = (data.get("recipient_owner_name") or "").strip()
     recipient_account_id = safe_int(data.get("recipient_account_id"))
     recipient_account = db.payee_bank_accounts.find_one({"id": recipient_account_id, "status": {"$ne": "Inactive"}}) if recipient_account_id else None
+    is_other_payment = recipient_owner_type == "Other"
     if is_salary_payable:
         recipient_owner_type = recipient_owner_type or "Employee"
         recipient_owner_name = recipient_owner_name or payable.get("party_name") or "Salary Payable"
+        recipient_account_id = None
+        recipient_account_label = recipient_owner_name
+    elif is_other_payment:
+        recipient_owner_name = recipient_owner_name or "Other"
         recipient_account_id = None
         recipient_account_label = recipient_owner_name
     elif recipient_account:
@@ -6361,7 +6409,7 @@ def api_treasury_payable_payment(payable_id):
         return jsonify({"error": "Select the recipient account paid to."}), 400
     elif not recipient_owner_name:
         return jsonify({"error": "Select the vendor paid to."}), 400
-    if not is_salary_payable:
+    if not is_salary_payable and not is_other_payment:
         recipient_account_label = payee_bank_account_label(recipient_account) if recipient_account else recipient_owner_name
     payment_id = get_next_sequence_value("payable_payments")
     payment_date = data.get("payment_date") or datetime.now().strftime("%Y-%m-%d")
