@@ -1863,7 +1863,7 @@ def sync_transaction_to_expense_log(db, transaction_doc):
     account = db.accounts.find_one({"id": transaction_doc.get("account_id")}) if transaction_doc.get("account_id") else None
     vendor = db.vendors.find_one({"id": transaction_doc.get("vendor_id")}) if transaction_doc.get("vendor_id") else None
     project = db.projects.find_one({"id": transaction_doc.get("project_id")}) if transaction_doc.get("project_id") else None
-    
+
     product_id = transaction_doc.get("product_id")
     product_name = None
     if product_id:
@@ -1875,6 +1875,18 @@ def sync_transaction_to_expense_log(db, transaction_doc):
         if product:
             product_name = product.get("product_name")
 
+    # Resolve employee_name: prefer explicit field, then look up from the linked expense
+    # claim (so the claim submitter's name is used rather than the finance user who posted
+    # the transaction).
+    resolved_employee_name = transaction_doc.get("employee_name")
+    if not resolved_employee_name and transaction_doc.get("expense_claim_id"):
+        linked_claim = db.expense_claims.find_one(
+            {"id": transaction_doc["expense_claim_id"]},
+            {"employee_name": 1},
+        )
+        if linked_claim:
+            resolved_employee_name = (linked_claim.get("employee_name") or "").strip() or None
+
     payload = {
         "expense_date": transaction_doc.get("transaction_date") or transaction_doc.get("date"),
         "transaction_id": transaction_doc["id"],
@@ -1882,7 +1894,7 @@ def sync_transaction_to_expense_log(db, transaction_doc):
         "expense_category": transaction_doc.get("category"),
         "vendor_id": transaction_doc.get("vendor_id"),
         "vendor_name": vendor.get("name") if vendor else None,
-        "employee_name": transaction_doc.get("employee_name") or (transaction_doc.get("created_by_name") if transaction_doc.get("expense_claim_id") else None),
+        "employee_name": resolved_employee_name,
         "customer_id": transaction_doc.get("customer_id"),
         "project_id": transaction_doc.get("project_id"),
         "project_name": project.get("project_name") if project else None,
@@ -6274,6 +6286,36 @@ def api_treasury_payables():
                 payable["last_payment_amount"] = latest_payment.get("payment_amount")
             if not payable.get("last_payment_mode"):
                 payable["last_payment_mode"] = latest_payment.get("payment_mode")
+        # For Expense Log payables, re-derive party_name from the linked expense log
+        # record so that vendor payments show the vendor name and employee
+        # reimbursements show the employee who submitted the claim.
+        if payable.get("source_module") == "Expense Log" and payable.get("source_id"):
+            expense_entry = db.expense_log.find_one(
+                {"id": payable["source_id"]},
+                {"vendor_name": 1, "employee_name": 1, "transaction_id": 1},
+            )
+            if expense_entry:
+                vendor_name = (expense_entry.get("vendor_name") or "").strip()
+                employee_name = (expense_entry.get("employee_name") or "").strip()
+                # If there is no vendor_name and the expense log entry has an
+                # employee_name, verify it came from the actual claim (not from
+                # created_by_name which was incorrectly used in older records).
+                # We do this by looking up the claim directly via the transaction.
+                if not vendor_name and expense_entry.get("transaction_id"):
+                    tx = db.transactions.find_one(
+                        {"id": expense_entry["transaction_id"]},
+                        {"expense_claim_id": 1},
+                    )
+                    if tx and tx.get("expense_claim_id"):
+                        claim = db.expense_claims.find_one(
+                            {"id": tx["expense_claim_id"]},
+                            {"employee_name": 1},
+                        )
+                        if claim and (claim.get("employee_name") or "").strip():
+                            employee_name = claim["employee_name"].strip()
+                derived_party = vendor_name or employee_name
+                if derived_party:
+                    payable["party_name"] = derived_party
     stats = {
         "total_payables": sum(parse_float(p.get("original_amount")) for p in payables if p.get("status") not in {"Cancelled", "Reversed"}),
         "pending_payments": sum(parse_float(p.get("outstanding_amount")) for p in payables if p.get("status") in {"Pending", "Partially Paid"}),
