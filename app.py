@@ -384,6 +384,24 @@ def document_preview_url(document):
     return f"/api/uploads/preview?{urllib.parse.urlencode(params)}"
 
 
+def cloudinary_signed_delivery_url(source_url):
+    """Generate a short-lived signed Cloudinary delivery URL (5 minutes).
+    Works for both public and authenticated resources."""
+    config = cloudinary_config()
+    if not config.get("api_key") or not config.get("api_secret"):
+        return source_url  # Can't sign without credentials, return original
+    parsed = urllib.parse.urlparse(source_url)
+    # Extract path without leading slash: e.g. /image/upload/v123/folder/file.pdf
+    path = parsed.path  # e.g. /raw/upload/v.../...
+    expiry = int(datetime.now().timestamp()) + 300  # 5 min
+    # Build signature base: __cld_token__=e=<expiry>~hmac=<signature>
+    # Cloudinary signed URL format for delivery: append auth_token query param
+    to_sign = f"exp={expiry}{path}"
+    signature = hmac.new(config["api_secret"].encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+    sep = "&" if "?" in source_url else "?"
+    return f"{source_url}{sep}__cld_token__=e={expiry}~hmac={signature}"
+
+
 def slugify_api_name(value, suffix=""):
     slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
     slug = re.sub(r"_+", "_", slug)
@@ -1053,28 +1071,60 @@ def api_upload_preview():
 
     filename = request.args.get("name") or os.path.basename(parsed.path) or "document"
     requested_type = request.args.get("type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    if requested_type.lower() == "application/octet-stream" and filename.lower().endswith(".pdf"):
-        requested_type = "application/pdf"
 
     headers = {"User-Agent": "SwarajyaCRM/1.0"}
     range_header = request.headers.get("Range")
     if range_header:
         headers["Range"] = range_header
-    upstream_request = urllib.request.Request(source_url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(upstream_request, timeout=30) as upstream:
-            data = upstream.read()
-            upstream_headers = upstream.headers
-            status_code = upstream.getcode() or 200
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="ignore")
-        return jsonify({"error": "Unable to load document preview.", "detail": detail or exc.reason}), exc.code
-    except urllib.error.URLError as exc:
-        return jsonify({"error": f"Unable to load document preview: {exc.reason}"}), 502
 
-    content_type = upstream_headers.get("Content-Type") or requested_type
-    if filename.lower().endswith(".pdf") or requested_type.lower() == "application/pdf":
+    urls_to_try = [source_url]
+    if ".cloudinary.com" in source_url:
+        if ".pdf" in source_url.lower():
+            png_url = re.sub(r"\.pdf(\?.*)?$", r".png\1", source_url, flags=re.IGNORECASE)
+            if png_url not in urls_to_try:
+                urls_to_try.append(png_url)
+            jpg_url = re.sub(r"\.pdf(\?.*)?$", r".jpg\1", source_url, flags=re.IGNORECASE)
+            if jpg_url not in urls_to_try:
+                urls_to_try.append(jpg_url)
+            if "/upload/" in source_url and "/upload/f_png/" not in source_url:
+                f_png_url = source_url.replace("/upload/", "/upload/f_png/")
+                if f_png_url not in urls_to_try:
+                    urls_to_try.append(f_png_url)
+
+    upstream_response = None
+    last_error = None
+    for target_url in urls_to_try:
+        try:
+            req = urllib.request.Request(target_url, headers=headers, method="GET")
+            upstream_response = urllib.request.urlopen(req, timeout=30)
+            break
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+        except urllib.error.URLError as exc:
+            last_error = exc
+
+    if not upstream_response:
+        if isinstance(last_error, urllib.error.HTTPError):
+            detail = last_error.read().decode(errors="ignore") if hasattr(last_error, "read") else ""
+            return jsonify({"error": "Unable to load document preview.", "detail": detail or last_error.reason}), last_error.code
+        elif isinstance(last_error, urllib.error.URLError):
+            return jsonify({"error": f"Unable to load document preview: {last_error.reason}"}), 502
+        return jsonify({"error": "Unable to load document preview."}), 500
+
+    with upstream_response as upstream:
+        data = upstream.read()
+        upstream_headers = upstream.headers
+        status_code = upstream.getcode() or 200
+
+    if data.startswith(b"%PDF-"):
         content_type = "application/pdf"
+    elif data.startswith(b"\x89PNG"):
+        content_type = "image/png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        content_type = "image/jpeg"
+    else:
+        content_type = upstream_headers.get("Content-Type") or requested_type
+
     disposition = "inline"
     safe_filename = filename.replace('"', "")
     response = Response(data, status=status_code, content_type=content_type)
