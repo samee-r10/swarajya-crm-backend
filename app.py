@@ -2244,19 +2244,11 @@ def create_system_notification(db, user_id, title, message, link=None):
 
 
 def company_fund_available(db):
-    settled_revenue_ids = get_settled_revenue_ids(db)
-    reserve_balance_match = reserve_balance_payout_clause(settled_revenue_ids)
-    inflow_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Reserve Fund", **reserve_balance_match}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
-    ]))
-    outflow_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": {"$in": ["Reserve Expense", "Stakeholder Payout", "Channel Partner Payout"]}, **reserve_balance_match}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
-    ]))
-    inflow = inflow_doc[0]["total"] if inflow_doc else 0.0
-    outflow = outflow_doc[0]["total"] if outflow_doc else 0.0
-    return inflow - outflow
+    accounts = list(db.company_bank_accounts.find({"status": {"$ne": "Inactive"}}))
+    if not accounts:
+        accounts = list(db.company_bank_accounts.find())
+    total = sum(bank_account_current_balance(db, acc["id"]) or 0.0 for acc in accounts)
+    return round(total, 2)
 
 
 def payout_recipient_payload(db, data, existing=None):
@@ -5391,23 +5383,23 @@ def api_treasury_dashboard():
     normalize_stakeholder_flow_payouts(db)
     sync_revenue_settlements_from_payables(db)
     
-    # 1. Reserve Fund — only settled revenue allocations (+ manual reserve expenses)
+    # 1. Reserve Fund / Company Fund — total actual available funds in company accounts
+    reserve_available = company_fund_available(db)
+
+    inflow_doc = list(db.company_bank_transactions.aggregate([
+        {"$match": {"transaction_type": {"$ne": "Internal Transfer"}}},
+        {"$group": {"_id": None, "total": {"$sum": "$inflow"}}}
+    ]))
+    reserve_accumulated = round(inflow_doc[0]["total"] if inflow_doc else 0.0, 2)
+
+    outflow_doc = list(db.company_bank_transactions.aggregate([
+        {"$match": {"transaction_type": {"$ne": "Internal Transfer"}}},
+        {"$group": {"_id": None, "total": {"$sum": "$outflow"}}}
+    ]))
+    reserve_spent = round(outflow_doc[0]["total"] if outflow_doc else 0.0, 2)
+
     settled_revenue_ids = get_settled_revenue_ids(db)
     reserve_balance_match = reserve_balance_payout_clause(settled_revenue_ids)
-
-    reserve_acc_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Reserve Fund", **reserve_balance_match}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]))
-    reserve_accumulated = reserve_acc_doc[0]["total"] if reserve_acc_doc else 0.0
-
-    reserve_spent_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": {"$in": ["Reserve Expense", "Stakeholder Payout", "Channel Partner Payout"]}, **reserve_balance_match}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]))
-    reserve_spent = reserve_spent_doc[0]["total"] if reserve_spent_doc else 0.0
-
-    reserve_available = reserve_accumulated - reserve_spent
 
     # 2. Shared revenue = owner earnings + channel partner payouts (settled only; not contributions)
     shared_revenue_doc = list(db.treasury_payouts.aggregate([
@@ -6000,36 +5992,68 @@ def api_hr_salary_transactions_bulk():
 def api_hr_salary_payments():
     user = require_hr_access()
     db = get_db()
-    if not user_has_hr_permission(db, user, "post_salary_to_ledger"):
+    if not (user_has_hr_permission(db, user, "create_payroll") or user_has_hr_permission(db, user, "approve_payroll") or user_has_hr_permission(db, user, "post_salary_to_ledger")):
         abort(403)
     data = request.get_json() or {}
     transaction = data.get("transaction") or {}
-    record_id = transaction.get("id") or f"salary-ledger-{get_next_sequence_value('hr_salary_transactions')}"
-    tx_doc = {
-        **transaction,
-        "id": record_id,
-        "status": transaction.get("status") or "Pending Payable",
+    payroll_records = data.get("payroll_records") or []
+    record_ids = [item.get("id") for item in payroll_records if item.get("id")]
+    if not record_ids:
+        return jsonify({"error": "Select at least one finalized unpaid salary record."}), 400
+
+    records_in_db = list(db.hr_payroll.find({"id": {"$in": record_ids}}))
+    if not records_in_db:
+        return jsonify({"error": "Selected payroll records not found."}), 404
+
+    month = transaction.get("salary_month") or records_in_db[0].get("salary_month") or ""
+    year = int(transaction.get("salary_year") or records_in_db[0].get("salary_year") or datetime.now().year)
+    total_amount = sum(parse_float(r.get("net_payable_salary")) for r in records_in_db)
+    if total_amount <= 0:
+        total_amount = parse_float(transaction.get("total_amount") or transaction.get("amount"))
+
+    if total_amount <= 0:
+        return jsonify({"error": "Payable amount must be greater than zero."}), 400
+
+    payable_id = get_next_sequence_value("payables")
+    payable_number = f"PAY-{payable_id:05d}"
+    reference = transaction.get("reference") or transaction.get("transaction_reference") or f"SAL-PAYABLE-{year}-{str(month)[:3].upper()}-{int(datetime.now().timestamp()*1000)}"
+
+    payable_doc = {
+        "id": payable_id,
+        "payable_number": payable_number,
+        "source_module": "HR Salary",
+        "source_id": f"salary-batch-{payable_id}",
+        "source_reference": reference,
+        "party_name": transaction.get("party_name") or f"Salary for {month} {year}",
+        "transaction_date": datetime.now().strftime("%Y-%m-%d"),
+        "original_amount": total_amount,
+        "paid_amount": 0.0,
+        "outstanding_amount": total_amount,
+        "payment_status": "Pending",
+        "status": "Pending",
+        "due_date": datetime.now().strftime("%Y-%m-%d"),
+        "currency": transaction.get("currency") or "INR",
+        "remarks": transaction.get("description") or f"Salary payable for {month} {year}",
+        "hr_payroll_record_ids": record_ids,
         "created_at": datetime.now(),
         "updated_at": datetime.now(),
         "created_by_id": user["id"],
     }
-    db.hr_salary_transactions.update_one({"id": record_id}, {"$set": tx_doc}, upsert=True)
-    saved_transaction = db.hr_salary_transactions.find_one({"id": record_id}, {"_id": 0})
-    payable = create_or_update_payable_from_salary_batch(db, saved_transaction)
-    saved_payroll = []
-    for item in data.get("payroll_records") or []:
-        item = {
-            **item,
-            "ledger_transaction_id": record_id,
-            "salary_payable_id": payable.get("id") if payable else None,
-            "salary_payable_number": payable.get("payable_number") if payable else None,
-            "salary_payable_status": payable.get("status") if payable else "Pending",
-        }
-        existing = db.hr_payroll.find_one({"id": item.get("id")})
-        record, error = upsert_hr_payroll_record(db, item, user, existing)
-        if not error and record:
-            saved_payroll.append(record)
-    return jsonify(json_ready({"transaction": saved_transaction, "payable": payable, "payroll": saved_payroll}))
+    db.payables.insert_one(payable_doc)
+    saved_payable = db.payables.find_one({"id": payable_id}, {"_id": 0})
+
+    db.hr_payroll.update_many(
+        {"id": {"$in": record_ids}},
+        {"$set": {
+            "salary_payable_id": payable_id,
+            "salary_payable_number": payable_number,
+            "salary_payable_status": "Pending",
+            "transaction_reference": reference,
+            "updated_at": datetime.now(),
+        }}
+    )
+    saved_payroll = list(db.hr_payroll.find({"id": {"$in": record_ids}}, {"_id": 0}))
+    return jsonify(json_ready({"payable": saved_payable, "payroll": saved_payroll}))
 
 
 @app.route("/api/hr/salary-ledger-payments", methods=["POST"])
@@ -6600,10 +6624,17 @@ def api_treasury_payable_payment(payable_id):
         sync_revenue_settlement_from_payable(db, updated_payable)
     if is_salary_payable:
         salary_transaction = db.hr_salary_transactions.find_one({"id": payable.get("source_id")}, {"_id": 0})
-        payroll_ids = (salary_transaction or {}).get("hr_payroll_record_ids") or []
+        payroll_ids = (salary_transaction or {}).get("hr_payroll_record_ids") or payable.get("hr_payroll_record_ids") or []
+        query_clauses = []
         if payroll_ids:
+            query_clauses.append({"id": {"$in": payroll_ids}})
+        if payable.get("id"):
+            query_clauses.append({"salary_payable_id": payable.get("id")})
+        if payable.get("source_id"):
+            query_clauses.append({"salary_payable_id": payable.get("source_id")})
+        if query_clauses:
             db.hr_payroll.update_many(
-                {"id": {"$in": payroll_ids}},
+                {"$or": query_clauses},
                 {"$set": {
                     "payment_status": status,
                     "payment_date": payment_date,
