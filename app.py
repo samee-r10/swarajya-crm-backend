@@ -337,7 +337,8 @@ def upload_file_to_cloudinary(file_storage, folder="crm-documents"):
             "content": file_bytes,
         }
     })
-    upload_url = f"https://api.cloudinary.com/v1_1/{config['cloud_name']}/auto/upload"
+    resource_type = "raw" if (file_storage.filename.lower().endswith(".pdf") or "pdf" in str(content_type).lower()) else "auto"
+    upload_url = f"https://api.cloudinary.com/v1_1/{config['cloud_name']}/{resource_type}/upload"
     request_obj = urllib.request.Request(upload_url, data=payload, headers={"Content-Type": multipart_type}, method="POST")
     try:
         with urllib.request.urlopen(request_obj, timeout=30) as response:
@@ -1059,8 +1060,6 @@ def api_cloudinary_upload():
 
 @app.route("/api/uploads/preview", methods=["GET"])
 def api_upload_preview():
-    if "user_id" not in session:
-        abort(401)
     source_url = request.args.get("url") or ""
     parsed = urllib.parse.urlparse(source_url)
     if parsed.scheme != "https" or not parsed.netloc:
@@ -1077,19 +1076,36 @@ def api_upload_preview():
     if range_header:
         headers["Range"] = range_header
 
-    urls_to_try = [source_url]
-    if ".cloudinary.com" in source_url:
-        if ".pdf" in source_url.lower():
-            png_url = re.sub(r"\.pdf(\?.*)?$", r".png\1", source_url, flags=re.IGNORECASE)
-            if png_url not in urls_to_try:
+    try:
+        page = int(request.args.get("page") or 1)
+    except (ValueError, TypeError):
+        page = 1
+
+    urls_to_try = []
+    is_pdf_req = ".pdf" in source_url.lower() or "pdf" in str(requested_type).lower()
+    
+    if ".cloudinary.com" in source_url and is_pdf_req:
+        if "/image/upload/" in source_url:
+            if page > 1:
+                pg_url = source_url.replace("/image/upload/", f"/image/upload/pg_{page}/")
+                pg_png_url = re.sub(r"\.pdf(\?.*)?$", r".png\1", pg_url, flags=re.IGNORECASE)
+                urls_to_try.append(pg_png_url)
+            else:
+                urls_to_try.append(source_url)
+                pg_url = source_url.replace("/image/upload/", "/image/upload/pg_1/")
+                pg_png_url = re.sub(r"\.pdf(\?.*)?$", r".png\1", pg_url, flags=re.IGNORECASE)
+                urls_to_try.append(pg_png_url)
+                raw_url = source_url.replace("/image/upload/", "/raw/upload/")
+                urls_to_try.append(raw_url)
+                png_url = re.sub(r"\.pdf(\?.*)?$", r".png\1", source_url, flags=re.IGNORECASE)
                 urls_to_try.append(png_url)
-            jpg_url = re.sub(r"\.pdf(\?.*)?$", r".jpg\1", source_url, flags=re.IGNORECASE)
-            if jpg_url not in urls_to_try:
-                urls_to_try.append(jpg_url)
-            if "/upload/" in source_url and "/upload/f_png/" not in source_url:
-                f_png_url = source_url.replace("/upload/", "/upload/f_png/")
-                if f_png_url not in urls_to_try:
-                    urls_to_try.append(f_png_url)
+        else:
+            urls_to_try.append(source_url)
+    elif ".cloudinary.com" in source_url:
+        urls_to_try.append(source_url)
+        png_url = re.sub(r"\.[a-zA-Z0-9]+(\?.*)?$", r".png\1", source_url, flags=re.IGNORECASE)
+        if png_url not in urls_to_try:
+            urls_to_try.append(png_url)
 
     upstream_response = None
     last_error = None
@@ -1603,10 +1619,14 @@ def ensure_master_options(db, config):
 def active_master_option_names(db, key):
     config = MASTER_OPTION_CONFIG[key]
     ensure_master_options(db, config)
-    return [
-        item["name"]
-        for item in db[config["collection"]].find({"is_active": {"$ne": 0}}, {"_id": 0, "name": 1}).sort("name", 1)
-    ]
+    names = []
+    seen = set()
+    for item in db[config["collection"]].find({"is_active": {"$ne": 0}}, {"_id": 0, "name": 1}).sort("name", 1):
+        name = (item.get("name") or "").strip()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            names.append(name)
+    return names
 
 
 def validate_profile_master_fields(db, data, include_supplier_fields=False):
@@ -2969,12 +2989,13 @@ def api_finance_receivable_invoices():
     db = get_db()
     customer_id = request.args.get("customer_id")
     account_id = request.args.get("account_id")
+    include_invoice_id = request.args.get("include_invoice_id")
     if not customer_id:
         return jsonify(json_ready({"invoices": []}))
 
     query = {
         "customer_id": int(customer_id),
-        "status": {"$in": INVOICE_RECEIPT_STATUSES},
+        "status": {"$in": ["Approved", "Partially Paid"]},
     }
     if account_id:
         matching_ids = get_matching_account_ids(db, account_id)
@@ -2987,7 +3008,23 @@ def api_finance_receivable_invoices():
     invoices = list(
         db.invoices.find(query, {"_id": 0}).sort([("issue_date", -1), ("invoice_number", -1)])
     )
-    return jsonify(json_ready({"invoices": [invoice_receipt_summary(inv) for inv in invoices]}))
+    summaries = []
+    for inv in invoices:
+        summary = invoice_receipt_summary(inv)
+        if summary["balance_due"] > 0:
+            summaries.append(summary)
+
+    if include_invoice_id:
+        try:
+            inc_id = int(include_invoice_id)
+            if not any(s["id"] == inc_id for s in summaries):
+                inc_inv = db.invoices.find_one({"id": inc_id, "customer_id": int(customer_id)}, {"_id": 0})
+                if inc_inv:
+                    summaries.insert(0, invoice_receipt_summary(inc_inv))
+        except (ValueError, TypeError):
+            pass
+
+    return jsonify(json_ready({"invoices": summaries}))
 
 
 @app.route("/api/search")
@@ -3667,6 +3704,7 @@ def api_opportunities():
             "requirements": data.get("requirements"),
             "next_action": data.get("next_action"),
             "notes": data.get("notes"),
+            "documents": data.get("documents") or data.get("attachments") or [],
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
             "created_by_id": actor_id,
@@ -3741,6 +3779,11 @@ def api_opportunity_detail(opportunity_id):
             "modified_by_id": actor_id,
             "modified_by_name": actor_name
         }
+        if "documents" in data:
+            update_data["documents"] = data.get("documents") or []
+        elif "attachments" in data:
+            update_data["documents"] = data.get("attachments") or []
+            
         # Merge other dynamic custom fields
         merge_client_fields(update_data, data)
                 
@@ -3776,6 +3819,90 @@ def api_opportunity_detail(opportunity_id):
         "projects": projects,
         "fields": fields
     }))
+
+
+@app.route("/api/opportunities/<int:opportunity_id>/documents", methods=["POST"])
+def api_opportunity_add_document(opportunity_id):
+    db = get_db()
+    opp = db.opportunities.find_one({"id": opportunity_id})
+    if not opp:
+        abort(404)
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No document data provided"}), 400
+    
+    import uuid
+    actor, actor_id, actor_name = audit_actor()
+    doc_id = data.get("id") or data.get("public_id") or str(uuid.uuid4())[:8]
+    document_entry = {
+        "id": doc_id,
+        "name": data.get("name") or data.get("filename") or "Document",
+        "url": data.get("url") or data.get("secure_url"),
+        "secure_url": data.get("secure_url") or data.get("url"),
+        "public_id": data.get("public_id"),
+        "size": data.get("size", 0),
+        "format": data.get("format"),
+        "type": data.get("type") or data.get("resource_type") or "file",
+        "category": data.get("category") or "General",
+        "description": data.get("description") or "",
+        "uploaded_at": datetime.now().isoformat(),
+        "uploaded_by_id": actor_id,
+        "uploaded_by_name": actor_name
+    }
+    
+    db.opportunities.update_one(
+        {"id": opportunity_id},
+        {
+            "$push": {"documents": document_entry},
+            "$set": {
+                "updated_at": datetime.now(),
+                "modified_by_id": actor_id,
+                "modified_by_name": actor_name
+            }
+        }
+    )
+    
+    updated_opp = db.opportunities.find_one({"id": opportunity_id}, {"_id": 0, "documents": 1})
+    log_activity_async("Opportunities", "Opportunity", opportunity_id, "UPLOAD_DOCUMENT", new_data=document_entry, reference_number=opp.get("opportunity_number"))
+    return jsonify(json_ready({"success": True, "documents": updated_opp.get("documents", []), "document": document_entry}))
+
+
+@app.route("/api/opportunities/<int:opportunity_id>/documents/<doc_id>", methods=["DELETE"])
+def api_opportunity_delete_document(opportunity_id, doc_id):
+    db = get_db()
+    opp = db.opportunities.find_one({"id": opportunity_id})
+    if not opp:
+        abort(404)
+    actor, actor_id, actor_name = audit_actor()
+    
+    db.opportunities.update_one(
+        {"id": opportunity_id},
+        {
+            "$pull": {
+                "documents": {
+                    "$or": [
+                        {"id": doc_id},
+                        {"public_id": doc_id},
+                        {"name": doc_id}
+                    ]
+                }
+            },
+            "$set": {
+                "updated_at": datetime.now(),
+                "modified_by_id": actor_id,
+                "modified_by_name": actor_name
+            }
+        }
+    )
+    # Direct match fallback
+    db.opportunities.update_one(
+        {"id": opportunity_id},
+        {"$pull": {"documents": {"id": doc_id}}}
+    )
+    
+    updated_opp = db.opportunities.find_one({"id": opportunity_id}, {"_id": 0, "documents": 1})
+    log_activity_async("Opportunities", "Opportunity", opportunity_id, "DELETE_DOCUMENT", new_data={"deleted_doc_id": doc_id}, reference_number=opp.get("opportunity_number"))
+    return jsonify(json_ready({"success": True, "documents": updated_opp.get("documents", [])}))
 
 def normalize_product_payload(data):
     return {
@@ -4278,15 +4405,15 @@ def api_finance_transactions():
             invoice = db.invoices.find_one({
                 "id": invoice_id,
                 "customer_id": customer_id,
-                "status": {"$in": INVOICE_RECEIPT_STATUSES},
+                "status": {"$in": ["Approved", "Partially Paid"]},
                 "$or": [
                     {"account_id": {"$in": matching_ids}},
                     {"account_id": {"$exists": False}},
                     {"account_id": None},
                 ],
             })
-            if not invoice:
-                return jsonify({"error": "Select an approved, partially paid, or paid invoice for this customer and account."}), 400
+            if not invoice or (float(invoice.get("total_amount") or 0) <= float(invoice.get("amount_paid") or 0)):
+                return jsonify({"error": "Select an outstanding (approved or partially paid) invoice for this customer and account."}), 400
             invoice_number = invoice.get("invoice_number")
         else:
             invoice_id = None
@@ -4723,7 +4850,17 @@ def api_finance_transaction_detail(transaction_id):
         {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "product": 0, "bank_account": 0, "invoice": 0, "_id": 0}}
     ]))
     if not transactions:
-        abort(404)
+        salary_tx = db.hr_salary_transactions.find_one({
+            "$or": [
+                {"id": transaction_id},
+                {"display_id": transaction_id},
+                {"legacy_id": transaction_id}
+            ]
+        }, {"_id": 0})
+        if salary_tx:
+            transactions = [salary_tx]
+        else:
+            abort(404)
         
     transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
     fields = get_fields_for_user(transaction_obj["id"]) if transaction_obj else []
@@ -5346,6 +5483,423 @@ def api_gl_report():
         "entries": entries
     }))
 
+
+@app.route("/api/finance/reports/customer-ledger")
+def api_customer_ledger_report():
+    require_finance_access()
+    db = get_db()
+
+    customer_id = request.args.get("customer_id")
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    search_term = (request.args.get("search") or "").strip().lower()
+    type_filter = (request.args.get("type") or "").strip().lower()
+    currency_filter = (request.args.get("currency") or "").strip().upper()
+
+    # Load exchange rates
+    inr_rate = 95.0
+    setting = db.system_settings.find_one({"key_name": "exchange_rates"})
+    if setting and setting.get("value"):
+        try:
+            rates_data = json.loads(setting["value"])
+            inr_rate = rates_data.get("INR", {}).get("default", 95.0)
+        except Exception:
+            pass
+
+    cust_int = int(customer_id) if customer_id and str(customer_id).isdigit() else None
+
+    # 1. Opening Balance Calculation (All prior invoices - prior receipts before start_date)
+    opening_balance = 0.0
+    if start_date:
+        # Prior Invoices
+        prior_inv_query = {
+            "status": {"$ne": "Cancelled"},
+            "$or": [
+                {"issue_date": {"$lt": start_date}},
+                {"issue_date": {"$exists": False}, "created_at": {"$lt": datetime.strptime(start_date, "%Y-%m-%d")}}
+            ]
+        }
+        if cust_int:
+            prior_inv_query["customer_id"] = cust_int
+        prior_invoices = list(db.invoices.find(prior_inv_query))
+        for inv in prior_invoices:
+            amt = float(inv.get("total_amount") or 0.0)
+            curr = inv.get("currency", "INR")
+            d_str = inv.get("issue_date") or str(inv.get("created_at", ""))[:10]
+            opening_balance += convert_to_usd(amt, curr, d_str, inr_rate, setting)
+
+        # Prior Receipts
+        prior_rcpt_query = {
+            "type": "Income",
+            "status": {"$ne": "Reversed"},
+            "date": {"$lt": start_date}
+        }
+        if cust_int:
+            prior_rcpt_query["customer_id"] = cust_int
+        else:
+            prior_rcpt_query["customer_id"] = {"$ne": None}
+        prior_receipts = list(db.transactions.find(prior_rcpt_query))
+        for r in prior_receipts:
+            amt = float(r.get("total_amount") or r.get("amount") or 0.0)
+            curr = r.get("currency", "USD")
+            d_str = r.get("transaction_date") or r.get("date")
+            opening_balance -= convert_to_usd(amt, curr, d_str, inr_rate, setting)
+
+    # 2. Fetch Period Invoices
+    inv_query = {"status": {"$ne": "Cancelled"}}
+    if cust_int:
+        inv_query["customer_id"] = cust_int
+    if start_date and end_date:
+        inv_query["issue_date"] = {"$gte": start_date, "$lte": end_date}
+    elif start_date:
+        inv_query["issue_date"] = {"$gte": start_date}
+    elif end_date:
+        inv_query["issue_date"] = {"$lte": end_date}
+
+    invoices = list(db.invoices.aggregate([
+        {"$match": inv_query},
+        {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
+        {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
+        {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "products", "localField": "product_id", "foreignField": "id", "as": "product"}},
+        {"$unwind": {"path": "$product", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "customer_name": "$customer.company_name",
+            "project_name": "$project.project_name",
+            "product_name": "$product.product_name",
+            "product_code": "$product.product_code",
+            "transaction_date": "$issue_date"
+        }},
+        {"$project": {"customer": 0, "project": 0, "product": 0, "_id": 0}}
+    ]))
+
+    # 3. Fetch Period Receipts
+    rcpt_query = {
+        "type": "Income",
+        "status": {"$ne": "Reversed"}
+    }
+    if cust_int:
+        rcpt_query["customer_id"] = cust_int
+    else:
+        rcpt_query["customer_id"] = {"$ne": None}
+
+    if start_date and end_date:
+        rcpt_query["date"] = {"$gte": start_date, "$lte": end_date}
+    elif start_date:
+        rcpt_query["date"] = {"$gte": start_date}
+    elif end_date:
+        rcpt_query["date"] = {"$lte": end_date}
+
+    receipts = list(db.transactions.aggregate([
+        {"$match": rcpt_query},
+        {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
+        {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
+        {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "products", "localField": "product_id", "foreignField": "id", "as": "product"}},
+        {"$unwind": {"path": "$product", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "customer_name": "$customer.company_name",
+            "project_name": "$project.project_name",
+            "product_name": "$product.product_name",
+            "product_code": "$product.product_code",
+            "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
+        }},
+        {"$project": {"customer": 0, "project": 0, "product": 0, "_id": 0}}
+    ]))
+
+    # 4. Standardize and merge entries
+    raw_entries = []
+
+    for inv in invoices:
+        amt = float(inv.get("total_amount") or 0.0)
+        curr = inv.get("currency", "INR")
+        d_str = inv.get("transaction_date") or str(inv.get("created_at", ""))[:10]
+        raw_entries.append({
+            "id": f"INV-{inv.get('id')}",
+            "invoice_id": inv.get("id"),
+            "entry_type": "Invoice",
+            "type": "Invoice",
+            "transaction_type": "Customer Invoice",
+            "category": "Customer Invoice",
+            "reference": inv.get("invoice_number"),
+            "transaction_number": inv.get("invoice_number"),
+            "invoice_number": inv.get("invoice_number"),
+            "receipt_number": "—",
+            "customer_id": inv.get("customer_id"),
+            "customer_name": inv.get("customer_name") or "—",
+            "description": inv.get("notes") or f"Customer invoice {inv.get('invoice_number')}",
+            "transaction_date": d_str,
+            "date": d_str,
+            "currency": curr,
+            "debit": amt,
+            "credit": None,
+            "amount": amt,
+            "total_amount": amt,
+            "status": inv.get("status") or "Approved",
+            "created_by_name": inv.get("modified_by_name") or "System Administrator",
+            "product_name": inv.get("product_name"),
+            "product_code": inv.get("product_code"),
+            "project_name": inv.get("project_name"),
+            "source_module": "Invoicing"
+        })
+
+    for r in receipts:
+        amt = float(r.get("total_amount") or r.get("amount") or 0.0)
+        curr = r.get("currency", "INR")
+        d_str = r.get("transaction_date") or r.get("date")
+        raw_entries.append({
+            "id": r.get("id"),
+            "transaction_id": r.get("id"),
+            "invoice_id": r.get("invoice_id"),
+            "entry_type": "Receipt",
+            "type": "Receipt",
+            "transaction_type": "Customer Receipt",
+            "category": r.get("category") or "Customer Receipt",
+            "reference": r.get("reference") or r.get("id"),
+            "transaction_number": r.get("id"),
+            "invoice_number": r.get("invoice_number") or "—",
+            "receipt_number": r.get("id"),
+            "customer_id": r.get("customer_id"),
+            "customer_name": r.get("customer_name") or "—",
+            "description": r.get("description") or f"Payment receipt against {r.get('customer_name') or 'customer'}",
+            "transaction_date": d_str,
+            "date": d_str,
+            "currency": curr,
+            "debit": None,
+            "credit": amt,
+            "amount": amt,
+            "total_amount": amt,
+            "status": r.get("status") or "Completed",
+            "created_by_name": r.get("created_by_name") or "System Administrator",
+            "product_name": r.get("product_name"),
+            "product_code": r.get("product_code"),
+            "project_name": r.get("project_name"),
+            "source_module": "Finance"
+        })
+
+    # Sort chronologically
+    raw_entries.sort(key=lambda e: (e.get("transaction_date") or "", e.get("id") or ""))
+
+    # Apply filters
+    filtered_entries = []
+    for e in raw_entries:
+        if type_filter and type_filter != "all":
+            if type_filter not in (e.get("entry_type") or "").lower():
+                continue
+        if currency_filter and currency_filter != "ALL":
+            if e.get("currency", "").upper() != currency_filter:
+                continue
+        if search_term:
+            searchable = f"{e.get('customer_name')} {e.get('reference')} {e.get('invoice_number')} {e.get('receipt_number')} {e.get('description')} {e.get('category')}".lower()
+            if search_term not in searchable:
+                continue
+        filtered_entries.append(e)
+
+    # 5. Calculate Running Balances
+    running_balance = opening_balance
+    total_debits = 0.0
+    total_credits = 0.0
+    entries = []
+
+    for e in filtered_entries:
+        amt = float(e.get("amount") or 0.0)
+        curr = e.get("currency", "USD")
+        d_str = e.get("transaction_date")
+        amt_usd = convert_to_usd(amt, curr, d_str, inr_rate, setting)
+
+        if e.get("debit") is not None:
+            total_debits += amt_usd
+            running_balance += amt_usd
+        else:
+            total_credits += amt_usd
+            running_balance -= amt_usd
+
+        e["running_balance"] = running_balance
+        entries.append(e)
+
+    closing_balance = running_balance
+
+    return jsonify(json_ready({
+        "opening_balance": opening_balance,
+        "total_debits": total_debits,
+        "total_credits": total_credits,
+        "closing_balance": closing_balance,
+        "entries": entries
+    }))
+
+
+@app.route("/api/finance/reports/vendor-ledger")
+def api_vendor_ledger_report():
+    require_finance_access()
+    db = get_db()
+
+    vendor_id = request.args.get("vendor_id")
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    search_term = (request.args.get("search") or "").strip().lower()
+    type_filter = (request.args.get("type") or "").strip().lower()
+    currency_filter = (request.args.get("currency") or "").strip().upper()
+
+    # Load exchange rates
+    inr_rate = 95.0
+    setting = db.system_settings.find_one({"key_name": "exchange_rates"})
+    if setting and setting.get("value"):
+        try:
+            rates_data = json.loads(setting["value"])
+            inr_rate = rates_data.get("INR", {}).get("default", 95.0)
+        except Exception:
+            pass
+
+    ven_int = int(vendor_id) if vendor_id and str(vendor_id).isdigit() else None
+
+    # 1. Opening Balance Calculation (Prior expenses - prior payments before start_date)
+    opening_balance = 0.0
+    if start_date:
+        prior_query = {
+            "type": "Expense",
+            "status": {"$ne": "Reversed"},
+            "date": {"$lt": start_date}
+        }
+        if ven_int:
+            prior_query["vendor_id"] = ven_int
+        else:
+            prior_query["vendor_id"] = {"$ne": None}
+
+        prior_txns = list(db.transactions.find(prior_query))
+        for t in prior_txns:
+            amt = float(t.get("total_amount") or t.get("amount") or 0.0)
+            curr = t.get("currency", "USD")
+            d_str = t.get("transaction_date") or t.get("date")
+            amt_usd = convert_to_usd(amt, curr, d_str, inr_rate, setting)
+            opening_balance += amt_usd
+
+    # 2. Fetch Period Vendor Transactions
+    ven_query = {
+        "type": "Expense",
+        "status": {"$ne": "Reversed"}
+    }
+    if ven_int:
+        ven_query["vendor_id"] = ven_int
+    else:
+        ven_query["vendor_id"] = {"$ne": None}
+
+    if start_date and end_date:
+        ven_query["date"] = {"$gte": start_date, "$lte": end_date}
+    elif start_date:
+        ven_query["date"] = {"$gte": start_date}
+    elif end_date:
+        ven_query["date"] = {"$lte": end_date}
+
+    txns = list(db.transactions.aggregate([
+        {"$match": ven_query},
+        {"$lookup": {"from": "vendors", "localField": "vendor_id", "foreignField": "id", "as": "vendor"}},
+        {"$unwind": {"path": "$vendor", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "accounts", "localField": "account_id", "foreignField": "id", "as": "account"}},
+        {"$unwind": {"path": "$account", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
+        {"$unwind": {"path": "$project", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": "products", "localField": "product_id", "foreignField": "id", "as": "product"}},
+        {"$unwind": {"path": "$product", "preserveNullAndEmptyArrays": True}},
+        {"$addFields": {
+            "vendor_name": "$vendor.name",
+            "account_name": "$account.name",
+            "gl_code": "$account.gl_code",
+            "gl_account_number": "$account.gl_code",
+            "gl_account_name": "$account.name",
+            "project_name": "$project.project_name",
+            "product_name": "$product.product_name",
+            "product_code": "$product.product_code",
+            "transaction_date": {"$ifNull": ["$transaction_date", "$date"]}
+        }},
+        {"$project": {"vendor": 0, "account": 0, "project": 0, "product": 0, "_id": 0}}
+    ]))
+
+    raw_entries = []
+    for t in txns:
+        amt = float(t.get("total_amount") or t.get("amount") or 0.0)
+        curr = t.get("currency", "INR")
+        d_str = t.get("transaction_date") or t.get("date")
+        raw_entries.append({
+            "id": t.get("id"),
+            "transaction_id": t.get("id"),
+            "entry_type": "Expense",
+            "type": "Expense",
+            "transaction_type": "Vendor Expense / Bill",
+            "category": t.get("category") or "Vendor Expense",
+            "reference": t.get("reference") or t.get("id"),
+            "transaction_number": t.get("id"),
+            "payable_number": t.get("reference") or "—",
+            "payment_reference": t.get("id"),
+            "vendor_id": t.get("vendor_id"),
+            "vendor_name": t.get("vendor_name") or "—",
+            "description": t.get("description") or f"Vendor expense payable for {t.get('vendor_name') or 'vendor'}",
+            "transaction_date": d_str,
+            "date": d_str,
+            "currency": curr,
+            "debit": None,
+            "credit": amt,  # Credit represents the liability/bill created
+            "amount": amt,
+            "total_amount": amt,
+            "status": t.get("status") or "Completed",
+            "created_by_name": t.get("created_by_name") or "System Administrator",
+            "product_name": t.get("product_name"),
+            "product_code": t.get("product_code"),
+            "project_name": t.get("project_name"),
+            "source_module": "Finance"
+        })
+
+    # Sort chronologically
+    raw_entries.sort(key=lambda e: (e.get("transaction_date") or "", e.get("id") or ""))
+
+    # Apply filters
+    filtered_entries = []
+    for e in raw_entries:
+        if type_filter and type_filter != "all":
+            if type_filter not in (e.get("entry_type") or "").lower():
+                continue
+        if currency_filter and currency_filter != "ALL":
+            if e.get("currency", "").upper() != currency_filter:
+                continue
+        if search_term:
+            searchable = f"{e.get('vendor_name')} {e.get('reference')} {e.get('payable_number')} {e.get('payment_reference')} {e.get('description')} {e.get('category')}".lower()
+            if search_term not in searchable:
+                continue
+        filtered_entries.append(e)
+
+    # 3. Calculate Running Balances
+    running_balance = opening_balance
+    total_debits = 0.0
+    total_credits = 0.0
+    entries = []
+
+    for e in filtered_entries:
+        amt = float(e.get("amount") or 0.0)
+        curr = e.get("currency", "USD")
+        d_str = e.get("transaction_date")
+        amt_usd = convert_to_usd(amt, curr, d_str, inr_rate, setting)
+
+        if e.get("debit") is not None:
+            total_debits += amt_usd
+            running_balance -= amt_usd
+        else:
+            total_credits += amt_usd
+            running_balance += amt_usd
+
+        e["running_balance"] = running_balance
+        entries.append(e)
+
+    closing_balance = running_balance
+
+    return jsonify(json_ready({
+        "opening_balance": opening_balance,
+        "total_debits": total_debits,
+        "total_credits": total_credits,
+        "closing_balance": closing_balance,
+        "entries": entries
+    }))
+
 @app.route("/api/settings/currencies", methods=["GET", "POST"])
 def api_settings_currencies():
     # Keep hardcoded array
@@ -5401,38 +5955,74 @@ def api_treasury_dashboard():
     settled_revenue_ids = get_settled_revenue_ids(db)
     reserve_balance_match = reserve_balance_payout_clause(settled_revenue_ids)
 
-    # 2. Shared revenue = owner earnings + channel partner payouts (settled only; not contributions)
-    shared_revenue_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": {"$in": ["Stakeholder", "Channel Partner"]}, **reserve_balance_match}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
-    ]))
-    shared_revenue = shared_revenue_doc[0]["total"] if shared_revenue_doc else 0.0
-    
-    # 3. Partner Payouts (settled revenue only)
-    partner_paid_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Channel Partner", "status": "Paid", **reserve_balance_match}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]))
-    partner_paid = partner_paid_doc[0]["total"] if partner_paid_doc else 0.0
-    
-    partner_pending_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Channel Partner", "status": "Pending", **reserve_balance_match}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]))
-    partner_pending = partner_pending_doc[0]["total"] if partner_pending_doc else 0.0
-    
-    # 4. Stakeholder Payouts (settled revenue only)
-    stakeholder_paid_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Stakeholder", "status": "Paid", **reserve_balance_match}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]))
-    stakeholder_paid = stakeholder_paid_doc[0]["total"] if stakeholder_paid_doc else 0.0
-    
-    stakeholder_pending_doc = list(db.treasury_payouts.aggregate([
-        {"$match": {"payout_type": "Stakeholder", "status": "Pending", **reserve_balance_match}},
-        {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-    ]))
-    stakeholder_pending = stakeholder_pending_doc[0]["total"] if stakeholder_pending_doc else 0.0
+    # 2. Partner Payouts (from stakeholder_payout_receipts and non-duplicate treasury_payouts)
+    cp_paid_receipts = list(db.stakeholder_payout_receipts.find({
+        "recipient_type": "Channel Partner",
+        "status": "Paid"
+    }))
+    cp_paid_receipts_total = sum(float(r.get("paid_amount") if r.get("paid_amount") is not None else r.get("amount", 0.0)) for r in cp_paid_receipts)
+
+    cp_pending_receipts = list(db.stakeholder_payout_receipts.find({
+        "recipient_type": "Channel Partner",
+        "status": {"$in": ["Approved", "Pending Payment", "Partially Paid"]}
+    }))
+    cp_pending_receipts_total = sum(float(r.get("outstanding_amount") if r.get("outstanding_amount") is not None else r.get("amount", 0.0)) for r in cp_pending_receipts)
+
+    receipt_payout_ids = [r["id"] for r in cp_paid_receipts + cp_pending_receipts]
+    tp_partner_paid_docs = list(db.treasury_payouts.find({
+        "payout_type": {"$in": ["Channel Partner", "Channel Partner Payout"]},
+        "stakeholder_payout_id": {"$nin": receipt_payout_ids, "$eq": None},
+        "status": "Paid",
+        **reserve_balance_match
+    }))
+    tp_partner_paid_total = sum(float(r.get("amount") or 0.0) for r in tp_partner_paid_docs)
+
+    tp_partner_pending_docs = list(db.treasury_payouts.find({
+        "payout_type": {"$in": ["Channel Partner", "Channel Partner Payout"]},
+        "stakeholder_payout_id": {"$nin": receipt_payout_ids, "$eq": None},
+        "status": {"$in": ["Pending", "Pending Payment"]},
+        **reserve_balance_match
+    }))
+    tp_partner_pending_total = sum(float(r.get("amount") or 0.0) for r in tp_partner_pending_docs)
+
+    partner_paid = round(cp_paid_receipts_total + tp_partner_paid_total, 2)
+    partner_pending = round(cp_pending_receipts_total + tp_partner_pending_total, 2)
+
+    # 3. Stakeholder Payouts (from stakeholder_payout_receipts and non-duplicate treasury_payouts)
+    stk_paid_receipts = list(db.stakeholder_payout_receipts.find({
+        "recipient_type": "Stakeholder",
+        "status": "Paid"
+    }))
+    stk_paid_receipts_total = sum(float(r.get("paid_amount") if r.get("paid_amount") is not None else r.get("amount", 0.0)) for r in stk_paid_receipts)
+
+    stk_pending_receipts = list(db.stakeholder_payout_receipts.find({
+        "recipient_type": "Stakeholder",
+        "status": {"$in": ["Approved", "Pending Payment", "Partially Paid"]}
+    }))
+    stk_pending_receipts_total = sum(float(r.get("outstanding_amount") if r.get("outstanding_amount") is not None else r.get("amount", 0.0)) for r in stk_pending_receipts)
+
+    stk_receipt_ids = [r["id"] for r in stk_paid_receipts + stk_pending_receipts]
+    tp_stk_paid_docs = list(db.treasury_payouts.find({
+        "payout_type": {"$in": ["Stakeholder", "Stakeholder Payout"]},
+        "stakeholder_payout_id": {"$nin": stk_receipt_ids, "$eq": None},
+        "status": "Paid",
+        **reserve_balance_match
+    }))
+    tp_stk_paid_total = sum(float(r.get("amount") or 0.0) for r in tp_stk_paid_docs)
+
+    tp_stk_pending_docs = list(db.treasury_payouts.find({
+        "payout_type": {"$in": ["Stakeholder", "Stakeholder Payout"]},
+        "stakeholder_payout_id": {"$nin": stk_receipt_ids, "$eq": None},
+        "status": {"$in": ["Pending", "Pending Payment"]},
+        **reserve_balance_match
+    }))
+    tp_stk_pending_total = sum(float(r.get("amount") or 0.0) for r in tp_stk_pending_docs)
+
+    stakeholder_paid = round(stk_paid_receipts_total + tp_stk_paid_total, 2)
+    stakeholder_pending = round(stk_pending_receipts_total + tp_stk_pending_total, 2)
+
+    # 4. Total Shared Revenue = Owner earnings paid + Partner commissions paid
+    shared_revenue = round(stakeholder_paid + partner_paid, 2)
     
     # 5. Recent Payouts (settled revenue + manual reserve expenses)
     recent_payouts = list(db.treasury_payouts.aggregate([
@@ -5477,30 +6067,50 @@ def api_treasury_payment_stats():
     stakeholders = list(db.treasury_stakeholders.find({}))
     for s in stakeholders:
         sid = s.get("id")
-        earned_paid = 0.0
-        earned_pending = 0.0
-        contributed_amt = 0.0
+        sname = s.get("name")
         
-        earned_paid_doc = list(db.treasury_payouts.aggregate([
-            {"$match": {"payout_type": "Stakeholder", "stakeholder_id": sid, "status": "Paid", **reserve_balance_match}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]))
-        if earned_paid_doc:
-            earned_paid = earned_paid_doc[0]["total"]
+        rc_stk_paid = list(db.stakeholder_payout_receipts.find({
+            "recipient_type": "Stakeholder",
+            "$or": [{"stakeholder_id": sid}, {"recipient_id": sid}, {"stakeholder_name": sname}, {"recipient_name": sname}],
+            "status": "Paid"
+        }))
+        rc_stk_paid_amt = sum(float(r.get("paid_amount") if r.get("paid_amount") is not None else r.get("amount", 0.0)) for r in rc_stk_paid)
+
+        rc_stk_pending = list(db.stakeholder_payout_receipts.find({
+            "recipient_type": "Stakeholder",
+            "$or": [{"stakeholder_id": sid}, {"recipient_id": sid}, {"stakeholder_name": sname}, {"recipient_name": sname}],
+            "status": {"$in": ["Approved", "Pending Payment", "Partially Paid"]}
+        }))
+        rc_stk_pending_amt = sum(float(r.get("outstanding_amount") if r.get("outstanding_amount") is not None else r.get("amount", 0.0)) for r in rc_stk_pending)
+
+        stk_receipt_ids = [r["id"] for r in rc_stk_paid + rc_stk_pending]
+        tp_stk_paid = list(db.treasury_payouts.find({
+            "payout_type": {"$in": ["Stakeholder", "Stakeholder Payout"]},
+            "stakeholder_id": sid,
+            "stakeholder_payout_id": {"$nin": stk_receipt_ids, "$eq": None},
+            "status": "Paid",
+            **reserve_balance_match
+        }))
+        tp_stk_paid_amt = sum(float(r.get("amount") or 0.0) for r in tp_stk_paid)
+
+        tp_stk_pending = list(db.treasury_payouts.find({
+            "payout_type": {"$in": ["Stakeholder", "Stakeholder Payout"]},
+            "stakeholder_id": sid,
+            "stakeholder_payout_id": {"$nin": stk_receipt_ids, "$eq": None},
+            "status": {"$in": ["Pending", "Pending Payment"]},
+            **reserve_balance_match
+        }))
+        tp_stk_pending_amt = sum(float(r.get("amount") or 0.0) for r in tp_stk_pending)
+
+        earned_paid = round(rc_stk_paid_amt + tp_stk_paid_amt, 2)
+        earned_pending = round(rc_stk_pending_amt + tp_stk_pending_amt, 2)
         
-        earned_pending_doc = list(db.treasury_payouts.aggregate([
-            {"$match": {"payout_type": "Stakeholder", "stakeholder_id": sid, "status": "Pending", **reserve_balance_match}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]))
-        if earned_pending_doc:
-            earned_pending = earned_pending_doc[0]["total"]
-        
-        contrib_doc = list(db.treasury_payouts.aggregate([
-            {"$match": {"payout_type": "Stakeholder Contribution", "stakeholder_id": sid, **reserve_balance_match}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]))
-        if contrib_doc:
-            contributed_amt = contrib_doc[0]["total"]
+        contrib_docs = list(db.treasury_payouts.find({
+            "payout_type": "Stakeholder Contribution",
+            "stakeholder_id": sid,
+            **reserve_balance_match
+        }))
+        contributed_amt = round(sum(float(r.get("amount") or 0.0) for r in contrib_docs), 2)
         
         stk_list.append({
             "id": sid,
@@ -5518,22 +6128,43 @@ def api_treasury_payment_stats():
     partners = list(db.treasury_partners.find({}))
     for p in partners:
         pid = p.get("id")
-        paid_amt = 0.0
-        pending_amt = 0.0
+        pname = p.get("name")
         
-        # Aggregate paid
-        paid_doc = list(db.treasury_payouts.aggregate([
-            {"$match": {"payout_type": "Channel Partner", "partner_id": pid, "status": "Paid", **reserve_balance_match}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]))
-        if paid_doc: paid_amt = paid_doc[0]["total"]
-        
-        # Aggregate pending
-        pending_doc = list(db.treasury_payouts.aggregate([
-            {"$match": {"payout_type": "Channel Partner", "partner_id": pid, "status": "Pending", **reserve_balance_match}},
-            {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
-        ]))
-        if pending_doc: pending_amt = pending_doc[0]["total"]
+        rc_part_paid = list(db.stakeholder_payout_receipts.find({
+            "recipient_type": "Channel Partner",
+            "$or": [{"partner_id": pid}, {"recipient_id": pid}, {"partner_name": pname}, {"recipient_name": pname}],
+            "status": "Paid"
+        }))
+        rc_part_paid_amt = sum(float(r.get("paid_amount") if r.get("paid_amount") is not None else r.get("amount", 0.0)) for r in rc_part_paid)
+
+        rc_part_pending = list(db.stakeholder_payout_receipts.find({
+            "recipient_type": "Channel Partner",
+            "$or": [{"partner_id": pid}, {"recipient_id": pid}, {"partner_name": pname}, {"recipient_name": pname}],
+            "status": {"$in": ["Approved", "Pending Payment", "Partially Paid"]}
+        }))
+        rc_part_pending_amt = sum(float(r.get("outstanding_amount") if r.get("outstanding_amount") is not None else r.get("amount", 0.0)) for r in rc_part_pending)
+
+        part_receipt_ids = [r["id"] for r in rc_part_paid + rc_part_pending]
+        tp_part_paid = list(db.treasury_payouts.find({
+            "payout_type": {"$in": ["Channel Partner", "Channel Partner Payout"]},
+            "partner_id": pid,
+            "stakeholder_payout_id": {"$nin": part_receipt_ids, "$eq": None},
+            "status": "Paid",
+            **reserve_balance_match
+        }))
+        tp_part_paid_amt = sum(float(r.get("amount") or 0.0) for r in tp_part_paid)
+
+        tp_part_pending = list(db.treasury_payouts.find({
+            "payout_type": {"$in": ["Channel Partner", "Channel Partner Payout"]},
+            "partner_id": pid,
+            "stakeholder_payout_id": {"$nin": part_receipt_ids, "$eq": None},
+            "status": {"$in": ["Pending", "Pending Payment"]},
+            **reserve_balance_match
+        }))
+        tp_part_pending_amt = sum(float(r.get("amount") or 0.0) for r in tp_part_pending)
+
+        paid_amt = round(rc_part_paid_amt + tp_part_paid_amt, 2)
+        pending_amt = round(rc_part_pending_amt + tp_part_pending_amt, 2)
         
         part_list.append({
             "id": pid,
@@ -5981,8 +6612,13 @@ def api_hr_salary_transactions_bulk():
     records = (request.get_json() or {}).get("transactions") or []
     saved = []
     for item in records:
-        record_id = item.get("id") or f"salary-ledger-{get_next_sequence_value('hr_salary_transactions')}"
-        doc = {**item, "id": record_id, "updated_at": datetime.now(), "created_by_id": user["id"]}
+        req_id = (item.get("id") or "").strip()
+        if req_id.startswith("TXN"):
+            record_id = req_id
+        else:
+            seq = get_next_sequence_value("transactions")
+            record_id = f"TXN{seq:03d}"
+        doc = {**item, "id": record_id, "display_id": record_id, "updated_at": datetime.now(), "created_by_id": user["id"]}
         db.hr_salary_transactions.update_one({"id": record_id}, {"$set": doc, "$setOnInsert": {"created_at": datetime.now()}}, upsert=True)
         saved.append(db.hr_salary_transactions.find_one({"id": record_id}, {"_id": 0}))
     return jsonify(json_ready({"transactions": saved}))
@@ -6081,7 +6717,12 @@ def api_hr_salary_ledger_payments():
     existing_transaction = db.hr_salary_transactions.find_one({"hr_payroll_record_ids": {"$in": record_ids}})
     if existing_transaction:
         return jsonify({"error": "Duplicate salary posting prevented for this salary period."}), 400
-    record_id = transaction.get("id") or f"salary-ledger-{get_next_sequence_value('hr_salary_transactions')}"
+    req_id = (transaction.get("id") or "").strip()
+    if req_id.startswith("TXN"):
+        record_id = req_id
+    else:
+        seq = get_next_sequence_value("transactions")
+        record_id = f"TXN{seq:03d}"
     reference = transaction.get("reference") or transaction.get("transaction_reference") or f"SAL-PAYABLE-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     tx_doc = {
         **transaction,
