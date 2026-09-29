@@ -826,6 +826,8 @@ def init_database():
     db.hr_payroll.create_index([("employee_record_id", 1), ("salary_year", 1), ("salary_month", 1)])
     db.hr_salary_transactions.create_index("id", unique=True)
     db.hr_settings.create_index("setting_key", unique=True)
+    sync_all_invoices_paid_status(db)
+
 
 
 @app.template_filter("date_or_dash")
@@ -2814,6 +2816,66 @@ APPROVED_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid"}
 POST_APPROVAL_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid", "Cancelled"}
 
 
+def sync_invoice_status_and_paid(db, invoice_id):
+    if not invoice_id:
+        return None
+    try:
+        inv_id = int(invoice_id)
+    except (ValueError, TypeError):
+        return None
+
+    inv = db.invoices.find_one({"id": inv_id})
+    if not inv:
+        return None
+
+    txs = list(db.transactions.find({
+        "invoice_id": inv_id,
+        "status": {"$ne": "Reversed"}
+    }))
+
+    total_paid = sum(
+        round(float(tx.get("total_amount") if tx.get("total_amount") is not None else tx.get("amount") or 0), 2)
+        for tx in txs
+    )
+    total_amount = round(float(inv.get("total_amount") or 0), 2)
+
+    amount_paid = min(total_paid, total_amount)
+    balance_due = max(0.0, round(total_amount - total_paid, 2))
+
+    if total_amount > 0 and total_paid >= total_amount - 0.001:
+        new_status = "Paid"
+        amount_paid = total_amount
+    elif total_paid > 0:
+        new_status = "Partially Paid"
+        amount_paid = total_paid
+    else:
+        current_status = inv.get("status")
+        if current_status in ["Paid", "Partially Paid"]:
+            new_status = "Approved"
+        else:
+            new_status = current_status
+        amount_paid = 0.0
+
+    db.invoices.update_one(
+        {"id": inv_id},
+        {"$set": {
+            "amount_paid": round(amount_paid, 2),
+            "status": new_status,
+            "updated_at": datetime.now()
+        }}
+    )
+    inv["amount_paid"] = round(amount_paid, 2)
+    inv["status"] = new_status
+    return inv
+
+
+def sync_all_invoices_paid_status(db):
+    invoices = list(db.invoices.find({}, {"id": 1}))
+    for inv in invoices:
+        if inv.get("id"):
+            sync_invoice_status_and_paid(db, inv["id"])
+
+
 def invoice_receipt_summary(invoice):
     paid = float(invoice.get("amount_paid") or 0)
     total = float(invoice.get("total_amount") or 0)
@@ -2993,9 +3055,14 @@ def api_finance_receivable_invoices():
     if not customer_id:
         return jsonify(json_ready({"invoices": []}))
 
+    customer_invs = list(db.invoices.find({"customer_id": int(customer_id)}, {"id": 1}))
+    for cinv in customer_invs:
+        if cinv.get("id"):
+            sync_invoice_status_and_paid(db, cinv["id"])
+
     query = {
         "customer_id": int(customer_id),
-        "status": {"$in": ["Approved", "Partially Paid"]},
+        "status": {"$in": ["Approved", "Partially Paid", "Sent", "Draft"]},
     }
     if account_id:
         matching_ids = get_matching_account_ids(db, account_id)
@@ -4402,18 +4469,26 @@ def api_finance_transactions():
             if not invoice_id:
                 return jsonify({"error": "Invoice number is required for Sales Revenue receipts."}), 400
             matching_ids = get_matching_account_ids(db, account_id)
+            sync_invoice_status_and_paid(db, invoice_id)
             invoice = db.invoices.find_one({
                 "id": invoice_id,
                 "customer_id": customer_id,
-                "status": {"$in": ["Approved", "Partially Paid"]},
                 "$or": [
                     {"account_id": {"$in": matching_ids}},
                     {"account_id": {"$exists": False}},
                     {"account_id": None},
                 ],
             })
-            if not invoice or (float(invoice.get("total_amount") or 0) <= float(invoice.get("amount_paid") or 0)):
-                return jsonify({"error": "Select an outstanding (approved or partially paid) invoice for this customer and account."}), 400
+            if not invoice:
+                return jsonify({"error": "Select a valid invoice for this customer and account."}), 400
+            inv_total = round(float(invoice.get("total_amount") or 0), 2)
+            inv_paid = round(float(invoice.get("amount_paid") or 0), 2)
+            rem_balance = max(0.0, round(inv_total - inv_paid, 2))
+            inv_num = invoice.get("invoice_number") or f"#{invoice_id}"
+            if invoice.get("status") == "Paid" or rem_balance <= 0.001:
+                return jsonify({"error": f"Invoice {inv_num} is already fully paid."}), 400
+            if total_amount > rem_balance + 0.001:
+                return jsonify({"error": f"Transaction amount ({total_amount:,.2f}) exceeds the remaining balance due ({rem_balance:,.2f}) for invoice {inv_num}."}), 400
             invoice_number = invoice.get("invoice_number")
         else:
             invoice_id = None
@@ -4554,6 +4629,9 @@ def api_finance_transactions():
             if not ((category == "Loan Disbursement" and linked_loan) or (category == "Loan Repayment" and linked_schedule) or linked_claim):
                 sync_transaction_to_treasury_revenue(db, insert_data)
 
+        if invoice_id:
+            sync_invoice_status_and_paid(db, invoice_id)
+
         log_activity_async("Finance", "Accounting Entry", transaction_id, "CREATE", new_data=insert_data, reference_number=data.get("reference"))
         return jsonify({"id": transaction_id})
         
@@ -4662,6 +4740,8 @@ def api_finance_transaction_detail(transaction_id):
             old_data=old_tx,
             reference_number=old_tx.get("reference"),
         )
+        if old_tx.get("invoice_id"):
+            sync_invoice_status_and_paid(db, old_tx.get("invoice_id"))
         return jsonify({"success": True})
 
     if request.method == "PUT":
@@ -4699,7 +4779,6 @@ def api_finance_transaction_detail(transaction_id):
             invoice = db.invoices.find_one({
                 "id": invoice_id,
                 "customer_id": customer_id,
-                "status": {"$in": INVOICE_RECEIPT_STATUSES},
                 "$or": [
                     {"account_id": {"$in": matching_ids}},
                     {"account_id": {"$exists": False}},
@@ -4707,7 +4786,21 @@ def api_finance_transaction_detail(transaction_id):
                 ],
             })
             if not invoice:
-                return jsonify({"error": "Select an approved, partially paid, or paid invoice for this customer and account."}), 400
+                return jsonify({"error": "Select a valid invoice for this customer and account."}), 400
+
+            other_txs = list(db.transactions.find({
+                "invoice_id": invoice_id,
+                "id": {"$ne": transaction_id},
+                "status": {"$ne": "Reversed"}
+            }))
+            other_paid = sum(round(float(tx.get("total_amount") if tx.get("total_amount") is not None else tx.get("amount") or 0), 2) for tx in other_txs)
+            inv_total = round(float(invoice.get("total_amount") or 0), 2)
+            rem_balance = max(0.0, round(inv_total - other_paid, 2))
+            inv_num = invoice.get("invoice_number") or f"#{invoice_id}"
+            if rem_balance <= 0.001:
+                return jsonify({"error": f"Invoice {inv_num} is already fully paid by other transactions."}), 400
+            if total_amount > rem_balance + 0.001:
+                return jsonify({"error": f"Transaction amount ({total_amount:,.2f}) exceeds the remaining balance due ({rem_balance:,.2f}) for invoice {inv_num}."}), 400
             invoice_number = invoice.get("invoice_number")
         else:
             invoice_id = None
@@ -4814,6 +4907,11 @@ def api_finance_transaction_detail(transaction_id):
             sync_transaction_to_treasury_revenue(db, new_tx)
         if new_tx.get("type") == "Expense" or db.expense_log.find_one({"transaction_id": transaction_id}):
             sync_transaction_to_expense_log(db, new_tx)
+        old_invoice_id = old_tx.get("invoice_id")
+        if old_invoice_id:
+            sync_invoice_status_and_paid(db, old_invoice_id)
+        if invoice_id:
+            sync_invoice_status_and_paid(db, invoice_id)
         log_activity_async("Finance", "Accounting Entry", transaction_id, "UPDATE", old_data=old_tx, new_data=new_tx, reference_number=new_tx.get("reference"))
         return jsonify({"success": True})
         
@@ -5114,6 +5212,7 @@ def api_invoice_detail(invoice_id):
                 "modified_by_name": actor_name
             }}
         )
+        sync_invoice_status_and_paid(db, invoice_id)
         new_inv = db.invoices.find_one({"id": invoice_id})
         log_activity_async("Finance", "Invoice", invoice_id, "UPDATE", old_data=old_inv, new_data=new_inv, reference_number=new_inv.get("invoice_number") if new_inv else None)
         return jsonify({"success": True})
