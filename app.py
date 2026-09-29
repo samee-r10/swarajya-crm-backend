@@ -566,6 +566,10 @@ def seed_native_standard_fields():
             ("IGST Amount", "igst_amount", "Number", 0),
             ("TDS Percent", "tds_percent", "Number", 0),
             ("TDS Amount", "tds_amount", "Number", 0),
+            ("Additional Charges Percent", "additional_charges_percent", "Number", 0),
+            ("Additional Charges", "additional_charges", "Number", 0),
+            ("Platform Fee Percent", "platform_fee_percent", "Number", 0),
+            ("Platform Fee Amount", "platform_fee_amount", "Number", 0),
             ("Total Amount", "total_amount", "Number", 1),
             ("Project", "project_id", "Number", 0),
         ],
@@ -611,12 +615,21 @@ def remove_hidden_setup_object_metadata(db):
 DEFAULT_ACCOUNTS = [
     {"name": "Cash on Hand", "gl_code": "1000", "type": "Asset"},
     {"name": "Bank Account", "gl_code": "1010", "type": "Asset"},
+    {"name": "CGST Input Tax Credit", "gl_code": "1020", "type": "Asset"},
+    {"name": "IGST Input Tax Credit", "gl_code": "1030", "type": "Asset"},
+    {"name": "TDS Receivable", "gl_code": "1040", "type": "Asset"},
+    {"name": "CGST Output Tax Payable", "gl_code": "2010", "type": "Liability"},
+    {"name": "IGST Output Tax Payable", "gl_code": "2020", "type": "Liability"},
+    {"name": "TDS Payable", "gl_code": "2030", "type": "Liability"},
     {"name": "Sales Revenue", "gl_code": "4000", "type": "Revenue"},
     {"name": "Subscription Revenue", "gl_code": "4010", "type": "Revenue"},
+    {"name": "Additional Charges Income", "gl_code": "4020", "type": "Revenue"},
     {"name": "Operating Expenses", "gl_code": "5000", "type": "Expense"},
     {"name": "Salary", "gl_code": "5010", "type": "Expense"},
     {"name": "Stakeholder Payout", "gl_code": "5020", "type": "Expense"},
     {"name": "Channel Partner Payout", "gl_code": "5030", "type": "Expense"},
+    {"name": "Payment Gateway & Platform Fees", "gl_code": "5040", "type": "Expense"},
+    {"name": "Additional Charges Expense", "gl_code": "5050", "type": "Expense"},
     {"name": "Employee Claims", "gl_code": "7010", "type": "Expense"},
 ]
 
@@ -640,11 +653,69 @@ def dedupe_accounts(accounts):
     return unique_accounts
 
 
+def calculate_account_balance(db, account, system_accounts=None):
+    if not system_accounts:
+        system_accounts = get_system_gl_accounts(db)
+        
+    acc_id = account.get("id")
+    gl_code = account.get("gl_code")
+    acc_type = account.get("type", "Revenue")
+    
+    matching_account_ids = [
+        doc["id"]
+        for doc in db.accounts.find({"gl_code": gl_code}, {"id": 1, "_id": 0})
+        if doc.get("id") is not None
+    ] if gl_code else [acc_id]
+
+    raw_txns = list(db.transactions.find({"status": {"$ne": "Reversed"}}))
+    total_debits = 0.0
+    total_credits = 0.0
+    
+    for t in raw_txns:
+        legs = expand_transaction_to_gl_legs(db, t, system_accounts)
+        for leg in legs:
+            leg_acc_id = safe_int(leg.get("account_id"))
+            leg_gl = str(leg.get("gl_code") or "").strip()
+            if (leg_acc_id and leg_acc_id in matching_account_ids) or (gl_code and leg_gl == str(gl_code).strip()):
+                if leg.get("credit") is not None:
+                    total_credits += float(leg["credit"] or 0.0)
+                if leg.get("debit") is not None:
+                    total_debits += float(leg["debit"] or 0.0)
+
+    sal_raw = list(db.hr_salary_transactions.find({}, {"_id": 0}))
+    for st in sal_raw:
+        txn_account_id = safe_int(st.get("account_id"))
+        sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
+        if txn_account_id in matching_account_ids:
+            total_debits += sal_amt
+        bank_acc = system_accounts.get("bank")
+        if bank_acc and bank_acc["id"] in matching_account_ids:
+            total_credits += sal_amt
+
+    if acc_type in ["Asset", "Expense"]:
+        balance = round(total_debits - total_credits, 2)
+    else:
+        balance = round(total_credits - total_debits, 2)
+        
+    return {
+        "balance": balance,
+        "total_debits": round(total_debits, 2),
+        "total_credits": round(total_credits, 2)
+    }
+
+
 def account_list(db, query=None, projection=None, sort=None):
+    system_accounts = get_system_gl_accounts(db)
     cursor = db.accounts.find(query or {}, projection or {"_id": 0})
     if sort:
         cursor = cursor.sort(sort)
-    return dedupe_accounts(list(cursor))
+    raw_list = dedupe_accounts(list(cursor))
+    for acc in raw_list:
+        bal_info = calculate_account_balance(db, acc, system_accounts)
+        acc["balance"] = bal_info["balance"]
+        acc["total_debits"] = bal_info["total_debits"]
+        acc["total_credits"] = bal_info["total_credits"]
+    return raw_list
 
 
 def repair_duplicate_account_ids(db):
@@ -676,7 +747,7 @@ def ensure_default_accounts(db):
                 updates["gl_code"] = account["gl_code"]
             if not existing.get("type"):
                 updates["type"] = account["type"]
-            if "is_active" not in existing:
+            if not existing.get("is_active"):
                 updates["is_active"] = 1
             if "show_in_income" not in existing:
                 updates["show_in_income"] = visibility["show_in_income"]
@@ -3003,16 +3074,18 @@ def api_finance_account_transactions(account_id):
     account = db.accounts.find_one({"id": account_id}, {"_id": 0})
     if not account:
         abort(404)
-    account_ids = [account_id]
-    if account.get("gl_code"):
-        account_ids = [
-            doc["id"]
-            for doc in db.accounts.find({"gl_code": account.get("gl_code")}, {"id": 1, "_id": 0})
-            if doc.get("id") is not None
-        ]
+        
+    gl_code = account.get("gl_code")
+    account_ids = [
+        doc["id"]
+        for doc in db.accounts.find({"gl_code": gl_code}, {"id": 1, "_id": 0})
+        if doc.get("id") is not None
+    ] if gl_code else [account_id]
 
-    transactions = list(db.transactions.aggregate([
-        {"$match": {"account_id": {"$in": account_ids}}},
+    system_accounts = get_system_gl_accounts(db)
+
+    raw_transactions = list(db.transactions.aggregate([
+        {"$match": {"status": {"$ne": "Reversed"}}},
         {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
         {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "vendors", "localField": "vendor_id", "foreignField": "id", "as": "vendor"}},
@@ -3026,10 +3099,10 @@ def api_finance_account_transactions(account_id):
         {"$lookup": {"from": "invoices", "localField": "invoice_id", "foreignField": "id", "as": "invoice"}},
         {"$unwind": {"path": "$invoice", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {
-            "account_name": account.get("name"),
-            "gl_code": account.get("gl_code"),
-            "gl_account_number": account.get("gl_code"),
-            "gl_account_name": account.get("name"),
+            "account_name": "$account.name",
+            "gl_code": "$account.gl_code",
+            "gl_account_number": "$account.gl_code",
+            "gl_account_name": "$account.name",
             "customer_name": "$customer.company_name",
             "vendor_name": "$vendor.name",
             "project_name": "$project.project_name",
@@ -3040,9 +3113,67 @@ def api_finance_account_transactions(account_id):
             "transaction_date": {"$ifNull": ["$transaction_date", "$date"]},
         }},
         {"$project": {"customer": 0, "vendor": 0, "project": 0, "invoice": 0, "_id": 0}},
-        {"$sort": {"transaction_date": -1, "created_at": -1, "id": -1}},
     ]))
-    return jsonify(json_ready({"account": account, "transactions": transactions}))
+
+    matching_legs = []
+    for t in raw_transactions:
+        legs = expand_transaction_to_gl_legs(db, t, system_accounts)
+        for leg in legs:
+            leg_acc_id = safe_int(leg.get("account_id"))
+            leg_gl = str(leg.get("gl_code") or "").strip()
+            if (leg_acc_id and leg_acc_id in account_ids) or (gl_code and leg_gl == str(gl_code).strip()):
+                leg_amt = leg.get("credit") if leg.get("credit") is not None else leg.get("debit")
+                matching_legs.append({
+                    **leg,
+                    "amount": leg_amt,
+                    "total_amount": leg_amt,
+                    "leg_amount": leg_amt,
+                })
+
+    salary_raw = list(db.hr_salary_transactions.find({}, {"_id": 0}))
+    for st in salary_raw:
+        txn_account_id = safe_int(st.get("account_id"))
+        sal_account = db.accounts.find_one({"id": txn_account_id}, {"_id": 0}) if txn_account_id else None
+        sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
+        sal_date = st.get("transaction_date") or str(st.get("created_at", ""))[:10]
+        
+        # Leg 1: Salary Expense (Debit)
+        exp_acc_id = txn_account_id
+        if exp_acc_id in account_ids:
+            matching_legs.append({
+                **st,
+                "leg_id": f"sal-{st.get('id')}-exp",
+                "type": "Expense",
+                "account_id": exp_acc_id,
+                "description": st.get("description") or st.get("category") or "Salary Expense",
+                "transaction_date": sal_date,
+                "debit": sal_amt,
+                "credit": None,
+                "amount": sal_amt,
+                "total_amount": sal_amt,
+                "leg_amount": sal_amt,
+            })
+            
+        # Leg 2: Bank Outflow (Credit)
+        bank_acc = system_accounts.get("bank")
+        bank_acc_id = bank_acc["id"] if bank_acc else None
+        if bank_acc_id in account_ids:
+            matching_legs.append({
+                **st,
+                "leg_id": f"sal-{st.get('id')}-bank",
+                "type": "Income",
+                "account_id": bank_acc_id,
+                "description": f"Salary Payment Outflow ({st.get('id')})",
+                "transaction_date": sal_date,
+                "debit": None,
+                "credit": sal_amt,
+                "amount": sal_amt,
+                "total_amount": sal_amt,
+                "leg_amount": sal_amt,
+            })
+
+    matching_legs.sort(key=lambda x: (x.get("transaction_date") or x.get("created_at") or ""), reverse=True)
+    return jsonify(json_ready({"account": account, "transactions": matching_legs}))
 
 
 @app.route("/api/finance/invoices/receivable")
@@ -4344,9 +4475,12 @@ def api_finance_dashboard():
     total_expenses_inr = 0.0
 
     for tx in transactions:
-        amount = float(tx.get("total_amount") or tx.get("amount") or 0.0)
-        currency = tx.get("currency", "USD")
+        amount = parse_float(tx.get("amount"))
+        add_chg = parse_float(tx.get("additional_charges") or tx.get("additional_charges_amount"))
+        platform_fee = parse_float(tx.get("platform_fee_amount") or tx.get("platform_charges"))
+        net_bank = parse_float(tx.get("total_amount"), amount - platform_fee + add_chg)
         
+        currency = tx.get("currency", "USD")
         tx_date = tx.get("transaction_date") or tx.get("date")
         month = tx_date[:7] if tx_date and len(tx_date) >= 7 else ""
         current_rate = inr_rate
@@ -4359,25 +4493,32 @@ def api_finance_dashboard():
             except Exception:
                 pass
                 
-        if currency == "USD":
-            amt_usd = amount
-            amt_inr = amount * current_rate
-        elif currency == "INR":
-            amt_usd = amount / current_rate
-            amt_inr = amount
-        else:
-            # Fallback for EUR/GBP etc.
-            amt_usd = amount
-            amt_inr = amount * current_rate
-            
         tx_type = tx.get("type")
         if tx_type in ["Credit", "Income"]:
-            total_revenue_usd += amt_usd
-            total_revenue_inr += amt_inr
-        elif tx_type in ["Debit", "Expense"]:
-            total_expenses_usd += amt_usd
-            total_expenses_inr += amt_inr
+            gross_income = amount + add_chg
+            fee_expense = platform_fee
             
+            total_revenue_usd += convert_to_usd(gross_income, currency, tx_date, current_rate, setting)
+            total_revenue_inr += gross_income if currency == "INR" else gross_income * current_rate
+            
+            if fee_expense > 0:
+                total_expenses_usd += convert_to_usd(fee_expense, currency, tx_date, current_rate, setting)
+                total_expenses_inr += fee_expense if currency == "INR" else fee_expense * current_rate
+        elif tx_type in ["Debit", "Expense"]:
+            base_expense = amount + add_chg + platform_fee
+            
+            total_expenses_usd += convert_to_usd(base_expense, currency, tx_date, current_rate, setting)
+            total_expenses_inr += base_expense if currency == "INR" else base_expense * current_rate
+            
+    # Include salary transactions in expenses
+    salary_txns = list(db.hr_salary_transactions.find({}, {"_id": 0}))
+    for st in salary_txns:
+        sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
+        sal_curr = st.get("currency", "INR")
+        sal_date = st.get("transaction_date") or str(st.get("created_at", ""))[:10]
+        total_expenses_usd += convert_to_usd(sal_amt, sal_curr, sal_date, inr_rate, setting)
+        total_expenses_inr += sal_amt if sal_curr == "INR" else sal_amt * inr_rate
+
     unpaid_invoices_count = db.invoices.count_documents({"status": {"$in": ["Draft", "Sent", "Partially Paid"]}})
     
     metrics = {
@@ -4447,8 +4588,32 @@ def api_finance_transactions():
         cgst_amount = round(amount * (cgst_percent / 100.0), 2)
         igst_amount = round(amount * (igst_percent / 100.0), 2)
         tds_amount = round(amount * (tds_percent / 100.0), 2)
+
+        additional_charges_percent = float(data.get("additional_charges_percent") or 0)
+        additional_charges = float(data.get("additional_charges") or data.get("additional_charges_amount") or 0)
+        if not additional_charges and additional_charges_percent:
+            additional_charges = round(amount * (additional_charges_percent / 100.0), 2)
+
+        platform_fee_percent = float(data.get("platform_fee_percent") or 0)
+        platform_fee_amount = float(data.get("platform_fee_amount") or data.get("platform_charges") or 0)
+        if not platform_fee_amount and platform_fee_percent:
+            platform_fee_amount = round(amount * (platform_fee_percent / 100.0), 2)
         
-        total_amount = round(amount + cgst_amount + igst_amount - tds_amount, 2)
+        transaction_type = data.get("type", "Income")
+        if transaction_type == "Income":
+            total_amount = round(amount + cgst_amount + igst_amount + additional_charges - tds_amount - platform_fee_amount, 2)
+            tot_debits = round(total_amount + platform_fee_amount + tds_amount, 2)
+            tot_credits = round(amount + additional_charges + cgst_amount + igst_amount, 2)
+        else:
+            total_amount = round(amount + cgst_amount + igst_amount + additional_charges + platform_fee_amount - tds_amount, 2)
+            tot_debits = round(amount + additional_charges + platform_fee_amount + cgst_amount + igst_amount, 2)
+            tot_credits = round(total_amount + tds_amount, 2)
+            
+        diff = round(abs(tot_debits - tot_credits), 2)
+        if diff > 0.01:
+            return jsonify({
+                "error": f"Journal entry is not balanced. Total Debit: ₹{tot_debits:,.2f}, Total Credit: ₹{tot_credits:,.2f}, Difference: ₹{diff:,.2f}."
+            }), 400
         
         date_val = data.get("transaction_date") or data.get("date")
         if not date_val:
@@ -4574,6 +4739,12 @@ def api_finance_transactions():
             "igst_amount": igst_amount,
             "tds_percent": tds_percent,
             "tds_amount": tds_amount,
+            "additional_charges_percent": additional_charges_percent,
+            "additional_charges": additional_charges,
+            "additional_charges_amount": additional_charges,
+            "platform_fee_percent": platform_fee_percent,
+            "platform_fee_amount": platform_fee_amount,
+            "platform_charges": platform_fee_amount,
             "total_amount": total_amount,
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
@@ -4754,8 +4925,32 @@ def api_finance_transaction_detail(transaction_id):
         cgst_amount = round(amount * (cgst_percent / 100.0), 2)
         igst_amount = round(amount * (igst_percent / 100.0), 2)
         tds_amount = round(amount * (tds_percent / 100.0), 2)
-        
-        total_amount = round(amount + cgst_amount + igst_amount - tds_amount, 2)
+
+        additional_charges_percent = float(data.get("additional_charges_percent") or 0)
+        additional_charges = float(data.get("additional_charges") or data.get("additional_charges_amount") or 0)
+        if not additional_charges and additional_charges_percent:
+            additional_charges = round(amount * (additional_charges_percent / 100.0), 2)
+
+        platform_fee_percent = float(data.get("platform_fee_percent") or 0)
+        platform_fee_amount = float(data.get("platform_fee_amount") or data.get("platform_charges") or 0)
+        if not platform_fee_amount and platform_fee_percent:
+            platform_fee_amount = round(amount * (platform_fee_percent / 100.0), 2)
+
+        transaction_type = data.get("type") or "Income"
+        if transaction_type == "Income":
+            total_amount = round(amount + cgst_amount + igst_amount + additional_charges - tds_amount - platform_fee_amount, 2)
+            tot_debits = round(total_amount + platform_fee_amount + tds_amount, 2)
+            tot_credits = round(amount + additional_charges + cgst_amount + igst_amount, 2)
+        else:
+            total_amount = round(amount + cgst_amount + igst_amount + additional_charges + platform_fee_amount - tds_amount, 2)
+            tot_debits = round(amount + additional_charges + platform_fee_amount + cgst_amount + igst_amount, 2)
+            tot_credits = round(total_amount + tds_amount, 2)
+
+        diff = round(abs(tot_debits - tot_credits), 2)
+        if diff > 0.01:
+            return jsonify({
+                "error": f"Journal entry is not balanced. Total Debit: ₹{tot_debits:,.2f}, Total Credit: ₹{tot_credits:,.2f}, Difference: ₹{diff:,.2f}."
+            }), 400
         
         date_val = data.get("transaction_date") or data.get("date")
         if not date_val:
@@ -4877,6 +5072,12 @@ def api_finance_transaction_detail(transaction_id):
             "igst_amount": igst_amount,
             "tds_percent": tds_percent,
             "tds_amount": tds_amount,
+            "additional_charges_percent": additional_charges_percent,
+            "additional_charges": additional_charges,
+            "additional_charges_amount": additional_charges,
+            "platform_fee_percent": platform_fee_percent,
+            "platform_fee_amount": platform_fee_amount,
+            "platform_charges": platform_fee_amount,
             "total_amount": total_amount,
             "updated_at": datetime.now(),
             "modified_by_id": actor_id,
@@ -5425,6 +5626,437 @@ def convert_to_usd(amount, currency, date_str, inr_rate, setting):
         return amount / current_rate
 
 
+def get_system_gl_accounts(db):
+    ensure_default_accounts(db)
+    system_map = {}
+    mappings = {
+        "bank": ("Bank Account", "1010", "Asset"),
+        "platform_fee": ("Payment Gateway & Platform Fees", "5040", "Expense"),
+        "additional_charges_income": ("Additional Charges Income", "4020", "Revenue"),
+        "additional_charges_expense": ("Additional Charges Expense", "5050", "Expense"),
+        "cgst_output": ("CGST Output Tax Payable", "2010", "Liability"),
+        "igst_output": ("IGST Output Tax Payable", "2020", "Liability"),
+        "cgst_input": ("CGST Input Tax Credit", "1020", "Asset"),
+        "igst_input": ("IGST Input Tax Credit", "1030", "Asset"),
+        "tds_receivable": ("TDS Receivable", "1040", "Asset"),
+        "tds_payable": ("TDS Payable", "2030", "Liability"),
+    }
+    for key, (name, gl_code, acc_type) in mappings.items():
+        acc = db.accounts.find_one({"$or": [{"gl_code": gl_code}, {"name": name}]})
+        if not acc:
+            acc_id = get_next_sequence_value("accounts")
+            visibility = default_account_visibility(acc_type)
+            acc = {
+                "id": acc_id,
+                "gl_code": gl_code,
+                "name": name,
+                "type": acc_type,
+                "is_active": 1,
+                **visibility,
+                "balance": 0,
+                "is_system_default": 1,
+                "created_at": datetime.now()
+            }
+            db.accounts.insert_one(acc)
+        system_map[key] = acc
+    return system_map
+
+
+def expand_transaction_to_gl_legs(db, t, system_accounts):
+    legs = []
+    t_id = str(t.get("id") or "")
+    t_type = t.get("type", "Income")
+    desc = (t.get("description") or "").strip()
+    
+    amount = round(float(t.get("amount") or 0.0), 2)
+    cgst_amount = round(float(t.get("cgst_amount") or 0.0), 2)
+    igst_amount = round(float(t.get("igst_amount") or 0.0), 2)
+    tds_amount = round(float(t.get("tds_amount") or 0.0), 2)
+    additional_charges = round(float(t.get("additional_charges") or t.get("additional_charges_amount") or 0.0), 2)
+    platform_fee = round(float(t.get("platform_fee_amount") or t.get("platform_charges") or 0.0), 2)
+    
+    if t_type == "Income":
+        total_amount = parse_float(t.get("total_amount"), amount + cgst_amount + igst_amount + additional_charges - tds_amount - platform_fee)
+    else:
+        total_amount = parse_float(t.get("total_amount"), amount + cgst_amount + igst_amount + additional_charges + platform_fee - tds_amount)
+
+    primary_acc_id = safe_int(t.get("account_id"))
+    primary_acc_name = t.get("account_name") or t.get("gl_account_name")
+    primary_gl_code = t.get("gl_code") or t.get("gl_account_number")
+
+    if primary_acc_id and (not primary_acc_name or not primary_gl_code):
+        acc_doc = db.accounts.find_one({"id": primary_acc_id})
+        if acc_doc:
+            primary_acc_name = primary_acc_name or acc_doc.get("name")
+            primary_gl_code = primary_gl_code or acc_doc.get("gl_code")
+
+    if not primary_gl_code:
+        primary_gl_code = "4000" if t_type == "Income" else "5000"
+    if not primary_acc_name:
+        primary_acc_name = "Subscription Revenue" if primary_gl_code == "4010" else ("Sales Revenue" if t_type == "Income" else "Operating Expenses")
+
+    if t_type == "Income":
+        # 1. Bank Account Net Receipt Leg (Debit)
+        if total_amount > 0:
+            acc = system_accounts.get("bank")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "1010")
+            acc_name = (acc or {}).get("name", "Bank Account")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-bank",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Asset",
+                "account_type": "Asset",
+                "debit": total_amount,
+                "credit": None,
+                "debit_amount": total_amount,
+                "credit_amount": 0.0,
+                "leg_amount": total_amount,
+                "amount": total_amount,
+                "description": f"Net Settlement Received in Bank ({t_id})",
+            })
+
+        # 2. Payment Gateway & Platform Fees Leg (Debit)
+        if platform_fee > 0:
+            acc = system_accounts.get("platform_fee")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "5040")
+            acc_name = (acc or {}).get("name", "Payment Gateway & Platform Fees")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-platform-fee",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Expense",
+                "account_type": "Expense",
+                "debit": platform_fee,
+                "credit": None,
+                "debit_amount": platform_fee,
+                "credit_amount": 0.0,
+                "leg_amount": platform_fee,
+                "amount": platform_fee,
+                "description": f"Payment Gateway / Platform Fee ({t.get('platform_fee_percent', 0)}%)",
+            })
+
+        # 3. TDS Receivable Leg (Debit)
+        if tds_amount > 0:
+            acc = system_accounts.get("tds_receivable")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "1040")
+            acc_name = (acc or {}).get("name", "TDS Receivable")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-tds",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Asset",
+                "account_type": "Asset",
+                "debit": tds_amount,
+                "credit": None,
+                "debit_amount": tds_amount,
+                "credit_amount": 0.0,
+                "leg_amount": tds_amount,
+                "amount": tds_amount,
+                "description": f"TDS Receivable Asset ({t.get('tds_percent', 0)}%)",
+            })
+
+        # 4. Primary Revenue Leg (Credit)
+        if amount > 0:
+            rev_desc = desc or ("Gross Subscription Revenue" if primary_gl_code == "4010" else f"Gross Sales Revenue ({primary_acc_name})")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-rev",
+                "account_id": primary_acc_id,
+                "gl_code": primary_gl_code,
+                "gl_account_number": primary_gl_code,
+                "account_name": primary_acc_name,
+                "gl_account_name": primary_acc_name,
+                "type": "Income",
+                "account_type": "Revenue",
+                "debit": None,
+                "credit": amount,
+                "debit_amount": 0.0,
+                "credit_amount": amount,
+                "leg_amount": amount,
+                "amount": amount,
+                "description": rev_desc,
+            })
+        
+        # 5. Additional Charges Income Leg (Credit)
+        if additional_charges > 0:
+            acc = system_accounts.get("additional_charges_income")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "4020")
+            acc_name = (acc or {}).get("name", "Additional Charges Income")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-add-chg",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Income",
+                "account_type": "Revenue",
+                "debit": None,
+                "credit": additional_charges,
+                "debit_amount": 0.0,
+                "credit_amount": additional_charges,
+                "leg_amount": additional_charges,
+                "amount": additional_charges,
+                "description": f"Additional Charges Income ({t.get('additional_charges_percent', 0)}%)",
+            })
+
+        # 6. CGST Output Tax Payable Leg (Credit)
+        if cgst_amount > 0:
+            acc = system_accounts.get("cgst_output")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "2010")
+            acc_name = (acc or {}).get("name", "CGST Output Tax Payable")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-cgst",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Liability",
+                "account_type": "Liability",
+                "debit": None,
+                "credit": cgst_amount,
+                "debit_amount": 0.0,
+                "credit_amount": cgst_amount,
+                "leg_amount": cgst_amount,
+                "amount": cgst_amount,
+                "description": f"CGST Output Tax Payable ({t.get('cgst_percent', 0)}%)",
+            })
+
+        # 7. IGST Output Tax Payable Leg (Credit)
+        if igst_amount > 0:
+            acc = system_accounts.get("igst_output")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "2020")
+            acc_name = (acc or {}).get("name", "IGST Output Tax Payable")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-igst",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Liability",
+                "account_type": "Liability",
+                "debit": None,
+                "credit": igst_amount,
+                "debit_amount": 0.0,
+                "credit_amount": igst_amount,
+                "leg_amount": igst_amount,
+                "amount": igst_amount,
+                "description": f"IGST Output Tax Payable ({t.get('igst_percent', 0)}%)",
+            })
+
+    else: # Expense
+        # 1. Primary Expense Leg (Debit)
+        if amount > 0:
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-exp",
+                "account_id": primary_acc_id,
+                "gl_code": primary_gl_code,
+                "gl_account_number": primary_gl_code,
+                "account_name": primary_acc_name,
+                "gl_account_name": primary_acc_name,
+                "type": "Expense",
+                "account_type": "Expense",
+                "debit": amount,
+                "credit": None,
+                "debit_amount": amount,
+                "credit_amount": 0.0,
+                "leg_amount": amount,
+                "amount": amount,
+                "description": desc or f"Base Operating Expense ({primary_acc_name})",
+            })
+
+        # 2. Additional Charges Expense Leg (Debit)
+        if additional_charges > 0:
+            acc = system_accounts.get("additional_charges_expense")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "5050")
+            acc_name = (acc or {}).get("name", "Additional Charges Expense")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-add-chg",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Expense",
+                "account_type": "Expense",
+                "debit": additional_charges,
+                "credit": None,
+                "debit_amount": additional_charges,
+                "credit_amount": 0.0,
+                "leg_amount": additional_charges,
+                "amount": additional_charges,
+                "description": f"Additional Charges Expense ({t.get('additional_charges_percent', 0)}%)",
+            })
+
+        # 3. Payment Gateway / Platform Fees Leg (Debit)
+        if platform_fee > 0:
+            acc = system_accounts.get("platform_fee")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "5040")
+            acc_name = (acc or {}).get("name", "Payment Gateway & Platform Fees")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-platform-fee",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Expense",
+                "account_type": "Expense",
+                "debit": platform_fee,
+                "credit": None,
+                "debit_amount": platform_fee,
+                "credit_amount": 0.0,
+                "leg_amount": platform_fee,
+                "amount": platform_fee,
+                "description": f"Payment Gateway / Platform Fee ({t.get('platform_fee_percent', 0)}%)",
+            })
+
+        # 4. CGST Input Tax Credit Leg (Debit)
+        if cgst_amount > 0:
+            acc = system_accounts.get("cgst_input")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "1020")
+            acc_name = (acc or {}).get("name", "CGST Input Tax Credit")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-cgst",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Asset",
+                "account_type": "Asset",
+                "debit": cgst_amount,
+                "credit": None,
+                "debit_amount": cgst_amount,
+                "credit_amount": 0.0,
+                "leg_amount": cgst_amount,
+                "amount": cgst_amount,
+                "description": f"CGST Input Tax Credit ({t.get('cgst_percent', 0)}%)",
+            })
+
+        # 5. IGST Input Tax Credit Leg (Debit)
+        if igst_amount > 0:
+            acc = system_accounts.get("igst_input")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "1030")
+            acc_name = (acc or {}).get("name", "IGST Input Tax Credit")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-igst",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Asset",
+                "account_type": "Asset",
+                "debit": igst_amount,
+                "credit": None,
+                "debit_amount": igst_amount,
+                "credit_amount": 0.0,
+                "leg_amount": igst_amount,
+                "amount": igst_amount,
+                "description": f"IGST Input Tax Credit ({t.get('igst_percent', 0)}%)",
+            })
+
+        # 6. TDS Payable Leg (Credit)
+        if tds_amount > 0:
+            acc = system_accounts.get("tds_payable")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "2030")
+            acc_name = (acc or {}).get("name", "TDS Payable")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-tds",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Liability",
+                "account_type": "Liability",
+                "debit": None,
+                "credit": tds_amount,
+                "debit_amount": 0.0,
+                "credit_amount": tds_amount,
+                "leg_amount": tds_amount,
+                "amount": tds_amount,
+                "description": f"TDS Payable Liability ({t.get('tds_percent', 0)}%)",
+            })
+
+        # 7. Bank Account Outflow Leg (Credit)
+        if total_amount > 0:
+            acc = system_accounts.get("bank")
+            acc_id = acc["id"] if acc else None
+            gl_code = (acc or {}).get("gl_code", "1010")
+            acc_name = (acc or {}).get("name", "Bank Account")
+            legs.append({
+                **t,
+                "id": t_id,
+                "leg_id": f"{t_id}-bank",
+                "account_id": acc_id,
+                "gl_code": gl_code,
+                "gl_account_number": gl_code,
+                "account_name": acc_name,
+                "gl_account_name": acc_name,
+                "type": "Asset",
+                "account_type": "Asset",
+                "debit": None,
+                "credit": total_amount,
+                "debit_amount": 0.0,
+                "credit_amount": total_amount,
+                "leg_amount": total_amount,
+                "amount": total_amount,
+                "description": f"Net Cash Outflow from Bank ({t_id})",
+            })
+
+    return legs
+
+
 @app.route("/api/finance/reports/general-ledger")
 def api_gl_report():
     require_finance_access()
@@ -5444,29 +6076,29 @@ def api_gl_report():
         except Exception:
             pass
 
+    system_accounts = get_system_gl_accounts(db)
+
     # 1. Compute opening balance of previous transactions (normalized to USD)
     opening_balance = 0.0
     if start_date:
         opening_query = {"date": {"$lt": start_date}, "status": {"$ne": "Reversed"}}
-        if account_id:
-            opening_query["account_id"] = int(account_id)
-            
         opening_txns = list(db.transactions.find(opening_query))
         for t in opening_txns:
-            amt = float(t.get("total_amount") or t.get("amount") or 0.0)
-            currency = t.get("currency", "USD")
-            txn_date = t.get("transaction_date") or t.get("date")
-            amt_usd = convert_to_usd(amt, currency, txn_date, inr_rate, setting)
-            
-            if t.get("type") == "Income":
-                opening_balance += amt_usd
-            else:
-                opening_balance -= amt_usd
+            legs = expand_transaction_to_gl_legs(db, t, system_accounts)
+            if account_id:
+                legs = [leg for leg in legs if leg.get("account_id") and int(leg["account_id"]) == int(account_id)]
+            for leg in legs:
+                leg_amt = float(leg.get("credit") or leg.get("debit") or 0.0)
+                currency = leg.get("currency", "USD")
+                txn_date = leg.get("transaction_date") or leg.get("date")
+                amt_usd = convert_to_usd(leg_amt, currency, txn_date, inr_rate, setting)
+                if leg.get("credit") is not None:
+                    opening_balance += amt_usd
+                else:
+                    opening_balance -= amt_usd
                 
     # 2. Fetch period transactions from main finance transactions
     period_query = {"status": {"$ne": "Reversed"}}
-    if account_id:
-        period_query["account_id"] = int(account_id)
     if start_date and end_date:
         period_query["date"] = {"$gte": start_date, "$lte": end_date}
     elif start_date:
@@ -5474,7 +6106,7 @@ def api_gl_report():
     elif end_date:
         period_query["date"] = {"$lte": end_date}
         
-    transactions = list(db.transactions.aggregate([
+    raw_transactions = list(db.transactions.aggregate([
         {"$match": period_query},
         {"$lookup": {"from": "accounts", "localField": "account_id", "foreignField": "id", "as": "account"}},
         {"$unwind": {"path": "$account", "preserveNullAndEmptyArrays": True}},
@@ -5502,6 +6134,13 @@ def api_gl_report():
         {"$sort": {"transaction_date": 1}}
     ]))
 
+    period_legs = []
+    for t in raw_transactions:
+        legs = expand_transaction_to_gl_legs(db, t, system_accounts)
+        if account_id:
+            legs = [leg for leg in legs if leg.get("account_id") and int(leg["account_id"]) == int(account_id)]
+        period_legs.extend(legs)
+
     # 2b. Fetch salary transactions from hr_salary_transactions and merge into GL
     salary_date_query = {}
     if start_date and end_date:
@@ -5517,63 +6156,123 @@ def api_gl_report():
 
     for st in salary_transactions_raw:
         txn_account_id = safe_int(st.get("account_id"))
-        # If a specific account filter is active, skip salary txns not tied to that account
-        if account_id and txn_account_id != int(account_id):
-            continue
         sal_account = db.accounts.find_one({"id": txn_account_id}, {"_id": 0}) if txn_account_id else None
-        # Normalise the salary entry into a GL-compatible format
-        sal_entry = {
+        sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
+        sal_date = st.get("transaction_date") or str(st.get("created_at", ""))[:10]
+        
+        # Leg 1: Salary Expense (Debit)
+        exp_acc_id = txn_account_id
+        exp_gl_code = (sal_account or {}).get("gl_code") or st.get("gl_code") or "5010"
+        exp_acc_name = (sal_account or {}).get("name") or st.get("account_name") or "Salary"
+        
+        sal_exp_leg = {
             **st,
+            "leg_id": f"sal-{st.get('id')}-exp",
             "type": "Expense",
-            "status": st.get("status") or "Pending Payable",
-            "gl_account_number": (sal_account or {}).get("gl_code") or st.get("gl_code"),
-            "gl_account_name": (sal_account or {}).get("name") or st.get("account_name"),
+            "account_id": exp_acc_id,
+            "gl_code": exp_gl_code,
+            "gl_account_number": exp_gl_code,
+            "account_name": exp_acc_name,
+            "gl_account_name": exp_acc_name,
             "source_module": "HR Salary",
-            "description": st.get("description") or st.get("category") or "Salary Payable",
-            "transaction_date": st.get("transaction_date") or str(st.get("created_at", ""))[:10],
-            "date": st.get("transaction_date") or str(st.get("created_at", ""))[:10],
+            "description": st.get("description") or st.get("category") or "Salary Expense",
+            "transaction_date": sal_date,
+            "date": sal_date,
             "currency": st.get("currency") or "INR",
-            "amount": parse_float(st.get("total_amount") or st.get("amount")),
-            "total_amount": parse_float(st.get("total_amount") or st.get("amount")),
+            "debit": sal_amt,
+            "credit": None,
+            "amount": sal_amt,
+            "total_amount": sal_amt,
         }
-        transactions.append(sal_entry)
+        
+        # Leg 2: Bank Account Outflow / Salary Payable (Credit)
+        bank_acc = system_accounts.get("bank")
+        bank_acc_id = bank_acc["id"] if bank_acc else None
+        bank_gl_code = (bank_acc or {}).get("gl_code", "1010")
+        bank_acc_name = (bank_acc or {}).get("name", "Bank Account")
+        
+        sal_bank_leg = {
+            **st,
+            "leg_id": f"sal-{st.get('id')}-bank",
+            "type": "Income",
+            "account_id": bank_acc_id,
+            "gl_code": bank_gl_code,
+            "gl_account_number": bank_gl_code,
+            "account_name": bank_acc_name,
+            "gl_account_name": bank_acc_name,
+            "source_module": "HR Salary",
+            "description": f"Salary Payment Outflow ({st.get('id')})",
+            "transaction_date": sal_date,
+            "date": sal_date,
+            "currency": st.get("currency") or "INR",
+            "debit": None,
+            "credit": sal_amt,
+            "amount": sal_amt,
+            "total_amount": sal_amt,
+        }
 
-    # Sort all entries together by transaction_date
-    transactions.sort(key=lambda t: (t.get("transaction_date") or t.get("date") or ""))
+        sal_legs = [sal_exp_leg, sal_bank_leg]
+        if account_id:
+            sal_legs = [l for l in sal_legs if l.get("account_id") and int(l["account_id"]) == int(account_id)]
+        period_legs.extend(sal_legs)
+
+    # Sort all legs together by transaction_date and leg_id
+    period_legs.sort(key=lambda t: (t.get("transaction_date") or t.get("date") or "", str(t.get("id") or ""), str(t.get("leg_id") or "")))
     
-    # 3. Calculate running balance and debit/credit columns (normalized to USD)
+    # 3. Calculate running balance and summary card metrics (normalized to USD)
     entries = []
     running_balance = opening_balance
     total_credits = 0.0
     total_debits = 0.0
     
-    for t in transactions:
-        amt = float(t.get("total_amount") or t.get("amount") or 0.0)
-        currency = t.get("currency", "USD")
-        txn_date = t.get("transaction_date") or t.get("date")
-        amt_usd = convert_to_usd(amt, currency, txn_date, inr_rate, setting)
-        
-        is_income = t.get("type") == "Income"
-        
-        debit = None
-        credit = None
-        
-        if is_income:
-            credit = amt
-            total_credits += amt_usd
-            running_balance += amt_usd
-        else:
-            debit = amt
-            total_debits += amt_usd
-            running_balance -= amt_usd
+    if account_id:
+        target_acc = db.accounts.find_one({"id": int(account_id)})
+        acc_type = (target_acc or {}).get("type")
+        for leg in period_legs:
+            amt = float(leg.get("credit") or leg.get("debit") or 0.0)
+            currency = leg.get("currency", "USD")
+            txn_date = leg.get("transaction_date") or leg.get("date")
+            amt_usd = convert_to_usd(amt, currency, txn_date, inr_rate, setting)
             
-        t["debit"] = debit
-        t["credit"] = credit
-        t["running_balance"] = running_balance
-        entries.append(t)
-        
-    closing_balance = running_balance
-    
+            if leg.get("credit") is not None:
+                total_credits += amt_usd
+                if acc_type in ["Asset", "Expense"]:
+                    running_balance -= amt_usd
+                else:
+                    running_balance += amt_usd
+            else:
+                total_debits += amt_usd
+                if acc_type in ["Asset", "Expense"]:
+                    running_balance += amt_usd
+                else:
+                    running_balance -= amt_usd
+                
+            leg["running_balance"] = running_balance
+            entries.append(leg)
+        closing_balance = running_balance
+    else:
+        total_credits = 0.0
+        total_debits = 0.0
+        for leg in period_legs:
+            d = float(leg.get("debit") or 0.0)
+            c = float(leg.get("credit") or 0.0)
+            currency = leg.get("currency", "USD")
+            txn_date = leg.get("transaction_date") or leg.get("date")
+            if d > 0:
+                total_debits += convert_to_usd(d, currency, txn_date, inr_rate, setting)
+            if c > 0:
+                total_credits += convert_to_usd(c, currency, txn_date, inr_rate, setting)
+
+            amt_usd = convert_to_usd(float(c or d or 0.0), currency, txn_date, inr_rate, setting)
+            if c > 0:
+                running_balance += amt_usd
+            else:
+                running_balance -= amt_usd
+            leg["running_balance"] = round(running_balance, 2)
+            entries.append(leg)
+
+        closing_balance = round(opening_balance + total_credits - total_debits, 2)
+
     return jsonify(json_ready({
         "opening_balance": opening_balance,
         "total_credits": total_credits,
