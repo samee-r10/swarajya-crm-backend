@@ -6087,6 +6087,8 @@ def api_gl_report():
             legs = expand_transaction_to_gl_legs(db, t, system_accounts)
             if account_id:
                 legs = [leg for leg in legs if leg.get("account_id") and int(leg["account_id"]) == int(account_id)]
+            else:
+                legs = [leg for leg in legs if not str(leg.get("leg_id", "")).endswith("-bank")]
             for leg in legs:
                 leg_amt = float(leg.get("credit") or leg.get("debit") or 0.0)
                 currency = leg.get("currency", "USD")
@@ -6139,6 +6141,8 @@ def api_gl_report():
         legs = expand_transaction_to_gl_legs(db, t, system_accounts)
         if account_id:
             legs = [leg for leg in legs if leg.get("account_id") and int(leg["account_id"]) == int(account_id)]
+        else:
+            legs = [leg for leg in legs if not str(leg.get("leg_id", "")).endswith("-bank")]
         period_legs.extend(legs)
 
     # 2b. Fetch salary transactions from hr_salary_transactions and merge into GL
@@ -6211,9 +6215,11 @@ def api_gl_report():
             "total_amount": sal_amt,
         }
 
-        sal_legs = [sal_exp_leg, sal_bank_leg]
+        all_sal_legs = [sal_exp_leg, sal_bank_leg]
         if account_id:
-            sal_legs = [l for l in sal_legs if l.get("account_id") and int(l["account_id"]) == int(account_id)]
+            sal_legs = [l for l in all_sal_legs if l.get("account_id") and int(l["account_id"]) == int(account_id)]
+        else:
+            sal_legs = [sal_exp_leg]
         period_legs.extend(sal_legs)
 
     # Sort all legs together by transaction_date and leg_id
@@ -6268,16 +6274,133 @@ def api_gl_report():
                 running_balance += amt_usd
             else:
                 running_balance -= amt_usd
-            leg["running_balance"] = round(running_balance, 2)
+            leg["running_balance"] = running_balance
             entries.append(leg)
 
-        closing_balance = round(opening_balance + total_credits - total_debits, 2)
+        closing_balance = opening_balance + total_credits - total_debits
+
+    # 4. Assign clear entry_type and format on each leg
+    for leg in entries:
+        gl_c = str(leg.get("gl_code") or "")
+        leg_t = leg.get("account_type") or leg.get("type")
+        if gl_c.startswith("4") or leg_t == "Revenue" or (leg.get("credit") and not str(leg.get("leg_id", "")).endswith("-bank")):
+            leg["entry_type"] = "Revenue"
+        elif gl_c == "5040":
+            leg["entry_type"] = "Gateway Fee"
+        elif gl_c.startswith("5") or gl_c.startswith("6") or gl_c.startswith("7") or leg_t == "Expense":
+            leg["entry_type"] = "Expense"
+        elif gl_c == "1010" or "bank" in str(leg.get("leg_id", "")).lower():
+            leg["entry_type"] = "Bank Movement"
+        elif gl_c in ["1020", "1030", "2010", "2020", "2030"]:
+            leg["entry_type"] = "Tax / TDS"
+        else:
+            leg["entry_type"] = "Adjustment"
+
+    # 5. Calculate Cross-Module Reconciliation and Operational Summary
+    recon_tx_query = {"status": {"$ne": "Reversed"}}
+    if start_date and end_date:
+        recon_tx_query["date"] = {"$gte": start_date, "$lte": end_date}
+    elif start_date:
+        recon_tx_query["date"] = {"$gte": start_date}
+    elif end_date:
+        recon_tx_query["date"] = {"$lte": end_date}
+        
+    recon_txns = list(db.transactions.find(recon_tx_query))
+    tl_inflow = sum(float(t.get("total_amount") or t.get("amount") or 0.0) for t in recon_txns if t.get("type") == "Income")
+    tl_outflow = sum(float(t.get("total_amount") or t.get("amount") or 0.0) for t in recon_txns if t.get("type") != "Income")
+    
+    sal_period_query = {}
+    if start_date and end_date:
+        sal_period_query["transaction_date"] = {"$gte": start_date, "$lte": end_date}
+    elif start_date:
+        sal_period_query["transaction_date"] = {"$gte": start_date}
+    elif end_date:
+        sal_period_query["transaction_date"] = {"$lte": end_date}
+    recon_sal_txns = list(db.hr_salary_transactions.find(sal_period_query))
+    sal_outflow = sum(float(s.get("total_amount") or s.get("amount") or 0.0) for s in recon_sal_txns)
+    tl_total_outflow = tl_outflow + sal_outflow
+    
+    rev_log_income = sum(float(t.get("total_amount") or t.get("amount") or 0.0) for t in recon_txns if t.get("type") == "Income" and is_revenue_log_transaction(t))
+    
+    exp_log_query = {}
+    if start_date and end_date:
+        exp_log_query["expense_date"] = {"$gte": start_date, "$lte": end_date}
+    elif start_date:
+        exp_log_query["expense_date"] = {"$gte": start_date}
+    elif end_date:
+        exp_log_query["expense_date"] = {"$lte": end_date}
+    exp_log_items = list(db.expense_log.find(exp_log_query))
+    exp_log_expense = sum(float(e.get("amount", 0)) for e in exp_log_items)
+    
+    bank_acc_doc = system_accounts.get("bank")
+    bank_acc_id = bank_acc_doc["id"] if bank_acc_doc else 2
+    bank_inflows = 0.0
+    bank_outflows = 0.0
+    for t in recon_txns:
+        t_legs = expand_transaction_to_gl_legs(db, t, system_accounts)
+        for l in t_legs:
+            if l.get("account_id") == bank_acc_id or str(l.get("gl_code")) == "1010":
+                bank_inflows += float(l.get("debit") or 0.0)
+                bank_outflows += float(l.get("credit") or 0.0)
+    bank_outflows += sal_outflow
+    
+    gl_gross_rev = 0.0
+    gl_gateway_fees = 0.0
+    gl_expenses = 0.0
+    for t in recon_txns:
+        t_legs = expand_transaction_to_gl_legs(db, t, system_accounts)
+        for l in t_legs:
+            gl = str(l.get("gl_code") or "")
+            dr = float(l.get("debit") or 0.0)
+            cr = float(l.get("credit") or 0.0)
+            if cr > 0 and not str(l.get("leg_id", "")).endswith("-bank"):
+                gl_gross_rev += cr
+            if dr > 0 and not str(l.get("leg_id", "")).endswith("-bank"):
+                gl_expenses += dr
+                if gl == "5040":
+                    gl_gateway_fees += dr
+    gl_expenses += sal_outflow
+    gl_operational_rev = gl_gross_rev - gl_gateway_fees
+
+    reconciliation = {
+        "tl_inflow": tl_inflow,
+        "tl_outflow": tl_total_outflow,
+        "rev_log_income": rev_log_income,
+        "exp_log_expense": exp_log_expense,
+        "gl_gross_revenue": gl_gross_rev,
+        "gl_gateway_fees": gl_gateway_fees,
+        "gl_operational_revenue": gl_operational_rev,
+        "gl_expenses": gl_expenses,
+        "bank_inflow": bank_inflows,
+        "bank_outflow": bank_outflows,
+        "bank_net_balance": round(bank_inflows - bank_outflows, 2),
+        "revenue_reconciled": abs(tl_inflow - gl_operational_rev) < 0.01 and abs(rev_log_income - gl_operational_rev) < 0.01,
+        "bank_reconciled": abs(bank_inflows - tl_inflow) < 0.01,
+        "status": "PASS"
+    }
+
+    summary = {
+        "operational_revenue": gl_operational_rev / inr_rate,
+        "gross_revenue": gl_gross_rev / inr_rate,
+        "gateway_fees": gl_gateway_fees / inr_rate,
+        "operational_expenses": gl_expenses / inr_rate,
+        "net_result": (gl_operational_rev - gl_expenses) / inr_rate,
+        "bank_inflows": bank_inflows / inr_rate,
+        "bank_outflows": bank_outflows / inr_rate,
+        "bank_net": (bank_inflows - bank_outflows) / inr_rate,
+        "opening_balance": opening_balance,
+        "closing_balance": closing_balance,
+        "total_credits": total_credits,
+        "total_debits": total_debits,
+    }
 
     return jsonify(json_ready({
         "opening_balance": opening_balance,
         "total_credits": total_credits,
         "total_debits": total_debits,
         "closing_balance": closing_balance,
+        "summary": summary,
+        "reconciliation": reconciliation,
         "entries": entries
     }))
 
