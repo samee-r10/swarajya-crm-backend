@@ -2,6 +2,7 @@ import json
 import mimetypes
 import os
 import re
+import time
 import hmac
 from base64 import urlsafe_b64encode
 from contextlib import contextmanager
@@ -183,19 +184,31 @@ def generate_password_hash(password):
         method = "scrypt" if hasattr(hashlib, "scrypt") else "pbkdf2:sha256:1000000"
     return werkzeug_generate_password_hash(password, method=method)
 
+_currencies_cache = None
+_currencies_cache_time = 0
+
 def get_active_currencies():
+    global _currencies_cache, _currencies_cache_time
+    now = time.time()
+    if _currencies_cache is not None and (now - _currencies_cache_time) < 120:
+        return _currencies_cache
     try:
-        row = fetch_one("SELECT setting_value FROM system_settings WHERE setting_key = 'currencies'")
-        if row and row["setting_value"]:
-            return json.loads(row["setting_value"])
+        db = get_db()
+        doc = db.system_settings.find_one({"setting_key": "currencies"})
+        if doc and doc.get("setting_value"):
+            _currencies_cache = json.loads(doc["setting_value"])
+            _currencies_cache_time = now
+            return _currencies_cache
     except Exception:
         pass
-    return [
+    _currencies_cache = [
         {"code": "USD", "symbol": "$"},
         {"code": "INR", "symbol": "\u20b9"},
         {"code": "EUR", "symbol": "\u20ac"},
         {"code": "GBP", "symbol": "\u00a3"}
     ]
+    _currencies_cache_time = now
+    return _currencies_cache
 
 
 def get_currency_symbols_dict():
@@ -215,9 +228,16 @@ def get_db():
         uri = os.getenv("MONGO_DB_URI")
         if not uri:
             raise ValueError("MONGO_DB_URI is not set in .env")
-        mongo_client = pymongo.MongoClient(uri)
-    # The database name is parsed from the URI or defaults to 'lms_crm' if not in URI.
-    # Actually for Atlas standard connection string, you specify db after /
+        mongo_client = pymongo.MongoClient(
+            uri,
+            maxPoolSize=50,
+            minPoolSize=0,
+            maxIdleTimeMS=60000,
+            connectTimeoutMS=20000,
+            socketTimeoutMS=20000,
+            serverSelectionTimeoutMS=20000,
+            retryWrites=True
+        )
     return mongo_client.get_database("lms_crm")
 
 def get_next_sequence_value(sequence_name):
@@ -704,12 +724,14 @@ def calculate_account_balance(db, account, system_accounts=None):
     }
 
 
-def account_list(db, query=None, projection=None, sort=None):
-    system_accounts = get_system_gl_accounts(db)
+def account_list(db, query=None, projection=None, sort=None, include_balances=True):
     cursor = db.accounts.find(query or {}, projection or {"_id": 0})
     if sort:
         cursor = cursor.sort(sort)
     raw_list = dedupe_accounts(list(cursor))
+    if not include_balances:
+        return raw_list
+    system_accounts = get_system_gl_accounts(db)
     for acc in raw_list:
         bal_info = calculate_account_balance(db, acc, system_accounts)
         acc["balance"] = bal_info["balance"]
@@ -737,7 +759,15 @@ def repair_duplicate_account_ids(db):
             )
 
 
+_default_accounts_ensured = False
+
 def ensure_default_accounts(db):
+    global _default_accounts_ensured
+    if _default_accounts_ensured:
+        return
+    if db.accounts.count_documents({}) >= len(DEFAULT_ACCOUNTS):
+        _default_accounts_ensured = True
+        return
     for account in DEFAULT_ACCOUNTS:
         existing = db.accounts.find_one({"name": account["name"]})
         visibility = default_account_visibility(account["type"])
@@ -785,6 +815,7 @@ def ensure_default_accounts(db):
             db.accounts.update_one({"id": account["id"]}, {"$set": updates})
 
     repair_duplicate_account_ids(db)
+    _default_accounts_ensured = True
 
 
 def init_database():
@@ -1608,8 +1639,44 @@ def api_pending_approval_center():
     return jsonify(json_ready({"approvals": pending_approval_items(db, user)}))
 
 
+@app.route("/api/approvals/eligible-delegates", methods=["GET"])
+def api_approvals_eligible_delegates():
+    require_current_user()
+    db = get_db()
+    users = list(db.app_users.find({"is_active": {"$ne": 0}}, {"_id": 0, "id": 1, "full_name": 1, "email": 1, "role_id": 1}).sort("full_name", 1))
+    stakeholders = list(db.treasury_stakeholders.find({"is_active": {"$ne": False}}, {"_id": 0, "id": 1, "name": 1, "linked_user_id": 1, "email": 1}))
+    stk_map = {s.get("linked_user_id"): s for s in stakeholders if s.get("linked_user_id")}
+    
+    delegates = []
+    for u in users:
+        stk = stk_map.get(u["id"])
+        delegates.append({
+            "id": u["id"],
+            "full_name": u.get("full_name") or "User",
+            "email": u.get("email"),
+            "stakeholder_id": stk["id"] if stk else None,
+            "stakeholder_name": stk["name"] if stk else None,
+            "is_stakeholder": bool(stk)
+        })
+    return jsonify(json_ready({"delegates": delegates}))
+
+
+_options_cache = None
+_options_cache_time = 0
+
+def invalidate_options_cache():
+    global _options_cache, _options_cache_time
+    _options_cache = None
+    _options_cache_time = 0
+
+
 @app.route("/api/options")
 def api_options():
+    global _options_cache, _options_cache_time
+    now = time.time()
+    if _options_cache is not None and (now - _options_cache_time) < 45:
+        return jsonify(_options_cache)
+
     db = get_db()
     ensure_default_accounts(db)
     customers_list = list(db.customers.find({}, {"_id": 0, "id": 1, "company_name": 1}).sort("company_name", 1))
@@ -1621,7 +1688,7 @@ def api_options():
         {"$sort": {"company_name": 1, "title": 1}}
     ]))
     
-    accounts = account_list(db, sort=[("name", 1)])
+    accounts = account_list(db, sort=[("name", 1)], include_balances=False)
     vendors = list(db.vendors.find({}, {"_id": 0, "id": 1, "name": 1}).sort("name", 1))
     projects_list = list(db.projects.find({}, {"_id": 0, "id": 1, "project_name": 1, "customer_id": 1, "product_id": 1, "product_code": 1, "product_name": 1}).sort("project_name", 1))
     products_list = list(db.products.find({"product_status": {"$ne": "Inactive"}}, {"_id": 0}).sort("product_name", 1))
@@ -1644,27 +1711,28 @@ def api_options():
     proj_status_field = db.custom_fields.find_one({"object_id": proj_obj["id"], "api_name": "status"}) if proj_obj else None
     project_statuses = json.loads(proj_status_field["picklist_options"]) if proj_status_field and proj_status_field.get("picklist_options") else PROJECT_STATUSES
     
-    return jsonify(
-        json_ready(
-            {
-                "customer_statuses": customer_statuses,
-                "opportunity_stages": opportunity_stages,
-                "project_statuses": project_statuses,
-                "currencies": CURRENCIES,
-                "customers": customers_list,
-                "opportunities": opportunities_list,
-                "accounts": accounts,
-                "vendors": vendors,
-                "projects": projects_list,
-                "products": products_list,
-                "payment_terms": active_master_option_names(db, "payment-terms"),
-                "payment_modes": active_master_option_names(db, "payment-modes"),
-                "bank_accounts": list(
-                    db.bank_accounts.find({"is_active": {"$ne": 0}}, {"_id": 0}).sort("label", 1)
-                ),
-            }
-        )
+    payload = json_ready(
+        {
+            "customer_statuses": customer_statuses,
+            "opportunity_stages": opportunity_stages,
+            "project_statuses": project_statuses,
+            "currencies": CURRENCIES,
+            "customers": customers_list,
+            "opportunities": opportunities_list,
+            "accounts": accounts,
+            "vendors": vendors,
+            "projects": projects_list,
+            "products": products_list,
+            "payment_terms": active_master_option_names(db, "payment-terms"),
+            "payment_modes": active_master_option_names(db, "payment-modes"),
+            "bank_accounts": list(
+                db.bank_accounts.find({"is_active": {"$ne": 0}}, {"_id": 0}).sort("label", 1)
+            ),
+        }
     )
+    _options_cache = payload
+    _options_cache_time = now
+    return jsonify(payload)
 
 
 ACCOUNT_TYPES = {"Asset", "Liability", "Equity", "Revenue", "Expense"}
@@ -1674,8 +1742,16 @@ def bool_flag(value):
     return 1 if value in (True, 1, "1", "true", "True", "on", "yes", "Yes") else 0
 
 
+_master_options_ensured = set()
+
 def ensure_master_options(db, config):
-    collection = db[config["collection"]]
+    collection_name = config["collection"]
+    if collection_name in _master_options_ensured:
+        return
+    _master_options_ensured.add(collection_name)
+    collection = db[collection_name]
+    if collection.count_documents({}) >= len(config["defaults"]):
+        return
     for name in config["defaults"]:
         if not collection.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}):
             option_id = get_next_sequence_value(config["counter"])
@@ -1687,6 +1763,7 @@ def ensure_master_options(db, config):
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
             })
+    _master_options_ensured.add(collection_name)
 
 
 def active_master_option_names(db, key):
@@ -2340,8 +2417,18 @@ def company_fund_available(db):
     accounts = list(db.company_bank_accounts.find({"status": {"$ne": "Inactive"}}))
     if not accounts:
         accounts = list(db.company_bank_accounts.find())
-    total = sum(bank_account_current_balance(db, acc["id"]) or 0.0 for acc in accounts)
-    return round(total, 2)
+    if not accounts:
+        return 0.0
+    acc_map = {acc["id"]: parse_float(acc.get("opening_balance")) for acc in accounts if "id" in acc}
+    acc_ids = list(acc_map.keys())
+    totals = list(db.company_bank_transactions.aggregate([
+        {"$match": {"bank_account_id": {"$in": acc_ids}}},
+        {"$group": {"_id": "$bank_account_id", "inflow": {"$sum": "$inflow"}, "outflow": {"$sum": "$outflow"}}}
+    ]))
+    total_balance = sum(acc_map.values())
+    for t in totals:
+        total_balance += (parse_float(t.get("inflow")) - parse_float(t.get("outflow")))
+    return round(total_balance, 2)
 
 
 def payout_recipient_payload(db, data, existing=None):
@@ -3197,11 +3284,21 @@ def api_finance_receivable_invoices():
     }
     if account_id:
         matching_ids = get_matching_account_ids(db, account_id)
-        query["$or"] = [
+        valid_acc_ids = [a["id"] for a in db.accounts.find({}, {"id": 1})]
+        sales_rev = db.accounts.find_one({"name": "Sales Revenue"})
+        sales_rev_ids = get_matching_account_ids(db, sales_rev["id"]) if sales_rev else []
+        is_sales_rev = any(aid in sales_rev_ids for aid in matching_ids)
+        
+        or_conditions = [
             {"account_id": {"$in": matching_ids}},
+            {"account_id": {"$nin": valid_acc_ids}},
             {"account_id": {"$exists": False}},
             {"account_id": None},
         ]
+        if is_sales_rev:
+            or_conditions.append({"account_id": {"$in": valid_acc_ids}})
+            
+        query["$or"] = or_conditions
 
     invoices = list(
         db.invoices.find(query, {"_id": 0}).sort([("issue_date", -1), ("invoice_number", -1)])
@@ -3779,11 +3876,36 @@ def api_customers():
         merge_client_fields(insert_data, data)
                 
         db.customers.insert_one(insert_data)
+        invalidate_options_cache()
         log_activity_async("Customers", "Customer", customer_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("company_name"))
         customer = db.customers.find_one({"id": customer_id}, {"_id": 0})
         return jsonify(json_ready({"customer": customer}))
         
-    customers = list(db.customers.find({}, {"_id": 0}).sort("created_at", -1))
+    page = request.args.get("page", type=int)
+    limit = request.args.get("limit", type=int) or request.args.get("pageSize", type=int)
+    search = (request.args.get("search") or "").strip()
+    status_filter = (request.args.get("status") or "").strip()
+
+    query = {}
+    if status_filter:
+        query["status"] = status_filter
+    if search:
+        query["$or"] = [
+            {"company_name": {"$regex": re.escape(search), "$options": "i"}},
+            {"contact_name": {"$regex": re.escape(search), "$options": "i"}},
+            {"email": {"$regex": re.escape(search), "$options": "i"}},
+            {"phone": {"$regex": re.escape(search), "$options": "i"}}
+        ]
+
+    total_count = None
+    if page and limit:
+        total_count = db.customers.count_documents(query)
+        customers = list(db.customers.find(query, {"_id": 0}).sort("created_at", -1).skip((page - 1) * limit).limit(limit))
+    elif query:
+        customers = list(db.customers.find(query, {"_id": 0}).sort("created_at", -1))
+    else:
+        customers = list(db.customers.find({}, {"_id": 0}).sort("created_at", -1))
+
     import json
     customer_obj = db.custom_objects.find_one({"api_name": "customers"})
     customer_status_field = db.custom_fields.find_one({"object_id": customer_obj["id"], "api_name": "status"}) if customer_obj else None
@@ -3794,11 +3916,16 @@ def api_customers():
     if customer_obj:
         fields = get_fields_for_user(customer_obj["id"])
         
-    return jsonify(json_ready({
+    resp_data = {
         "customers": customers,
         "statuses": customer_statuses,
         "fields": fields
-    }))
+    }
+    if total_count is not None:
+        resp_data["total"] = total_count
+        resp_data["page"] = page
+        resp_data["limit"] = limit
+    return jsonify(json_ready(resp_data))
 
 
 @app.route("/api/customers/<int:customer_id>", methods=["GET", "PUT"])
@@ -3914,6 +4041,7 @@ def api_opportunities():
         merge_client_fields(insert_data, data)
                 
         db.opportunities.insert_one(insert_data)
+        invalidate_options_cache()
         log_activity_async("Opportunities", "Opportunity", opportunity_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("opportunity_number"))
         
         opps = list(db.opportunities.aggregate([
@@ -3925,13 +4053,41 @@ def api_opportunities():
         ]))
         return jsonify(json_ready({"opportunity": opps[0]}))
         
-    opportunities = list(db.opportunities.aggregate([
+    page = request.args.get("page", type=int)
+    limit = request.args.get("limit", type=int) or request.args.get("pageSize", type=int)
+    search = (request.args.get("search") or "").strip()
+    stage_filter = (request.args.get("stage") or "").strip()
+
+    match_stage = {}
+    if stage_filter:
+        match_stage["stage"] = stage_filter
+    if search:
+        match_stage["$or"] = [
+            {"title": {"$regex": re.escape(search), "$options": "i"}},
+            {"opportunity_number": {"$regex": re.escape(search), "$options": "i"}},
+        ]
+
+    pipeline = []
+    if match_stage:
+        pipeline.append({"$match": match_stage})
+
+    total_count = None
+    if page and limit:
+        total_count = db.opportunities.count_documents(match_stage)
+
+    pipeline.extend([
         {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
         {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
         {"$addFields": {"company_name": "$customer.company_name"}},
         {"$project": {"_id": 0, "customer": 0}},
-        {"$sort": {"updated_at": -1}}
-    ]))
+        {"$sort": {"updated_at": -1, "id": -1}}
+    ])
+
+    if page and limit:
+        pipeline.append({"$skip": (page - 1) * limit})
+        pipeline.append({"$limit": limit})
+
+    opportunities = list(db.opportunities.aggregate(pipeline))
     import json
     opp_obj = db.custom_objects.find_one({"api_name": "opportunities"})
     opp_stage_field = db.custom_fields.find_one({"object_id": opp_obj["id"], "api_name": "stage"}) if opp_obj else None
@@ -3946,12 +4102,17 @@ def api_opportunities():
     currencies_records = list(db.currencies.find({}, {"_id": 0, "code": 1}))
     currencies_list = currencies_records if currencies_records else CURRENCIES
     
-    return jsonify(json_ready({
+    resp_data = {
         "opportunities": opportunities, 
         "stages": opportunity_stages, 
         "currencies": currencies_list,
         "fields": fields
-    }))
+    }
+    if total_count is not None:
+        resp_data["total"] = total_count
+        resp_data["page"] = page
+        resp_data["limit"] = limit
+    return jsonify(json_ready(resp_data))
 
 
 @app.route("/api/opportunities/<int:opportunity_id>", methods=["GET", "PUT"])
@@ -4217,6 +4378,7 @@ def api_projects():
         merge_client_fields(insert_data, data)
                 
         db.projects.insert_one(insert_data)
+        invalidate_options_cache()
         log_activity_async("Projects", "Project", project_id, "CREATE", new_data=insert_data, reference_number=insert_data.get("project_name"))
         
         projs = list(db.projects.aggregate([
@@ -4228,7 +4390,29 @@ def api_projects():
         ]))
         return jsonify(json_ready({"project": projs[0]}))
         
-    projects = list(db.projects.aggregate([
+    page = request.args.get("page", type=int)
+    limit = request.args.get("limit", type=int) or request.args.get("pageSize", type=int)
+    search = (request.args.get("search") or "").strip()
+    status_filter = (request.args.get("status") or "").strip()
+
+    match_stage = {}
+    if status_filter:
+        match_stage["status"] = status_filter
+    if search:
+        match_stage["$or"] = [
+            {"project_name": {"$regex": re.escape(search), "$options": "i"}},
+            {"owner": {"$regex": re.escape(search), "$options": "i"}},
+        ]
+
+    pipeline = []
+    if match_stage:
+        pipeline.append({"$match": match_stage})
+
+    total_count = None
+    if page and limit:
+        total_count = db.projects.count_documents(match_stage)
+
+    pipeline.extend([
         {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
         {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "opportunities", "localField": "opportunity_id", "foreignField": "id", "as": "opportunity"}},
@@ -4238,8 +4422,14 @@ def api_projects():
             "opportunity_title": "$opportunity.title"
         }},
         {"$project": {"_id": 0, "customer": 0, "opportunity": 0}},
-        {"$sort": {"updated_at": -1}}
-    ]))
+        {"$sort": {"updated_at": -1, "id": -1}}
+    ])
+
+    if page and limit:
+        pipeline.append({"$skip": (page - 1) * limit})
+        pipeline.append({"$limit": limit})
+
+    projects = list(db.projects.aggregate(pipeline))
     import json
     proj_obj = db.custom_objects.find_one({"api_name": "projects"})
     proj_status_field = db.custom_fields.find_one({"object_id": proj_obj["id"], "api_name": "status"}) if proj_obj else None
@@ -4254,12 +4444,17 @@ def api_projects():
     currencies_records = list(db.currencies.find({}, {"_id": 0, "code": 1}))
     currencies_list = currencies_records if currencies_records else CURRENCIES
     
-    return jsonify(json_ready({
+    resp_data = {
         "projects": projects, 
         "statuses": project_statuses, 
         "currencies": currencies_list,
         "fields": fields
-    }))
+    }
+    if total_count is not None:
+        resp_data["total"] = total_count
+        resp_data["page"] = page
+        resp_data["limit"] = limit
+    return jsonify(json_ready(resp_data))
 
 
 @app.route("/api/projects/<int:project_id>", methods=["GET", "PUT"])
@@ -4806,7 +5001,52 @@ def api_finance_transactions():
         log_activity_async("Finance", "Accounting Entry", transaction_id, "CREATE", new_data=insert_data, reference_number=data.get("reference"))
         return jsonify({"id": transaction_id})
         
-    transactions = list(db.transactions.aggregate([
+    page = request.args.get("page", type=int)
+    limit = request.args.get("limit", type=int) or request.args.get("pageSize", type=int)
+    search = (request.args.get("search") or "").strip()
+    txn_type = (request.args.get("type") or "").strip()
+    account_id = request.args.get("account_id", type=int)
+    customer_id = request.args.get("customer_id", type=int)
+    vendor_id = request.args.get("vendor_id", type=int)
+    project_id = request.args.get("project_id", type=int)
+    start_date = (request.args.get("start_date") or "").strip()
+    end_date = (request.args.get("end_date") or "").strip()
+
+    match_stage = {}
+    if txn_type:
+        match_stage["type"] = txn_type
+    if account_id:
+        match_stage["account_id"] = account_id
+    if customer_id:
+        match_stage["customer_id"] = customer_id
+    if vendor_id:
+        match_stage["vendor_id"] = vendor_id
+    if project_id:
+        match_stage["project_id"] = project_id
+    if start_date or end_date:
+        date_q = {}
+        if start_date:
+            date_q["$gte"] = start_date
+        if end_date:
+            date_q["$lte"] = end_date
+        match_stage["transaction_date"] = date_q
+    if search:
+        match_stage["$or"] = [
+            {"id": {"$regex": re.escape(search), "$options": "i"}},
+            {"description": {"$regex": re.escape(search), "$options": "i"}},
+            {"reference": {"$regex": re.escape(search), "$options": "i"}},
+            {"invoice_number": {"$regex": re.escape(search), "$options": "i"}},
+        ]
+
+    pipeline = []
+    if match_stage:
+        pipeline.append({"$match": match_stage})
+
+    total_count = None
+    if page and limit:
+        total_count = db.transactions.count_documents(match_stage)
+
+    pipeline.extend([
         {"$lookup": {"from": "accounts", "localField": "account_id", "foreignField": "id", "as": "account"}},
         {"$unwind": {"path": "$account", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
@@ -4837,10 +5077,22 @@ def api_finance_transactions():
         }},
         {"$project": {"account": 0, "customer": 0, "vendor": 0, "project": 0, "product": 0, "bank_account": 0, "invoice": 0, "_id": 0}},
         {"$sort": {"transaction_date": -1, "created_at": -1, "id": -1}}
-    ]))
+    ])
+
+    if page and limit:
+        pipeline.append({"$skip": (page - 1) * limit})
+        pipeline.append({"$limit": limit})
+
+    transactions = list(db.transactions.aggregate(pipeline))
     transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
     fields = get_fields_for_user(transaction_obj["id"]) if transaction_obj else []
-    return jsonify(json_ready({"transactions": transactions, "fields": fields}))
+
+    resp_data = {"transactions": transactions, "fields": fields}
+    if total_count is not None:
+        resp_data["total"] = total_count
+        resp_data["page"] = page
+        resp_data["limit"] = limit
+    return jsonify(json_ready(resp_data))
 
 @app.route("/api/finance/fixed-assets", methods=["GET"])
 def api_finance_fixed_assets():
@@ -5250,23 +5502,21 @@ def snapshot_invoice_payment_details(db, bank_account_id, invoice_number):
     return build_invoice_payment_details(bank, invoice_number)
 
 
-def attach_invoice_payment_details(inv_dict, db):
+def attach_invoice_payment_details(inv_dict, db, bank_map=None):
     snap = inv_dict.get("payment_details_snapshot")
     bank_id = inv_dict.get("bank_account_id")
-    if bank_id and db.company_bank_accounts.find_one({"id": int(bank_id)}, {"id": 1, "_id": 0}):
-        bank = find_invoice_bank_account(db, bank_id)
-        inv_dict["payment_details"] = build_invoice_payment_details(bank, inv_dict.get("invoice_number"))
-        return
+    if bank_id:
+        bank_id_int = int(bank_id) if str(bank_id).isdigit() else bank_id
+        bank = bank_map.get(bank_id_int) if bank_map is not None else find_invoice_bank_account(db, bank_id)
+        if bank:
+            inv_dict["payment_details"] = build_invoice_payment_details(bank, inv_dict.get("invoice_number"))
+            return
     if snap:
         details = dict(snap)
         details["payment_reference"] = inv_dict.get("invoice_number") or details.get("payment_reference", "")
         inv_dict["payment_details"] = details
         return
-    if bank_id:
-        bank = find_invoice_bank_account(db, bank_id)
-        inv_dict["payment_details"] = build_invoice_payment_details(bank, inv_dict.get("invoice_number"))
-    else:
-        inv_dict["payment_details"] = None
+    inv_dict["payment_details"] = None
 
 
 @app.route("/api/finance/invoices", methods=["GET", "POST"])
@@ -5340,7 +5590,32 @@ def api_invoices():
         log_activity_async("Finance", "Invoice", invoice_id, "CREATE", new_data=insert_data, reference_number=invoice_number)
         return jsonify({"id": invoice_id})
         
-    invoices = list(db.invoices.aggregate([
+    page = request.args.get("page", type=int)
+    limit = request.args.get("limit", type=int) or request.args.get("pageSize", type=int)
+    search = (request.args.get("search") or "").strip()
+    status_filter = (request.args.get("status") or "").strip()
+    customer_id = request.args.get("customer_id", type=int)
+
+    match_stage = {}
+    if status_filter:
+        match_stage["status"] = status_filter
+    if customer_id:
+        match_stage["customer_id"] = customer_id
+    if search:
+        match_stage["$or"] = [
+            {"invoice_number": {"$regex": re.escape(search), "$options": "i"}},
+            {"notes": {"$regex": re.escape(search), "$options": "i"}},
+        ]
+
+    pipeline = []
+    if match_stage:
+        pipeline.append({"$match": match_stage})
+
+    total_count = None
+    if page and limit:
+        total_count = db.invoices.count_documents(match_stage)
+
+    pipeline.extend([
         {"$lookup": {"from": "customers", "localField": "customer_id", "foreignField": "id", "as": "customer"}},
         {"$unwind": {"path": "$customer", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": "projects", "localField": "project_id", "foreignField": "id", "as": "project"}},
@@ -5354,12 +5629,27 @@ def api_invoices():
             "project_name": "$project.project_name"
         }},
         {"$project": {"customer": 0, "project": 0, "_id": 0}},
-        {"$sort": {"issue_date": -1}}
-    ]))
+        {"$sort": {"issue_date": -1, "id": -1}}
+    ])
+
+    if page and limit:
+        pipeline.append({"$skip": (page - 1) * limit})
+        pipeline.append({"$limit": limit})
+
+    invoices = list(db.invoices.aggregate(pipeline))
+    bank_docs = list(db.company_bank_accounts.find({}, {"_id": 0}))
+    bank_map = {b["id"]: b for b in bank_docs if b.get("id")}
+
     for inv in invoices:
         inv["invoice_date"] = inv.get("issue_date")
-        attach_invoice_payment_details(inv, db)
-    return jsonify(json_ready({"invoices": invoices}))
+        attach_invoice_payment_details(inv, db, bank_map)
+
+    resp_data = {"invoices": invoices}
+    if total_count is not None:
+        resp_data["total"] = total_count
+        resp_data["page"] = page
+        resp_data["limit"] = limit
+    return jsonify(json_ready(resp_data))
 
 @app.route("/api/finance/invoices/<int:invoice_id>", methods=["GET", "PUT", "DELETE"])
 def api_invoice_detail(invoice_id):
@@ -5610,14 +5900,18 @@ def convert_to_usd(amount, currency, date_str, inr_rate, setting):
     # Determine the rate for the transaction date (monthly override support)
     month = date_str[:7] if date_str and len(date_str) >= 7 else ""
     current_rate = inr_rate
-    if month and setting and setting.get("value"):
-        try:
-            rates_data = json.loads(setting["value"])
-            monthly_rates = rates_data.get("INR", {}).get("monthly", {})
-            if month in monthly_rates:
-                current_rate = monthly_rates[month]
-        except Exception:
-            pass
+    if month and setting:
+        monthly_rates = setting.get("_cached_monthly")
+        if monthly_rates is None and setting.get("value"):
+            try:
+                rates_data = json.loads(setting["value"])
+                monthly_rates = rates_data.get("INR", {}).get("monthly", {})
+                setting["_cached_monthly"] = monthly_rates
+            except Exception:
+                setting["_cached_monthly"] = {}
+                monthly_rates = {}
+        if monthly_rates and month in monthly_rates:
+            current_rate = monthly_rates[month]
             
     if currency == "INR":
         return amount / current_rate
@@ -5626,7 +5920,14 @@ def convert_to_usd(amount, currency, date_str, inr_rate, setting):
         return amount / current_rate
 
 
+_system_gl_accounts_cache = {"data": None, "ts": 0}
+
 def get_system_gl_accounts(db):
+    global _system_gl_accounts_cache
+    now = time.time()
+    if _system_gl_accounts_cache["data"] and (now - _system_gl_accounts_cache["ts"]) < 300:
+        return _system_gl_accounts_cache["data"]
+        
     ensure_default_accounts(db)
     system_map = {}
     mappings = {
@@ -5641,8 +5942,14 @@ def get_system_gl_accounts(db):
         "tds_receivable": ("TDS Receivable", "1040", "Asset"),
         "tds_payable": ("TDS Payable", "2030", "Liability"),
     }
+    gl_codes = [m[1] for m in mappings.values()]
+    names = [m[0] for m in mappings.values()]
+    found_accs = list(db.accounts.find({"$or": [{"gl_code": {"$in": gl_codes}}, {"name": {"$in": names}}]}))
+    acc_by_gl = {a.get("gl_code"): a for a in found_accs if a.get("gl_code")}
+    acc_by_name = {a.get("name"): a for a in found_accs if a.get("name")}
+
     for key, (name, gl_code, acc_type) in mappings.items():
-        acc = db.accounts.find_one({"$or": [{"gl_code": gl_code}, {"name": name}]})
+        acc = acc_by_gl.get(gl_code) or acc_by_name.get(name)
         if not acc:
             acc_id = get_next_sequence_value("accounts")
             visibility = default_account_visibility(acc_type)
@@ -5658,11 +5965,14 @@ def get_system_gl_accounts(db):
                 "created_at": datetime.now()
             }
             db.accounts.insert_one(acc)
+            acc_by_gl[gl_code] = acc
+            acc_by_name[name] = acc
         system_map[key] = acc
+    _system_gl_accounts_cache = {"data": system_map, "ts": now}
     return system_map
 
 
-def expand_transaction_to_gl_legs(db, t, system_accounts):
+def expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=None):
     legs = []
     t_id = str(t.get("id") or "")
     t_type = t.get("type", "Income")
@@ -5685,7 +5995,10 @@ def expand_transaction_to_gl_legs(db, t, system_accounts):
     primary_gl_code = t.get("gl_code") or t.get("gl_account_number")
 
     if primary_acc_id and (not primary_acc_name or not primary_gl_code):
-        acc_doc = db.accounts.find_one({"id": primary_acc_id})
+        if accounts_cache is not None:
+            acc_doc = accounts_cache.get(primary_acc_id)
+        else:
+            acc_doc = db.accounts.find_one({"id": primary_acc_id})
         if acc_doc:
             primary_acc_name = primary_acc_name or acc_doc.get("name")
             primary_gl_code = primary_gl_code or acc_doc.get("gl_code")
@@ -6077,6 +6390,8 @@ def api_gl_report():
             pass
 
     system_accounts = get_system_gl_accounts(db)
+    all_accounts = list(db.accounts.find({}, {"_id": 0, "id": 1, "name": 1, "gl_code": 1}))
+    accounts_cache = {a["id"]: a for a in all_accounts if "id" in a}
 
     # 1. Compute opening balance of previous transactions (normalized to USD)
     opening_balance = 0.0
@@ -6084,7 +6399,7 @@ def api_gl_report():
         opening_query = {"date": {"$lt": start_date}, "status": {"$ne": "Reversed"}}
         opening_txns = list(db.transactions.find(opening_query))
         for t in opening_txns:
-            legs = expand_transaction_to_gl_legs(db, t, system_accounts)
+            legs = expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=accounts_cache)
             if account_id:
                 legs = [leg for leg in legs if leg.get("account_id") and int(leg["account_id"]) == int(account_id)]
             else:
@@ -6138,7 +6453,7 @@ def api_gl_report():
 
     period_legs = []
     for t in raw_transactions:
-        legs = expand_transaction_to_gl_legs(db, t, system_accounts)
+        legs = expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=accounts_cache)
         if account_id:
             legs = [leg for leg in legs if leg.get("account_id") and int(leg["account_id"]) == int(account_id)]
         else:
@@ -6160,7 +6475,7 @@ def api_gl_report():
 
     for st in salary_transactions_raw:
         txn_account_id = safe_int(st.get("account_id"))
-        sal_account = db.accounts.find_one({"id": txn_account_id}, {"_id": 0}) if txn_account_id else None
+        sal_account = accounts_cache.get(txn_account_id) if txn_account_id else None
         sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
         sal_date = st.get("transaction_date") or str(st.get("created_at", ""))[:10]
         
@@ -6336,29 +6651,31 @@ def api_gl_report():
     bank_acc_id = bank_acc_doc["id"] if bank_acc_doc else 2
     bank_inflows = 0.0
     bank_outflows = 0.0
-    for t in recon_txns:
-        t_legs = expand_transaction_to_gl_legs(db, t, system_accounts)
-        for l in t_legs:
-            if l.get("account_id") == bank_acc_id or str(l.get("gl_code")) == "1010":
-                bank_inflows += float(l.get("debit") or 0.0)
-                bank_outflows += float(l.get("credit") or 0.0)
-    bank_outflows += sal_outflow
-    
     gl_gross_rev = 0.0
     gl_gateway_fees = 0.0
     gl_expenses = 0.0
+
     for t in recon_txns:
-        t_legs = expand_transaction_to_gl_legs(db, t, system_accounts)
+        t_legs = expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=accounts_cache)
         for l in t_legs:
+            acc_id = l.get("account_id")
             gl = str(l.get("gl_code") or "")
             dr = float(l.get("debit") or 0.0)
             cr = float(l.get("credit") or 0.0)
-            if cr > 0 and not str(l.get("leg_id", "")).endswith("-bank"):
+            is_bank_leg = str(l.get("leg_id", "")).endswith("-bank")
+
+            if acc_id == bank_acc_id or gl == "1010":
+                bank_inflows += dr
+                bank_outflows += cr
+
+            if cr > 0 and not is_bank_leg:
                 gl_gross_rev += cr
-            if dr > 0 and not str(l.get("leg_id", "")).endswith("-bank"):
+            if dr > 0 and not is_bank_leg:
                 gl_expenses += dr
                 if gl == "5040":
                     gl_gateway_fees += dr
+
+    bank_outflows += sal_outflow
     gl_expenses += sal_outflow
     gl_operational_rev = gl_gross_rev - gl_gateway_fees
 
@@ -6849,14 +7166,28 @@ def api_settings_exchange_rates():
         }
     })
 
+_last_treasury_sync_time = 0
+
+def run_treasury_maintenance_if_needed(db):
+    global _last_treasury_sync_time
+    now = time.time()
+    if now - _last_treasury_sync_time < 300:
+        return
+    try:
+        purge_orphaned_unsettled_transaction_revenue(db)
+        purge_unsettled_revenue_payouts(db)
+        normalize_stakeholder_flow_payouts(db)
+        sync_revenue_settlements_from_payables(db)
+    except Exception as e:
+        print(f"Treasury maintenance notice: {e}")
+    _last_treasury_sync_time = now
+
+
 @app.route("/api/treasury/dashboard", methods=["GET"])
 def api_treasury_dashboard():
     user = require_treasury_access()
     db = get_db()
-    purge_orphaned_unsettled_transaction_revenue(db)
-    purge_unsettled_revenue_payouts(db)
-    normalize_stakeholder_flow_payouts(db)
-    sync_revenue_settlements_from_payables(db)
+    run_treasury_maintenance_if_needed(db)
     
     # 1. Reserve Fund / Company Fund — total actual available funds in company accounts
     reserve_available = company_fund_available(db)
@@ -8585,7 +8916,8 @@ def api_pending_stakeholder_payout_approvals():
         attach_approval_user_names(db, [approval])
         normalize_payout_recipient(approval.get("payout"))
         attach_pending_approval_display(db, approval.get("payout"), "stakeholder_payout_approvals", "payout_id")
-        approval["can_act"] = approval.get("linked_user_id") == user["id"]
+        approval["can_act"] = approval.get("linked_user_id") == user["id"] or can_manage_payout_approvals(user, db)
+        approval["can_delegate"] = approval["can_act"]
     return jsonify(json_ready({"approvals": approvals}))
 
 
@@ -8599,9 +8931,12 @@ def api_stakeholder_payout_approval_action(approval_id):
     action = data.get("action")
     if action not in {"approve", "reject"}:
         return jsonify({"error": "Invalid approval action."}), 400
-    approval = db.stakeholder_payout_approvals.find_one({"id": approval_id, "linked_user_id": user["id"]})
+    approval = db.stakeholder_payout_approvals.find_one({"id": approval_id})
     if not approval or approval.get("status") != "Pending":
-        return jsonify({"error": "Approval task not found for this user."}), 404
+        return jsonify({"error": "Approval task not found or not pending."}), 404
+    can_act = approval.get("linked_user_id") == user["id"] or can_manage_payout_approvals(user, db)
+    if not can_act:
+        return jsonify({"error": "Approval task not authorized for this user."}), 403
     payout = db.stakeholder_payout_receipts.find_one({"id": approval.get("payout_id")})
     if not payout or not str(payout.get("status", "")).startswith("Pending"):
         return jsonify({"error": "Payout is not pending approval."}), 400
@@ -8640,6 +8975,101 @@ def api_stakeholder_payout_approval_action(approval_id):
     approved_payout = db.stakeholder_payout_receipts.find_one({"id": payout["id"]})
     create_or_update_payable_from_payout(db, approved_payout)
     return jsonify({"success": True, "status": "Pending Payment"})
+
+
+@app.route("/api/treasury/stakeholder-payout-approvals/<int:approval_id>/delegate", methods=["POST"])
+def api_stakeholder_payout_approval_delegate(approval_id):
+    if "user_id" not in session:
+        abort(401)
+    db = get_db()
+    user = get_current_user()
+    data = request.get_json() or {}
+    delegate_to_user_id = safe_int(data.get("delegate_to_user_id"))
+    remarks = (data.get("remarks") or "").strip()
+    if not delegate_to_user_id:
+        return jsonify({"error": "Target user is required for delegation."}), 400
+    
+    approval = db.stakeholder_payout_approvals.find_one({"id": approval_id})
+    if not approval or approval.get("status") != "Pending":
+        return jsonify({"error": "Approval task not found or not pending."}), 404
+        
+    can_delegate = approval.get("linked_user_id") == user["id"] or can_manage_payout_approvals(user, db)
+    if not can_delegate:
+        return jsonify({"error": "You do not have permission to delegate this approval."}), 403
+        
+    target_user = db.app_users.find_one({"id": delegate_to_user_id, "is_active": {"$ne": 0}})
+    if not target_user:
+        return jsonify({"error": "Target user not found or inactive."}), 404
+        
+    if approval.get("linked_user_id") == target_user["id"]:
+        return jsonify({"error": "Approval is already assigned to this user."}), 400
+
+    target_stakeholder = db.treasury_stakeholders.find_one({
+        "$or": [
+            {"linked_user_id": target_user["id"]},
+            {"email": target_user.get("email")}
+        ],
+        "is_active": {"$ne": False}
+    })
+    
+    prev_user_name = approval.get("stakeholder_name") or user.get("full_name") or "Approver"
+    now = datetime.now()
+    
+    update_doc = {
+        "linked_user_id": target_user["id"],
+        "delegated_from_user_id": approval.get("linked_user_id"),
+        "delegated_from_name": prev_user_name,
+        "delegated_by_id": user["id"],
+        "delegated_by_name": user.get("full_name"),
+        "delegated_at": now,
+        "delegation_remarks": remarks,
+        "updated_at": now
+    }
+    if target_stakeholder:
+        update_doc["stakeholder_id"] = target_stakeholder["id"]
+        update_doc["stakeholder_name"] = target_stakeholder["name"]
+        update_doc["email"] = target_stakeholder.get("email") or target_user.get("email")
+    else:
+        update_doc["stakeholder_name"] = target_user.get("full_name")
+        update_doc["email"] = target_user.get("email")
+        
+    db.stakeholder_payout_approvals.update_one({"id": approval_id}, {"$set": update_doc})
+    
+    db.stakeholder_payout_approval_audit.insert_one({
+        "id": get_next_sequence_value("stakeholder_payout_approval_audit"),
+        "payout_id": approval.get("payout_id"),
+        "approval_id": approval_id,
+        "approval_sequence": approval.get("approval_sequence"),
+        "action": "Delegated",
+        "remarks": f"Delegated from {prev_user_name} to {target_user.get('full_name')}. {remarks}".strip(),
+        "delegated_to_id": target_user["id"],
+        "delegated_to_name": target_user.get("full_name"),
+        "created_at": now,
+        "created_by_id": user["id"],
+    })
+    
+    new_status = pending_approval_status(db, "stakeholder_payout_approvals", "payout_id", approval.get("payout_id"), approval.get("approval_sequence"))
+    db.stakeholder_payout_receipts.update_one(
+        {"id": approval.get("payout_id")},
+        {"$set": {"status": new_status, "updated_at": now}}
+    )
+    
+    payout = db.stakeholder_payout_receipts.find_one({"id": approval.get("payout_id")})
+    payout_ref = payout.get("payout_number") if payout else f"Payout #{approval.get('payout_id')}"
+    create_system_notification(
+        db,
+        target_user["id"],
+        "Payout Approval Delegated",
+        f"{user.get('full_name')} delegated approval for {payout_ref} to you.",
+        "/treasury/stakeholder-payouts/approvals"
+    )
+    
+    return jsonify({
+        "success": True,
+        "status": new_status,
+        "delegated_to": target_user.get("full_name"),
+        "message": f"Successfully delegated approval to {target_user.get('full_name')}."
+    })
 
 
 @app.route("/api/treasury/channel-partners", methods=["GET", "POST"])
@@ -8806,9 +9236,15 @@ def api_pending_claim_approvals():
     if "user_id" not in session:
         abort(401)
     db = get_db()
+    user = get_current_user()
     user_id = session["user_id"]
+    role = db.roles.find_one({"id": user.get("role_id")}, {"_id": 0, "name": 1}) if user.get("role_id") else None
+    is_admin = role and role.get("name") in ["Admin", "System Administrator"]
+    match = {"status": "Pending"}
+    if not (is_admin or user.get("has_finance_access")):
+        match["linked_user_id"] = user_id
     approvals = list(db.claim_approvals.aggregate([
-        {"$match": {"linked_user_id": user_id, "status": "Pending"}},
+        {"$match": match},
         {"$lookup": {"from": "expense_claims", "localField": "claim_id", "foreignField": "id", "as": "claim"}},
         {"$unwind": "$claim"},
         {"$match": {"claim.status": {"$regex": "^Pending"}}},
@@ -8818,6 +9254,8 @@ def api_pending_claim_approvals():
     for approval in approvals:
         attach_approval_user_names(db, [approval])
         attach_pending_approval_display(db, approval.get("claim"), "claim_approvals", "claim_id")
+        approval["can_act"] = approval.get("linked_user_id") == user["id"] or is_admin or bool(user.get("has_finance_access"))
+        approval["can_delegate"] = approval["can_act"]
     return jsonify(json_ready({"approvals": approvals}))
 
 
@@ -8831,11 +9269,16 @@ def api_claim_approval_action(approval_id):
     action = data.get("action")
     if action not in {"approve", "reject"}:
         return jsonify({"error": "Invalid approval action."}), 400
-    approval = db.claim_approvals.find_one({"id": approval_id, "linked_user_id": user["id"]})
+    approval = db.claim_approvals.find_one({"id": approval_id})
     if not approval:
-        return jsonify({"error": "Approval task not found for this user."}), 404
+        return jsonify({"error": "Approval task not found."}), 404
     if approval.get("status") != "Pending":
         return jsonify({"error": "This approval task is not pending."}), 400
+    role = db.roles.find_one({"id": user.get("role_id")}, {"_id": 0, "name": 1}) if user.get("role_id") else None
+    is_admin = role and role.get("name") in ["Admin", "System Administrator"]
+    can_act = approval.get("linked_user_id") == user["id"] or is_admin or bool(user.get("has_finance_access"))
+    if not can_act:
+        return jsonify({"error": "Approval task not authorized for this user."}), 403
     claim = db.expense_claims.find_one({"id": approval.get("claim_id")})
     if not claim or not str(claim.get("status", "")).startswith("Pending"):
         return jsonify({"error": "Claim is not pending stakeholder approval."}), 400
@@ -8919,6 +9362,103 @@ def api_claim_approval_action(approval_id):
     for finance_user in finance_users:
         create_system_notification(db, finance_user.get("id"), "Claim ready for posting", f"{claim.get('claim_number')} is approved and ready for posting.", "/finance/claims")
     return jsonify({"success": True, "status": "Approved"})
+
+
+@app.route("/api/claim-approvals/<int:approval_id>/delegate", methods=["POST"])
+def api_claim_approval_delegate(approval_id):
+    if "user_id" not in session:
+        abort(401)
+    db = get_db()
+    user = get_current_user()
+    data = request.get_json() or {}
+    delegate_to_user_id = safe_int(data.get("delegate_to_user_id"))
+    remarks = (data.get("remarks") or "").strip()
+    if not delegate_to_user_id:
+        return jsonify({"error": "Target user is required for delegation."}), 400
+    
+    approval = db.claim_approvals.find_one({"id": approval_id})
+    if not approval or approval.get("status") != "Pending":
+        return jsonify({"error": "Approval task not found or not pending."}), 404
+        
+    role = db.roles.find_one({"id": user.get("role_id")}, {"_id": 0, "name": 1}) if user.get("role_id") else None
+    is_admin = role and role.get("name") in ["Admin", "System Administrator"]
+    can_delegate = approval.get("linked_user_id") == user["id"] or is_admin or bool(user.get("has_finance_access"))
+    if not can_delegate:
+        return jsonify({"error": "You do not have permission to delegate this claim approval."}), 403
+        
+    target_user = db.app_users.find_one({"id": delegate_to_user_id, "is_active": {"$ne": 0}})
+    if not target_user:
+        return jsonify({"error": "Target user not found or inactive."}), 404
+        
+    if approval.get("linked_user_id") == target_user["id"]:
+        return jsonify({"error": "Approval is already assigned to this user."}), 400
+
+    target_stakeholder = db.treasury_stakeholders.find_one({
+        "$or": [
+            {"linked_user_id": target_user["id"]},
+            {"email": target_user.get("email")}
+        ],
+        "is_active": {"$ne": False}
+    })
+    
+    prev_user_name = approval.get("stakeholder_name") or user.get("full_name") or "Approver"
+    now = datetime.now()
+    
+    update_doc = {
+        "linked_user_id": target_user["id"],
+        "delegated_from_user_id": approval.get("linked_user_id"),
+        "delegated_from_name": prev_user_name,
+        "delegated_by_id": user["id"],
+        "delegated_by_name": user.get("full_name"),
+        "delegated_at": now,
+        "delegation_remarks": remarks,
+        "updated_at": now
+    }
+    if target_stakeholder:
+        update_doc["stakeholder_id"] = target_stakeholder["id"]
+        update_doc["stakeholder_name"] = target_stakeholder["name"]
+        update_doc["email"] = target_stakeholder.get("email") or target_user.get("email")
+    else:
+        update_doc["stakeholder_name"] = target_user.get("full_name")
+        update_doc["email"] = target_user.get("email")
+        
+    db.claim_approvals.update_one({"id": approval_id}, {"$set": update_doc})
+    
+    db.claim_approval_audit.insert_one({
+        "id": get_next_sequence_value("claim_approval_audit"),
+        "claim_id": approval.get("claim_id"),
+        "approval_id": approval_id,
+        "approval_sequence": approval.get("approval_sequence"),
+        "action": "Delegated",
+        "remarks": f"Delegated from {prev_user_name} to {target_user.get('full_name')}. {remarks}".strip(),
+        "delegated_to_id": target_user["id"],
+        "delegated_to_name": target_user.get("full_name"),
+        "created_at": now,
+        "created_by_id": user["id"],
+    })
+    
+    new_status = pending_approval_status(db, "claim_approvals", "claim_id", approval.get("claim_id"), approval.get("approval_sequence"))
+    db.expense_claims.update_one(
+        {"id": approval.get("claim_id")},
+        {"$set": {"status": new_status, "updated_at": now}}
+    )
+    
+    claim = db.expense_claims.find_one({"id": approval.get("claim_id")})
+    claim_ref = claim.get("claim_number") if claim else f"Claim #{approval.get('claim_id')}"
+    create_system_notification(
+        db,
+        target_user["id"],
+        "Claim Approval Delegated",
+        f"{user.get('full_name')} delegated approval for {claim_ref} to you.",
+        "/claims/approvals"
+    )
+    
+    return jsonify({
+        "success": True,
+        "status": new_status,
+        "delegated_to": target_user.get("full_name"),
+        "message": f"Successfully delegated claim approval to {target_user.get('full_name')}."
+    })
 
 
 @app.route("/api/finance/expense-claims/<int:claim_id>", methods=["GET", "PUT"])
