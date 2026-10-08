@@ -6,7 +6,13 @@ import time
 import hmac
 from base64 import urlsafe_b64encode
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+
+# Set standard application timezone to Mumbai time (Asia/Kolkata)
+os.environ["TZ"] = "Asia/Kolkata"
+if hasattr(time, "tzset"):
+    time.tzset()
+
 from decimal import Decimal
 from hashlib import sha256
 import hashlib
@@ -1967,6 +1973,16 @@ def record_company_bank_movement(db, bank_account_id, movement_type, amount, *, 
         existing = db.company_bank_transactions.find_one({"source_module": source_module, "source_id": source_id, "bank_account_id": bank_account_id})
         if existing:
             return existing
+    if reference:
+        clean_ref = str(reference).strip()
+        existing_recent = db.company_bank_transactions.find_one({
+            "bank_account_id": bank_account_id,
+            "reference": clean_ref,
+            "transaction_type": movement_type,
+            "created_at": {"$gte": datetime.now() - timedelta(seconds=10)}
+        })
+        if existing_recent:
+            return existing_recent
     current_balance = bank_account_current_balance(db, bank_account_id) or 0.0
     inflow = amount if direction == "inflow" else 0.0
     outflow = amount if direction == "outflow" else 0.0
@@ -8101,6 +8117,18 @@ def api_treasury_bank_account_detail(bank_account_id):
     return jsonify(json_ready({"bank_account": company_bank_account_with_balance(db, account), "transactions": transactions}))
 
 
+@app.route("/api/treasury/bank-accounts/<int:bank_account_id>/statement", methods=["GET"])
+def api_treasury_bank_account_statement(bank_account_id):
+    require_treasury_access()
+    db = get_db()
+    account = db.company_bank_accounts.find_one({"id": bank_account_id})
+    if not account:
+        abort(404)
+    transactions = list(db.company_bank_transactions.find({"bank_account_id": bank_account_id}, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1), ("id", -1)]))
+    return jsonify(json_ready({"bank_account": company_bank_account_with_balance(db, account), "transactions": transactions}))
+
+
+
 @app.route("/api/treasury/bank-accounts/<int:bank_account_id>/balance", methods=["GET"])
 def api_treasury_bank_account_balance(bank_account_id):
     require_treasury_access()
@@ -8420,9 +8448,19 @@ def api_treasury_payable_payment(payable_id):
         return jsonify({"error": "Select the vendor paid to."}), 400
     if not is_salary_payable and not is_other_payment:
         recipient_account_label = payee_bank_account_label(recipient_account) if recipient_account else recipient_owner_name
-    payment_id = get_next_sequence_value("payable_payments")
     payment_date = data.get("payment_date") or datetime.now().strftime("%Y-%m-%d")
     payment_reference = (data.get("reference") or "").strip()
+    if payment_reference:
+        existing_ref = db.payable_payments.find_one({"payable_id": payable_id, "reference": payment_reference})
+        if existing_ref:
+            return jsonify({"error": f"Payment with reference '{payment_reference}' has already been recorded for this payable."}), 400
+    recent_dup = db.payable_payments.find_one({
+        "payable_id": payable_id,
+        "created_at": {"$gte": datetime.now() - timedelta(seconds=5)}
+    })
+    if recent_dup:
+        return jsonify({"error": "A duplicate payment request was detected. Please wait a moment."}), 400
+    payment_id = get_next_sequence_value("payable_payments")
     db.payable_payments.insert_one({
         "id": payment_id,
         "payable_id": payable_id,
