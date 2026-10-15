@@ -1835,14 +1835,75 @@ def safe_int(value):
     return int(value)
 
 
+def ensure_default_accounting_periods(db):
+    if db.accounting_periods.count_documents({}) == 0:
+        default_periods = [
+            {
+                "id": 1,
+                "name": "FY 2025",
+                "fiscal_year": "2025",
+                "start_date": "2025-01-01",
+                "end_date": "2025-12-31",
+                "status": "Closed",
+                "locked_at": datetime(2026, 1, 1),
+                "locked_by": "System Administrator",
+                "notes": "Closed financial year 2025",
+                "created_at": datetime.now(),
+                "updated_at": datetime.now(),
+            },
+            {
+                "id": 2,
+                "name": "FY 2026",
+                "fiscal_year": "2026",
+                "start_date": "2026-01-01",
+                "end_date": "2026-12-31",
+                "status": "Open",
+                "locked_at": None,
+                "locked_by": None,
+                "notes": "Current fiscal year",
+                "created_at": datetime.now(),
+                "updated_at": datetime.now(),
+            }
+        ]
+        db.accounting_periods.insert_many(default_periods)
+
+
+def check_accounting_period_lock(date_val, db=None):
+    """
+    Checks if date_val falls within any Locked or Closed accounting period.
+    Returns (is_locked: bool, period_doc: dict|None, error_message: str|None).
+    """
+    if not date_val:
+        return False, None, None
+    if db is None:
+        db = get_db()
+    ensure_default_accounting_periods(db)
+    d_str = str(date_val).strip()[:10]
+    locked = db.accounting_periods.find_one({
+        "status": {"$in": ["Locked", "Closed"]},
+        "start_date": {"$lte": d_str},
+        "end_date": {"$gte": d_str}
+    })
+    if locked:
+        name = locked.get("name") or locked.get("fiscal_year") or "Selected Period"
+        s = locked.get("start_date")
+        e = locked.get("end_date")
+        err = f"Accounting period '{name}' ({s} to {e}) is locked/closed. Transactions cannot be posted, modified, or reversed for this period."
+        return True, locked, err
+    return False, None, None
+
+
 def create_finance_transaction(db, payload, actor=None):
+    date_val = payload.get("transaction_date") or payload.get("date") or datetime.now().strftime("%Y-%m-%d")
+    is_locked, period, lock_err = check_accounting_period_lock(date_val, db)
+    if is_locked:
+        raise ValueError(lock_err)
     transaction_id = get_next_sequence_value("transactions")
     amount = parse_float(payload.get("amount"))
     cgst_amount = parse_float(payload.get("cgst_amount"))
     igst_amount = parse_float(payload.get("igst_amount"))
     tds_amount = parse_float(payload.get("tds_amount"))
     total_amount = parse_float(payload.get("total_amount"), amount + cgst_amount + igst_amount - tds_amount)
-    date_val = payload.get("transaction_date") or payload.get("date") or datetime.now().strftime("%Y-%m-%d")
     actor_id = actor["id"] if actor else None
     actor_name = actor.get("full_name", "Unknown") if actor else "System"
     doc = {
@@ -3534,6 +3595,7 @@ def api_setup_users():
             "id": user_id,
             "full_name": data["full_name"],
             "email": data["email"],
+            "notification_email": (data.get("notification_email") or "").strip(),
             "password_hash": generate_password_hash(data["password"]),
             "role_id": data.get("role_id") or None,
             "is_active": data.get("is_active", True),
@@ -3581,6 +3643,7 @@ def api_setup_user(user_id):
         update_data = {
             "full_name": data["full_name"],
             "email": data["email"],
+            "notification_email": (data.get("notification_email") or "").strip(),
             "role_id": data.get("role_id") or None,
             "is_active": data.get("is_active", True),
             "has_treasury_access": 1 if data.get("has_treasury_access") else 0,
@@ -4830,6 +4893,10 @@ def api_finance_transactions():
         if not date_val:
             date_val = datetime.now().strftime("%Y-%m-%d")
 
+        is_locked, period, lock_err = check_accounting_period_lock(date_val, db)
+        if is_locked:
+            return jsonify({"error": lock_err}), 400
+
         account_id = int(data.get("account_id")) if data.get("account_id") else None
         customer_id = int(data.get("customer_id")) if data.get("customer_id") else None
         selected_account = db.accounts.find_one({"id": account_id}) if account_id else None
@@ -5150,6 +5217,11 @@ def api_finance_transaction_detail(transaction_id):
         if not old_tx:
             abort(404)
 
+        old_date = old_tx.get("transaction_date") or old_tx.get("date")
+        is_locked, period, lock_err = check_accounting_period_lock(old_date, db)
+        if is_locked:
+            return jsonify({"error": f"Cannot delete transaction: {lock_err}"}), 400
+
         db.transactions.delete_one({"id": transaction_id})
 
         synced_revenues = list(
@@ -5184,7 +5256,19 @@ def api_finance_transaction_detail(transaction_id):
         return jsonify({"success": True})
 
     if request.method == "PUT":
+        old_tx = db.transactions.find_one({"id": transaction_id})
+        if not old_tx:
+            abort(404)
+        old_date = old_tx.get("transaction_date") or old_tx.get("date")
+        is_locked, period, lock_err = check_accounting_period_lock(old_date, db)
+        if is_locked:
+            return jsonify({"error": f"Cannot modify transaction: {lock_err}"}), 400
+
         data = request.get_json()
+        new_date = data.get("transaction_date") or data.get("date") or old_date
+        is_locked_new, period_new, lock_err_new = check_accounting_period_lock(new_date, db)
+        if is_locked_new:
+            return jsonify({"error": lock_err_new}), 400
         amount = round(float(data.get("amount") or 0), 2)
         cgst_percent = float(data.get("cgst_percent") or 0)
         igst_percent = float(data.get("igst_percent") or 0)
@@ -5445,6 +5529,17 @@ def api_finance_transaction_reverse(transaction_id):
     
     # 1. Update transaction status in db.transactions
     old_tx = db.transactions.find_one({"id": transaction_id})
+    if not old_tx:
+        abort(404)
+    old_date = old_tx.get("transaction_date") or old_tx.get("date")
+    is_locked, period, lock_err = check_accounting_period_lock(old_date, db)
+    if is_locked:
+        return jsonify({"error": f"Cannot reverse transaction: {lock_err}"}), 400
+    today_date = datetime.now().strftime("%Y-%m-%d")
+    is_locked_today, _, lock_err_today = check_accounting_period_lock(today_date, db)
+    if is_locked_today:
+        return jsonify({"error": f"Cannot post reversal entry: {lock_err_today}"}), 400
+
     res = db.transactions.update_one(
         {"id": transaction_id},
         {"$set": {"status": "Reversed"}}
@@ -5485,6 +5580,334 @@ def api_finance_transaction_reverse(transaction_id):
     log_treasury_action(user["id"], "Reverse Entry", f"Reversed transaction ledger entry #{transaction_id} and cancelled synced treasury splits.")
     
     return jsonify({"success": True})
+
+
+def explain_transaction_gl(entries, currency="INR"):
+    sym = "₹" if currency == "INR" else ("$" if currency == "USD" else ("€" if currency == "EUR" else "£"))
+    dr_items = [e for e in entries if e.get("debit") and float(e["debit"]) > 0]
+    cr_items = [e for e in entries if e.get("credit") and float(e["credit"]) > 0]
+    
+    parts = []
+    has_ap = any(str(e.get("gl_code")) == "2000" or "payable" in (e.get("account_name") or "").lower() for e in cr_items)
+    has_bank_cr = any(str(e.get("gl_code")) == "1010" or "bank" in (e.get("account_name") or "").lower() for e in cr_items)
+    
+    for e in dr_items:
+        name = e.get("account_name") or "Account"
+        amt = float(e["debit"])
+        tp = e.get("account_type") or e.get("type")
+        gl = str(e.get("gl_code") or "")
+        if gl == "1010":
+            parts.append(f"Bank Account increased by {sym}{amt:,.2f} through a debit deposit")
+        elif gl == "5040":
+            parts.append(f"Payment Gateway Fees recognized as an expense of {sym}{amt:,.2f} through a debit")
+        elif gl in ["1020", "1030"]:
+            parts.append(f"{name} increased by {sym}{amt:,.2f} as Input Tax Credit")
+        elif gl == "1040":
+            parts.append(f"{name} asset recognized with {sym}{amt:,.2f}")
+        elif tp == "Expense" or gl.startswith(("5", "6", "7", "4030")):
+            parts.append(f"{name} increased by {sym}{amt:,.2f} through a debit")
+        elif tp == "Asset":
+            parts.append(f"{name} (Asset) increased by {sym}{amt:,.2f} through a debit")
+        else:
+            parts.append(f"{name} debited with {sym}{amt:,.2f}")
+            
+    for e in cr_items:
+        name = e.get("account_name") or "Account"
+        amt = float(e["credit"])
+        tp = e.get("account_type") or e.get("type")
+        gl = str(e.get("gl_code") or "")
+        if gl == "1010":
+            parts.append(f"Bank Account decreased by {sym}{amt:,.2f} through a credit disbursement")
+        elif gl == "2000":
+            parts.append(f"Accounts Payable liability increased by {sym}{amt:,.2f} through a credit")
+        elif gl in ["2010", "2020"]:
+            parts.append(f"{name} liability recognized with {sym}{amt:,.2f}")
+        elif gl == "2030":
+            parts.append(f"TDS Payable liability withheld of {sym}{amt:,.2f} through a credit")
+        elif tp in ["Revenue", "Income"] or gl.startswith("4"):
+            parts.append(f"{name} increased by {sym}{amt:,.2f} through a credit")
+        elif tp == "Liability":
+            parts.append(f"{name} (Liability) increased by {sym}{amt:,.2f} through a credit")
+        else:
+            parts.append(f"{name} credited with {sym}{amt:,.2f}")
+            
+    explanation = ". ".join(parts) + "." if parts else "No accounting entries posted."
+    if has_ap and not has_bank_cr:
+        explanation += " No bank movement has occurred yet (booked to Accounts Payable liability)."
+    return explanation
+
+
+@app.route("/api/finance/transactions/<transaction_id>/gl-entries")
+def api_finance_transaction_gl_entries(transaction_id):
+    require_finance_access()
+    db = get_db()
+    ensure_default_accounts(db)
+    system_accounts = get_system_gl_accounts(db)
+    all_accounts = list(db.accounts.find({}, {"_id": 0, "id": 1, "name": 1, "gl_code": 1, "type": 1}))
+    accounts_cache = {a["id"]: a for a in all_accounts if "id" in a}
+
+    tx = db.transactions.find_one({"id": transaction_id}, {"_id": 0})
+    if not tx:
+        candidate_ids = []
+        clean_id_str = str(transaction_id).strip()
+        if clean_id_str.isdigit():
+            candidate_ids.append(f"TXN{int(clean_id_str):03d}")
+        elif clean_id_str.upper().startswith("TXN"):
+            num_part = clean_id_str[3:]
+            if num_part.isdigit():
+                candidate_ids.append(f"TXN{int(num_part):03d}")
+                candidate_ids.append(str(int(num_part)))
+        if candidate_ids:
+            tx = db.transactions.find_one({
+                "$or": [
+                    {"id": {"$in": candidate_ids}},
+                    {"display_id": {"$in": candidate_ids}},
+                    {"transaction_number": {"$in": candidate_ids}}
+                ]
+            }, {"_id": 0})
+
+    is_salary = False
+    if not tx:
+        salary_tx = db.hr_salary_transactions.find_one({
+            "$or": [
+                {"id": transaction_id},
+                {"display_id": transaction_id},
+                {"legacy_id": transaction_id}
+            ]
+        }, {"_id": 0})
+        if salary_tx:
+            tx = salary_tx
+            is_salary = True
+        else:
+            return jsonify({"error": "Transaction not found"}), 404
+
+    status = tx.get("status") or "Completed"
+    is_reversed = status == "Reversed"
+    is_draft = status in ["Draft", "Pending Approval", "Rejected"]
+    
+    currency = tx.get("currency") or "INR"
+    sym = CURRENCY_SYMBOLS.get(currency, "₹" if currency == "INR" else "$")
+
+    if is_draft:
+        return jsonify(json_ready({
+            "transaction_id": transaction_id,
+            "display_id": tx.get("display_id") or transaction_id,
+            "posting_status": status,
+            "is_posted": False,
+            "is_reversed": False,
+            "is_draft": True,
+            "transaction_date": tx.get("transaction_date") or tx.get("date"),
+            "accounting_date": tx.get("transaction_date") or tx.get("date"),
+            "description": tx.get("description") or "Draft transaction",
+            "currency": currency,
+            "currency_symbol": sym,
+            "entries": [],
+            "reversal_entries": [],
+            "totals": {
+                "total_debit": 0.0,
+                "total_credit": 0.0,
+                "difference": 0.0,
+                "is_balanced": True
+            },
+            "explanation": "No posted General Ledger entries are available for this transaction.",
+            "message": "No posted General Ledger entries are available for this transaction."
+        }))
+
+    if is_salary:
+        sal_amt = parse_float(tx.get("total_amount") or tx.get("amount"))
+        sal_date = tx.get("transaction_date") or str(tx.get("created_at", ""))[:10]
+        legs = [
+            {
+                **tx,
+                "id": transaction_id,
+                "leg_id": f"{transaction_id}-exp",
+                "account_name": "Salaries Expense",
+                "gl_code": "6010",
+                "gl_account_number": "6010",
+                "gl_account_name": "Salaries Expense",
+                "type": "Expense",
+                "account_type": "Expense",
+                "debit": sal_amt,
+                "credit": None,
+                "currency": currency,
+                "transaction_date": sal_date,
+                "description": tx.get("description") or f"Monthly Salary Disbursement ({tx.get('employee_name', '')})"
+            },
+            {
+                **tx,
+                "id": transaction_id,
+                "leg_id": f"{transaction_id}-bank",
+                "account_name": "Bank Account",
+                "gl_code": "1010",
+                "gl_account_number": "1010",
+                "gl_account_name": "Bank Account",
+                "type": "Asset",
+                "account_type": "Asset",
+                "debit": None,
+                "credit": sal_amt,
+                "currency": currency,
+                "transaction_date": sal_date,
+                "description": f"Net Salary Payout from Bank ({transaction_id})"
+            }
+        ]
+    else:
+        legs = expand_transaction_to_gl_legs(db, tx, system_accounts, accounts_cache=accounts_cache)
+
+    total_dr = sum(float(l.get("debit") or 0.0) for l in legs)
+    total_cr = sum(float(l.get("credit") or 0.0) for l in legs)
+    diff = round(abs(total_dr - total_cr), 2)
+    is_balanced = diff < 0.01
+
+    explanation = explain_transaction_gl(legs, currency=currency)
+
+    reversal_entries = []
+    reversal_totals = None
+    if is_reversed:
+        for l in legs:
+            rev_leg = dict(l)
+            rev_leg["leg_id"] = f"{l.get('leg_id')}-rev"
+            d = l.get("debit")
+            c = l.get("credit")
+            rev_leg["debit"] = c
+            rev_leg["credit"] = d
+            rev_leg["description"] = f"Reversal of {l.get('description', '')}"
+            rev_leg["status"] = "Reversed"
+            reversal_entries.append(rev_leg)
+        rev_dr = sum(float(l.get("debit") or 0.0) for l in reversal_entries)
+        rev_cr = sum(float(l.get("credit") or 0.0) for l in reversal_entries)
+        rev_diff = round(abs(rev_dr - rev_cr), 2)
+        reversal_totals = {
+            "total_debit": round(rev_dr, 2),
+            "total_credit": round(rev_cr, 2),
+            "difference": rev_diff,
+            "is_balanced": rev_diff < 0.01
+        }
+
+    customer_name = None
+    if tx.get("customer_id"):
+        cust = db.customers.find_one({"id": safe_int(tx["customer_id"])}, {"_id": 0, "company_name": 1})
+        if cust:
+            customer_name = cust.get("company_name")
+
+    vendor_name = None
+    if tx.get("vendor_id"):
+        vend = db.vendors.find_one({"id": safe_int(tx["vendor_id"])}, {"_id": 0, "name": 1})
+        if vend:
+            vendor_name = vend.get("name")
+
+    return jsonify(json_ready({
+        "transaction_id": transaction_id,
+        "display_id": tx.get("display_id") or transaction_id,
+        "posting_status": "Reversed" if is_reversed else "Posted",
+        "is_posted": True,
+        "is_reversed": is_reversed,
+        "is_draft": False,
+        "transaction_date": tx.get("transaction_date") or tx.get("date"),
+        "accounting_date": tx.get("transaction_date") or tx.get("date"),
+        "description": tx.get("description") or f"Transaction {transaction_id}",
+        "party_name": customer_name or vendor_name or tx.get("employee_name") or "—",
+        "category": tx.get("category") or ("Income" if tx.get("type") == "Income" else "Expense"),
+        "currency": currency,
+        "currency_symbol": sym,
+        "total_amount": float(tx.get("total_amount") or tx.get("amount") or 0.0),
+        "entries": legs,
+        "reversal_entries": reversal_entries,
+        "totals": {
+            "total_debit": round(total_dr, 2),
+            "total_credit": round(total_cr, 2),
+            "difference": diff,
+            "is_balanced": is_balanced
+        },
+        "reversal_totals": reversal_totals,
+        "explanation": explanation,
+        "related_documents": {
+            "invoice_id": tx.get("invoice_id"),
+            "invoice_number": tx.get("invoice_number"),
+            "expense_claim_id": tx.get("expense_claim_id"),
+            "loan_account_id": tx.get("loan_account_id"),
+            "customer_id": tx.get("customer_id"),
+            "customer_name": customer_name,
+            "vendor_id": tx.get("vendor_id"),
+            "vendor_name": vendor_name
+        }
+    }))
+
+
+@app.route("/api/finance/transactions/preview-gl", methods=["POST"])
+def api_finance_transaction_preview_gl():
+    require_finance_access()
+    db = get_db()
+    ensure_default_accounts(db)
+    system_accounts = get_system_gl_accounts(db)
+    all_accounts = list(db.accounts.find({}, {"_id": 0, "id": 1, "name": 1, "gl_code": 1, "type": 1}))
+    accounts_cache = {a["id"]: a for a in all_accounts if "id" in a}
+
+    data = request.get_json() or {}
+    t_id = data.get("id") or "PREVIEW"
+    t_type = data.get("type", "Expense")
+    amount = round(float(data.get("amount") or 0.0), 2)
+    cgst_percent = float(data.get("cgst_percent") or 0.0)
+    igst_percent = float(data.get("igst_percent") or 0.0)
+    tds_percent = float(data.get("tds_percent") or 0.0)
+    
+    cgst_amount = round(amount * (cgst_percent / 100.0), 2)
+    igst_amount = round(amount * (igst_percent / 100.0), 2)
+    tds_amount = round(amount * (tds_percent / 100.0), 2)
+
+    additional_charges = float(data.get("additional_charges") or data.get("additional_charges_amount") or 0.0)
+    platform_fee = float(data.get("platform_fee_amount") or data.get("platform_charges") or 0.0)
+    
+    currency = data.get("currency") or "INR"
+    sym = CURRENCY_SYMBOLS.get(currency, "₹" if currency == "INR" else "$")
+
+    temp_tx = {
+        "id": t_id,
+        "type": t_type,
+        "amount": amount,
+        "currency": currency,
+        "account_id": safe_int(data.get("account_id")),
+        "cgst_percent": cgst_percent,
+        "cgst_amount": cgst_amount,
+        "igst_percent": igst_percent,
+        "igst_amount": igst_amount,
+        "tds_percent": tds_percent,
+        "tds_amount": tds_amount,
+        "additional_charges": additional_charges,
+        "additional_charges_percent": float(data.get("additional_charges_percent") or 0.0),
+        "platform_fee_amount": platform_fee,
+        "platform_fee_percent": float(data.get("platform_fee_percent") or 0.0),
+        "payment_status": data.get("payment_status", "Paid"),
+        "description": data.get("description", ""),
+        "category": data.get("category", ""),
+    }
+
+    legs = expand_transaction_to_gl_legs(db, temp_tx, system_accounts, accounts_cache=accounts_cache)
+    total_dr = sum(float(l.get("debit") or 0.0) for l in legs)
+    total_cr = sum(float(l.get("credit") or 0.0) for l in legs)
+    diff = round(abs(total_dr - total_cr), 2)
+    is_balanced = diff < 0.01
+
+    explanation = explain_transaction_gl(legs, currency=currency)
+
+    tx_date = data.get("transaction_date") or data.get("date") or datetime.now().strftime("%Y-%m-%d")
+    is_locked, period, lock_err = check_accounting_period_lock(tx_date, db)
+
+    return jsonify(json_ready({
+        "is_simulated": True,
+        "currency": currency,
+        "currency_symbol": sym,
+        "entries": legs,
+        "totals": {
+            "total_debit": round(total_dr, 2),
+            "total_credit": round(total_cr, 2),
+            "difference": diff,
+            "is_balanced": is_balanced
+        },
+        "explanation": explanation,
+        "is_period_locked": is_locked,
+        "locked_period_name": period.get("name") if period else None,
+        "period_lock_warning": lock_err
+    }))
 
 def build_invoice_payment_details(bank_doc, invoice_number):
     if not bank_doc:
@@ -5840,6 +6263,142 @@ def api_settings_company():
     return jsonify(json_ready({}))
 
 
+@app.route("/api/settings/accounting-periods", methods=["GET", "POST"])
+def api_settings_accounting_periods():
+    require_finance_access()
+    db = get_db()
+    ensure_default_accounting_periods(db)
+
+    if request.method == "POST":
+        data = request.get_json() or {}
+        name = (data.get("name") or "").strip()
+        start_date = (data.get("start_date") or "").strip()
+        end_date = (data.get("end_date") or "").strip()
+        fiscal_year = (data.get("fiscal_year") or "").strip() or (start_date[:4] if start_date else "")
+        status = data.get("status") if data.get("status") in ["Open", "Locked", "Closed"] else "Open"
+        notes = (data.get("notes") or "").strip()
+
+        if not name:
+            return jsonify({"error": "Period name is required (e.g. FY 2026)."}), 400
+        if not start_date or not end_date:
+            return jsonify({"error": "Start date and End date are required."}), 400
+        if start_date > end_date:
+            return jsonify({"error": "Start date cannot be after End date."}), 400
+
+        actor = get_current_user()
+        actor_name = actor.get("full_name", "System") if actor else "System"
+
+        period_id = get_next_sequence_value("accounting_periods")
+        doc = {
+            "id": period_id,
+            "name": name,
+            "fiscal_year": fiscal_year,
+            "start_date": start_date,
+            "end_date": end_date,
+            "status": status,
+            "locked_at": datetime.now() if status in ["Locked", "Closed"] else None,
+            "locked_by": actor_name if status in ["Locked", "Closed"] else None,
+            "notes": notes,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        }
+        db.accounting_periods.insert_one(doc)
+        log_activity_async("Setup", "Accounting Period", period_id, "CREATE", new_data=doc, reference_number=name)
+        return jsonify(json_ready({"period": {k: v for k, v in doc.items() if k != "_id"}}))
+
+    periods = list(db.accounting_periods.find({}, {"_id": 0}).sort("start_date", -1))
+    return jsonify(json_ready({"periods": periods}))
+
+
+@app.route("/api/settings/accounting-periods/<int:period_id>", methods=["GET", "PUT", "DELETE"])
+def api_settings_accounting_period_detail(period_id):
+    require_finance_access()
+    db = get_db()
+    existing = db.accounting_periods.find_one({"id": period_id})
+    if not existing:
+        abort(404)
+
+    if request.method == "DELETE":
+        db.accounting_periods.delete_one({"id": period_id})
+        log_activity_async("Setup", "Accounting Period", period_id, "DELETE", old_data=existing, reference_number=existing.get("name"))
+        return jsonify({"success": True})
+
+    if request.method == "PUT":
+        data = request.get_json() or {}
+        name = (data.get("name") or existing.get("name") or "").strip()
+        start_date = (data.get("start_date") or existing.get("start_date") or "").strip()
+        end_date = (data.get("end_date") or existing.get("end_date") or "").strip()
+        fiscal_year = (data.get("fiscal_year") or existing.get("fiscal_year") or "").strip()
+        notes = data.get("notes") if "notes" in data else existing.get("notes")
+
+        if not name or not start_date or not end_date:
+            return jsonify({"error": "Period name, start date, and end date are required."}), 400
+        if start_date > end_date:
+            return jsonify({"error": "Start date cannot be after End date."}), 400
+
+        update_fields = {
+            "name": name,
+            "fiscal_year": fiscal_year,
+            "start_date": start_date,
+            "end_date": end_date,
+            "notes": notes,
+            "updated_at": datetime.now(),
+        }
+        db.accounting_periods.update_one({"id": period_id}, {"$set": update_fields})
+        updated = db.accounting_periods.find_one({"id": period_id}, {"_id": 0})
+        log_activity_async("Setup", "Accounting Period", period_id, "UPDATE", old_data=existing, new_data=updated, reference_number=name)
+        return jsonify(json_ready({"period": updated}))
+
+    return jsonify(json_ready({"period": {k: v for k, v in existing.items() if k != "_id"}}))
+
+
+@app.route("/api/settings/accounting-periods/<int:period_id>/toggle-lock", methods=["POST"])
+def api_settings_accounting_period_toggle_lock(period_id):
+    require_finance_access()
+    db = get_db()
+    existing = db.accounting_periods.find_one({"id": period_id})
+    if not existing:
+        abort(404)
+
+    actor = get_current_user()
+    actor_name = actor.get("full_name", "System") if actor else "System"
+
+    current_status = existing.get("status")
+    new_status = "Open" if current_status in ["Locked", "Closed"] else "Locked"
+    
+    update_data = {
+        "status": new_status,
+        "updated_at": datetime.now(),
+    }
+    if new_status == "Locked":
+        update_data["locked_at"] = datetime.now()
+        update_data["locked_by"] = actor_name
+    else:
+        update_data["unlocked_at"] = datetime.now()
+        update_data["unlocked_by"] = actor_name
+
+    db.accounting_periods.update_one({"id": period_id}, {"$set": update_data})
+    updated = db.accounting_periods.find_one({"id": period_id}, {"_id": 0})
+    action_label = "LOCK" if new_status == "Locked" else "UNLOCK"
+    log_activity_async("Setup", "Accounting Period", period_id, action_label, old_data=existing, new_data=updated, reference_number=existing.get("name"))
+    return jsonify(json_ready({"period": updated, "status": new_status}))
+
+
+@app.route("/api/settings/accounting-periods/check", methods=["GET"])
+def api_settings_accounting_periods_check():
+    require_finance_access()
+    db = get_db()
+    date_val = request.args.get("date")
+    if not date_val:
+        return jsonify({"is_locked": False})
+    is_locked, period, msg = check_accounting_period_lock(date_val, db)
+    return jsonify({
+        "is_locked": is_locked,
+        "period": {k: v for k, v in period.items() if k != "_id"} if period else None,
+        "message": msg
+    })
+
+
 @app.route("/api/settings/master-options/<option_type>", methods=["GET", "POST"])
 def api_settings_master_options(option_type):
     require_finance_access()
@@ -5948,6 +6507,8 @@ def get_system_gl_accounts(db):
     system_map = {}
     mappings = {
         "bank": ("Bank Account", "1010", "Asset"),
+        "accounts_payable": ("Accounts Payable", "2000", "Liability"),
+        "accounts_receivable": ("Accounts Receivable", "1050", "Asset"),
         "platform_fee": ("Payment Gateway & Platform Fees", "5040", "Expense"),
         "additional_charges_income": ("Additional Charges Income", "4020", "Revenue"),
         "additional_charges_expense": ("Additional Charges Expense", "5050", "Expense"),
@@ -6048,7 +6609,7 @@ def expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=None):
                 "credit_amount": 0.0,
                 "leg_amount": total_amount,
                 "amount": total_amount,
-                "description": f"Net Settlement Received in Bank ({t_id})",
+                "description": desc or f"Net Settlement Received in Bank ({t_id})",
             })
 
         # 2. Payment Gateway & Platform Fees Leg (Debit)
@@ -6357,30 +6918,48 @@ def expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=None):
                 "description": f"TDS Payable Liability ({t.get('tds_percent', 0)}%)",
             })
 
-        # 7. Bank Account Outflow Leg (Credit)
+        # 7. Counterpart Leg: Bank Account (Credit) or Accounts Payable (Credit if unpaid)
         if total_amount > 0:
-            acc = system_accounts.get("bank")
-            acc_id = acc["id"] if acc else None
-            gl_code = (acc or {}).get("gl_code", "1010")
-            acc_name = (acc or {}).get("name", "Bank Account")
+            is_unpaid = (
+                str(t.get("payment_status") or "").strip().lower() in ["unpaid", "pending", "due"]
+                or t.get("is_paid") is False
+                or str(t.get("status") or "").strip().lower() == "unpaid"
+            )
+            if is_unpaid:
+                acc = system_accounts.get("accounts_payable")
+                acc_id = acc["id"] if acc else None
+                gl_code = (acc or {}).get("gl_code", "2000")
+                acc_name = (acc or {}).get("name", "Accounts Payable")
+                desc_text = desc or f"Accounts Payable Liability ({t_id})"
+                acc_type = "Liability"
+                leg_id = f"{t_id}-ap"
+            else:
+                acc = system_accounts.get("bank")
+                acc_id = acc["id"] if acc else None
+                gl_code = (acc or {}).get("gl_code", "1010")
+                acc_name = (acc or {}).get("name", "Bank Account")
+                desc_text = desc or f"Net Cash Outflow from Bank ({t_id})"
+                acc_type = "Asset"
+                leg_id = f"{t_id}-bank"
+
             legs.append({
                 **t,
                 "id": t_id,
-                "leg_id": f"{t_id}-bank",
+                "leg_id": leg_id,
                 "account_id": acc_id,
                 "gl_code": gl_code,
                 "gl_account_number": gl_code,
                 "account_name": acc_name,
                 "gl_account_name": acc_name,
-                "type": "Asset",
-                "account_type": "Asset",
+                "type": acc_type,
+                "account_type": acc_type,
                 "debit": None,
                 "credit": total_amount,
                 "debit_amount": 0.0,
                 "credit_amount": total_amount,
                 "leg_amount": total_amount,
                 "amount": total_amount,
-                "description": f"Net Cash Outflow from Bank ({t_id})",
+                "description": desc_text,
             })
 
     return legs
@@ -6414,21 +6993,52 @@ def api_gl_report():
     if start_date:
         opening_query = {"date": {"$lt": start_date}, "status": {"$ne": "Reversed"}}
         opening_txns = list(db.transactions.find(opening_query))
+        target_acc = db.accounts.find_one({"id": int(account_id)}) if account_id else None
+        acc_type = (target_acc or {}).get("type")
         for t in opening_txns:
             legs = expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=accounts_cache)
             if account_id:
                 legs = [leg for leg in legs if leg.get("account_id") and int(leg["account_id"]) == int(account_id)]
-            else:
-                legs = [leg for leg in legs if not str(leg.get("leg_id", "")).endswith("-bank")]
             for leg in legs:
                 leg_amt = float(leg.get("credit") or leg.get("debit") or 0.0)
                 currency = leg.get("currency", "USD")
                 txn_date = leg.get("transaction_date") or leg.get("date")
                 amt_usd = convert_to_usd(leg_amt, currency, txn_date, inr_rate, setting)
-                if leg.get("credit") is not None:
-                    opening_balance += amt_usd
+                if account_id:
+                    if leg.get("debit") is not None and float(leg.get("debit") or 0.0) > 0:
+                        if acc_type in ["Asset", "Expense"]:
+                            opening_balance += amt_usd
+                        else:
+                            opening_balance -= amt_usd
+                    else:
+                        if acc_type in ["Asset", "Expense"]:
+                            opening_balance -= amt_usd
+                        else:
+                            opening_balance += amt_usd
                 else:
-                    opening_balance -= amt_usd
+                    gl = str(leg.get("gl_code") or "")
+                    is_bank = gl == "1010" or str(leg.get("leg_id", "")).endswith("-bank")
+                    if is_bank:
+                        if leg.get("debit") is not None and float(leg.get("debit") or 0.0) > 0:
+                            opening_balance += amt_usd
+                        elif leg.get("credit") is not None and float(leg.get("credit") or 0.0) > 0:
+                            opening_balance -= amt_usd
+
+        salary_open_query = {"transaction_date": {"$lt": start_date}}
+        opening_sal_txns = list(db.hr_salary_transactions.find(salary_open_query))
+        for st in opening_sal_txns:
+            txn_account_id = safe_int(st.get("account_id"))
+            sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
+            sal_date = st.get("transaction_date") or str(st.get("created_at", ""))[:10]
+            amt_usd = convert_to_usd(sal_amt, st.get("currency") or "INR", sal_date, inr_rate, setting)
+            if account_id:
+                if txn_account_id and int(txn_account_id) == int(account_id):
+                    if acc_type in ["Asset", "Expense"]:
+                        opening_balance += amt_usd
+                    else:
+                        opening_balance -= amt_usd
+            else:
+                opening_balance -= amt_usd
                 
     # 2. Fetch period transactions from main finance transactions
     period_query = {"status": {"$ne": "Reversed"}}
@@ -6472,8 +7082,6 @@ def api_gl_report():
         legs = expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=accounts_cache)
         if account_id:
             legs = [leg for leg in legs if leg.get("account_id") and int(leg["account_id"]) == int(account_id)]
-        else:
-            legs = [leg for leg in legs if not str(leg.get("leg_id", "")).endswith("-bank")]
         period_legs.extend(legs)
 
     # 2b. Fetch salary transactions from hr_salary_transactions and merge into GL
@@ -6550,11 +7158,20 @@ def api_gl_report():
         if account_id:
             sal_legs = [l for l in all_sal_legs if l.get("account_id") and int(l["account_id"]) == int(account_id)]
         else:
-            sal_legs = [sal_exp_leg]
+            sal_legs = all_sal_legs
         period_legs.extend(sal_legs)
 
-    # Sort all legs together by transaction_date and leg_id
-    period_legs.sort(key=lambda t: (t.get("transaction_date") or t.get("date") or "", str(t.get("id") or ""), str(t.get("leg_id") or "")))
+    # Sort all legs together by transaction_date, numeric transaction id, debits first, then credits
+    def leg_sort_key(leg):
+        d = str(leg.get("transaction_date") or leg.get("date") or "")
+        t_id = str(leg.get("id") or leg.get("transaction_id") or "")
+        tx_match = re.match(r"^TXN(\d+)$", t_id, re.I)
+        num_id = int(tx_match.group(1)) if tx_match else 999999
+        is_credit = 1 if leg.get("credit") is not None and float(leg.get("credit") or 0.0) > 0 else 0
+        leg_id = str(leg.get("leg_id") or "")
+        return (d, num_id, t_id, is_credit, leg_id)
+
+    period_legs.sort(key=leg_sort_key)
     
     # 3. Calculate running balance and summary card metrics (normalized to USD)
     entries = []
@@ -6566,23 +7183,25 @@ def api_gl_report():
         target_acc = db.accounts.find_one({"id": int(account_id)})
         acc_type = (target_acc or {}).get("type")
         for leg in period_legs:
-            amt = float(leg.get("credit") or leg.get("debit") or 0.0)
+            d = float(leg.get("debit") or 0.0)
+            c = float(leg.get("credit") or 0.0)
+            amt = float(d or c or 0.0)
             currency = leg.get("currency", "USD")
             txn_date = leg.get("transaction_date") or leg.get("date")
             amt_usd = convert_to_usd(amt, currency, txn_date, inr_rate, setting)
             
-            if leg.get("credit") is not None:
-                total_credits += amt_usd
-                if acc_type in ["Asset", "Expense"]:
-                    running_balance -= amt_usd
-                else:
-                    running_balance += amt_usd
-            else:
+            if d > 0:
                 total_debits += amt_usd
                 if acc_type in ["Asset", "Expense"]:
                     running_balance += amt_usd
                 else:
                     running_balance -= amt_usd
+            else:
+                total_credits += amt_usd
+                if acc_type in ["Asset", "Expense"]:
+                    running_balance -= amt_usd
+                else:
+                    running_balance += amt_usd
                 
             leg["running_balance"] = running_balance
             entries.append(leg)
@@ -6590,6 +7209,7 @@ def api_gl_report():
     else:
         total_credits = 0.0
         total_debits = 0.0
+        tx_net_cash = {}
         for leg in period_legs:
             d = float(leg.get("debit") or 0.0)
             c = float(leg.get("credit") or 0.0)
@@ -6600,29 +7220,41 @@ def api_gl_report():
             if c > 0:
                 total_credits += convert_to_usd(c, currency, txn_date, inr_rate, setting)
 
-            amt_usd = convert_to_usd(float(c or d or 0.0), currency, txn_date, inr_rate, setting)
-            if c > 0:
-                running_balance += amt_usd
-            else:
-                running_balance -= amt_usd
-            leg["running_balance"] = running_balance
+            t_id = str(leg.get("id") or leg.get("transaction_id") or "")
+            if t_id not in tx_net_cash:
+                tx_net_cash[t_id] = 0.0
+            gl = str(leg.get("gl_code") or "")
+            is_bank = gl == "1010" or str(leg.get("leg_id", "")).endswith("-bank")
+            if is_bank:
+                net_usd = convert_to_usd(d - c, currency, txn_date, inr_rate, setting)
+                tx_net_cash[t_id] += net_usd
+
+        curr_balance = opening_balance
+        processed_txs = set()
+        for leg in period_legs:
+            t_id = str(leg.get("id") or leg.get("transaction_id") or "")
+            if t_id not in processed_txs:
+                processed_txs.add(t_id)
+                curr_balance += tx_net_cash.get(t_id, 0.0)
+            leg["running_balance"] = curr_balance
             entries.append(leg)
 
-        closing_balance = opening_balance + total_credits - total_debits
+        closing_balance = curr_balance
 
     # 4. Assign clear entry_type and format on each leg
     for leg in entries:
         gl_c = str(leg.get("gl_code") or "")
         leg_t = leg.get("account_type") or leg.get("type")
-        if gl_c.startswith("4") or leg_t == "Revenue" or (leg.get("credit") and not str(leg.get("leg_id", "")).endswith("-bank")):
-            leg["entry_type"] = "Revenue"
-        elif gl_c == "5040":
-            leg["entry_type"] = "Gateway Fee"
-        elif gl_c.startswith("5") or gl_c.startswith("6") or gl_c.startswith("7") or leg_t == "Expense":
-            leg["entry_type"] = "Expense"
-        elif gl_c == "1010" or "bank" in str(leg.get("leg_id", "")).lower():
+        acc_name = str(leg.get("account_name") or leg.get("gl_account_name") or "").lower()
+        if gl_c == "1010" or "bank" in str(leg.get("leg_id", "")).lower():
             leg["entry_type"] = "Bank Movement"
-        elif gl_c in ["1020", "1030", "2010", "2020", "2030"]:
+        elif gl_c == "5040" or "fee" in acc_name:
+            leg["entry_type"] = "Gateway Fee"
+        elif "expense" in acc_name or leg_t == "Expense" or gl_c.startswith("5") or gl_c.startswith("6") or gl_c.startswith("7"):
+            leg["entry_type"] = "Expense"
+        elif gl_c.startswith("4") or leg_t == "Revenue" or "revenue" in acc_name or "income" in acc_name:
+            leg["entry_type"] = "Revenue"
+        elif gl_c in ["1020", "1030", "2010", "2020", "2030"] or "tax" in acc_name or "tds" in acc_name:
             leg["entry_type"] = "Tax / TDS"
         else:
             leg["entry_type"] = "Adjustment"
@@ -6687,9 +7319,10 @@ def api_gl_report():
             if cr > 0 and not is_bank_leg:
                 gl_gross_rev += cr
             if dr > 0 and not is_bank_leg:
-                gl_expenses += dr
                 if gl == "5040":
                     gl_gateway_fees += dr
+                else:
+                    gl_expenses += dr
 
     bank_outflows += sal_outflow
     gl_expenses += sal_outflow
@@ -7972,6 +8605,10 @@ def api_hr_salary_ledger_payments():
     record_ids = [item.get("id") for item in payroll_records if item.get("id")]
     if not record_ids:
         return jsonify({"error": "Select at least one finalized unpaid salary record."}), 400
+    tx_date = transaction.get("transaction_date") or transaction.get("date") or datetime.now().strftime("%Y-%m-%d")
+    is_locked, period, lock_err = check_accounting_period_lock(tx_date, db)
+    if is_locked:
+        return jsonify({"error": lock_err}), 400
     account_id = safe_int(transaction.get("account_id"))
     if not account_id:
         return jsonify({"error": "Select the GL account for salary posting."}), 400
@@ -10724,6 +11361,11 @@ def api_vault_logs():
         {"$limit": 100},
     ]))
     return jsonify(json_ready({"logs": logs}))
+
+
+# Register Task Management Module
+from task_module import init_task_module
+init_task_module(app)
 
 
 if __name__ == "__main__":
