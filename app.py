@@ -32,6 +32,7 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from werkzeug.security import check_password_hash as werkzeug_check_password_hash
 from werkzeug.security import generate_password_hash as werkzeug_generate_password_hash
 from werkzeug.local import LocalProxy
+from cache import cache_endpoint, invalidate_cache, is_redis_available
 # test
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,7 +93,8 @@ def health_check():
         "status": "ok",
         "service": "Swarajya CRM Backend",
         "mongo_uri_configured": mongo_uri_set,
-        "database": db_status
+        "database": db_status,
+        "redis": "connected" if is_redis_available() else "offline"
     })
 
 
@@ -1627,6 +1629,7 @@ def dashboard_payload():
 
 
 @app.route("/api/dashboard")
+@cache_endpoint("dashboard", ttl=120)
 def api_dashboard():
     return jsonify(json_ready(dashboard_payload()))
 

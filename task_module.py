@@ -7,6 +7,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from flask import Blueprint, jsonify, request, session, abort
 import pymongo
+from cache import cache_endpoint, invalidate_cache
 
 task_bp = Blueprint("task_bp", __name__)
 
@@ -254,6 +255,7 @@ def send_task_notification(task, event_type, recipient_user, sender_user, extra=
         "id": notification_id,
         "task_id": task["id"],
         "task_number": task_number,
+        "task_key": task_number,
         "event_type": event_type,
         "recipient_user_id": recipient_user.get("id"),
         "recipient_name": recipient_name,
@@ -429,6 +431,7 @@ def api_tasks_create():
     task_doc = {
         "id": task_id,
         "task_number": task_number,
+        "task_key": task_number,
         "title": title,
         "description": (data.get("description") or "").strip(),
         "task_type": task_type,
@@ -477,6 +480,7 @@ def api_tasks_create():
         "id": get_next_sequence_value("task_activities"),
         "task_id": task_id,
         "task_number": task_number,
+        "task_key": task_number,
         "action": "CREATED",
         "details": f"Task created and assigned to {assignee.get('full_name')}",
         "user_id": user["id"],
@@ -487,6 +491,8 @@ def api_tasks_create():
     # Dispatch assignment email notification to assignee's notification_email
     send_task_notification(task_doc, "assignment", assignee, user)
 
+    invalidate_cache("tasks")
+    invalidate_cache("dashboard")
     created = db.tasks.find_one({"id": task_id}, {"_id": 0})
     return jsonify(json_ready({"task": created, "message": f"Task {task_number} created successfully"})), 201
 
@@ -603,6 +609,8 @@ def api_tasks_update(task_id):
         send_task_notification(updated_task, "reassignment", reassigned_user, user)
 
     updated = db.tasks.find_one({"id": task_id}, {"_id": 0})
+    invalidate_cache("tasks")
+    invalidate_cache("dashboard")
     return jsonify(json_ready({"task": updated, "message": "Task updated successfully"}))
 
 
@@ -921,6 +929,7 @@ def api_tasks_add_dependency(task_id):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @task_bp.route("/api/tasks/dashboard-metrics", methods=["GET"])
+@cache_endpoint("tasks:metrics", ttl=60, user_scoped=True)
 def api_tasks_dashboard_metrics():
     user = require_current_user()
     db = get_db()
@@ -1033,6 +1042,7 @@ def api_tasks_reports():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @task_bp.route("/api/tasks/settings", methods=["GET"])
+@cache_endpoint("tasks:settings", ttl=600)
 def api_tasks_get_settings():
     require_current_user()
     settings = ensure_task_settings()
