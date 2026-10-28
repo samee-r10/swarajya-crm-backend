@@ -34,6 +34,7 @@ from werkzeug.security import generate_password_hash as werkzeug_generate_passwo
 from werkzeug.local import LocalProxy
 from cache import cache_endpoint, invalidate_cache, is_redis_available
 from customer_service import normalize_service_terms
+from finance_ledger import load_ledger_transactions
 # test
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -4887,6 +4888,10 @@ def api_finance_dashboard():
 def api_finance_transactions():
     require_finance_access()
     db = get_db()
+    if request.method == "GET" and request.args.get("metadata_only") == "1":
+        transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
+        fields = get_fields_for_user(transaction_obj["id"]) if transaction_obj else []
+        return jsonify(json_ready({"fields": fields}))
     ensure_default_accounts(db)
     if request.method == "POST":
         data = request.get_json()
@@ -5159,6 +5164,9 @@ def api_finance_transactions():
             {"reference": {"$regex": re.escape(search), "$options": "i"}},
             {"invoice_number": {"$regex": re.escape(search), "$options": "i"}},
         ]
+
+    if request.args.get("view") == "ledger" and not (page and limit):
+        return jsonify(json_ready({"transactions": load_ledger_transactions(db, match_stage)}))
 
     pipeline = []
     if match_stage:
