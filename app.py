@@ -33,6 +33,7 @@ from werkzeug.security import check_password_hash as werkzeug_check_password_has
 from werkzeug.security import generate_password_hash as werkzeug_generate_password_hash
 from werkzeug.local import LocalProxy
 from cache import cache_endpoint, invalidate_cache, is_redis_available
+from customer_service import normalize_service_terms
 # test
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3922,6 +3923,10 @@ def api_customers():
     db = get_db()
     if request.method == "POST":
         data = request.get_json()
+        try:
+            service_terms = normalize_service_terms(data.get("service_terms"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         validation_error = validate_profile_master_fields(db, data)
         if validation_error:
             return jsonify({"error": validation_error}), 400
@@ -3947,6 +3952,7 @@ def api_customers():
             "registration_type": data.get("registration_type"),
             "payment_terms": data.get("payment_terms"),
             "payment_mode": data.get("payment_mode"),
+            "service_terms": service_terms,
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
             "created_by_id": actor_id,
@@ -4019,6 +4025,10 @@ def api_customer_detail(customer_id):
         
     if request.method == "PUT":
         data = request.get_json()
+        try:
+            service_terms = normalize_service_terms(data["service_terms"]) if "service_terms" in data else customer.get("service_terms")
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         validation_error = validate_profile_master_fields(db, data)
         if validation_error:
             return jsonify({"error": validation_error}), 400
@@ -4041,6 +4051,7 @@ def api_customer_detail(customer_id):
             "registration_type": data.get("registration_type"),
             "payment_terms": data.get("payment_terms"),
             "payment_mode": data.get("payment_mode"),
+            "service_terms": service_terms,
             "updated_at": datetime.now(),
             "modified_by_id": actor_id,
             "modified_by_name": actor_name
@@ -4073,6 +4084,31 @@ def api_customer_detail(customer_id):
         "projects": projects,
         "fields": fields
     }))
+
+@app.route("/api/customers/<int:customer_id>/service", methods=["PUT"])
+def api_customer_service(customer_id):
+    actor, actor_id, actor_name = audit_actor()
+    data = request.get_json()
+    if not isinstance(data, dict) or "service_terms" not in data:
+        return jsonify({"error": "Provide service details."}), 400
+    try:
+        service_terms = normalize_service_terms(data["service_terms"])
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    db = get_db()
+    customer = db.customers.find_one({"id": customer_id}, {"_id": 0})
+    if not customer:
+        abort(404)
+    db.customers.update_one({"id": customer_id}, {"$set": {
+        "service_terms": service_terms,
+        "updated_at": datetime.now(),
+        "modified_by_id": actor_id,
+        "modified_by_name": actor_name,
+    }})
+    updated = db.customers.find_one({"id": customer_id}, {"_id": 0})
+    log_activity_async("Customers", "Customer", customer_id, "UPDATE", old_data=customer, new_data=updated, reference_number=updated.get("company_name"))
+    return jsonify(json_ready({"customer": updated}))
+
 
 @app.route("/api/opportunities", methods=["GET", "POST"])
 def api_opportunities():
