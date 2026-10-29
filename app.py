@@ -37,6 +37,7 @@ from customer_service import normalize_service_terms
 from finance_ledger import load_ledger_transactions
 from finance_sales import is_sales_revenue_account, invoice_posting_defaults, validate_invoice_posting
 from salary_posting import salary_payable_details
+from payout_numbering import ensure_payout_numbering, payout_number
 # test
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -9650,10 +9651,13 @@ def api_treasury_stakeholder_payouts():
         amount = parse_float(data.get("amount"))
         if amount <= 0:
             return jsonify({"error": "Payout amount must be greater than zero."}), 400
+        repaired_numbers = ensure_payout_numbering(db)
+        for repair in repaired_numbers:
+            log_treasury_action(user["id"], "Corrected Payout Number", f"Receipt ID {repair['id']}: {repair['old_number']} → {repair['new_number']}.")
         payout_id = get_next_sequence_value("stakeholder_payout_receipts")
         doc = {
             "id": payout_id,
-            "payout_number": data.get("payout_number") or f"SP-{datetime.now().strftime('%Y%m')}-{payout_id:04d}",
+            "payout_number": payout_number(payout_id),
             **recipient,
             "payout_date": data.get("payout_date") or datetime.now().strftime("%Y-%m-%d"),
             "payout_type": payout_type,
@@ -9671,7 +9675,10 @@ def api_treasury_stakeholder_payouts():
             "created_by_id": user["id"],
             "created_by_name": user.get("full_name"),
         }
-        db.stakeholder_payout_receipts.insert_one(doc)
+        try:
+            db.stakeholder_payout_receipts.insert_one(doc)
+        except pymongo.errors.DuplicateKeyError:
+            return jsonify({"error": "A payout receipt with this number already exists. Please retry."}), 409
         if status == "Submitted":
             initialize_stakeholder_payout_approval_workflow(db, payout_id, user)
         log_treasury_action(user["id"], "Created Payout", f"Created payout {doc['payout_number']} for {recipient.get('recipient_name')}.")
