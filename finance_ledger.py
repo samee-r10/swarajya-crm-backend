@@ -4,7 +4,7 @@
 LEDGER_FIELDS = (
     "id", "display_id", "transaction_number", "transaction_date", "date",
     "created_at", "updated_at", "type", "status", "description", "category",
-    "currency", "amount", "total_amount", "cgst_amount", "igst_amount",
+    "currency", "amount", "total_amount", "cgst_amount", "sgst_amount", "igst_amount",
     "tds_amount", "reference", "account_id", "customer_id", "vendor_id",
     "project_id", "invoice_id", "invoice_number", "payment_status",
 )

@@ -35,6 +35,8 @@ from werkzeug.local import LocalProxy
 from cache import cache_endpoint, invalidate_cache, is_redis_available
 from customer_service import normalize_service_terms
 from finance_ledger import load_ledger_transactions
+from finance_sales import is_sales_revenue_account, invoice_posting_defaults, validate_invoice_posting
+from salary_posting import salary_payable_details
 # test
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -592,6 +594,8 @@ def seed_native_standard_fields():
             ("Description", "description", "Long Text", 0),
             ("CGST Percent", "cgst_percent", "Number", 0),
             ("CGST Amount", "cgst_amount", "Number", 0),
+            ("SGST Percent", "sgst_percent", "Number", 0),
+            ("SGST Amount", "sgst_amount", "Number", 0),
             ("IGST Percent", "igst_percent", "Number", 0),
             ("IGST Amount", "igst_amount", "Number", 0),
             ("TDS Percent", "tds_percent", "Number", 0),
@@ -649,6 +653,8 @@ DEFAULT_ACCOUNTS = [
     {"name": "IGST Input Tax Credit", "gl_code": "1030", "type": "Asset"},
     {"name": "TDS Receivable", "gl_code": "1040", "type": "Asset"},
     {"name": "CGST Output Tax Payable", "gl_code": "2010", "type": "Liability"},
+    {"name": "SGST Output Tax Payable", "gl_code": "2015", "type": "Liability"},
+    {"name": "SGST Input Tax Credit", "gl_code": "1025", "type": "Asset"},
     {"name": "IGST Output Tax Payable", "gl_code": "2020", "type": "Liability"},
     {"name": "TDS Payable", "gl_code": "2030", "type": "Liability"},
     {"name": "Sales Revenue", "gl_code": "4000", "type": "Revenue"},
@@ -712,15 +718,11 @@ def calculate_account_balance(db, account, system_accounts=None):
                 if leg.get("debit") is not None:
                     total_debits += float(leg["debit"] or 0.0)
 
-    sal_raw = list(db.hr_salary_transactions.find({}, {"_id": 0}))
-    for st in sal_raw:
-        txn_account_id = safe_int(st.get("account_id"))
-        sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
-        if txn_account_id in matching_account_ids:
-            total_debits += sal_amt
-        bank_acc = system_accounts.get("bank")
-        if bank_acc and bank_acc["id"] in matching_account_ids:
-            total_credits += sal_amt
+    for salary in db.hr_salary_transactions.find({"status": {"$ne": "Reversed"}}, {"_id": 0}):
+        for leg in salary_transaction_gl_legs(db, salary, system_accounts):
+            if safe_int(leg.get("account_id")) in matching_account_ids or gl_code and str(leg.get("gl_code")) == str(gl_code):
+                total_debits += float(leg.get("debit") or 0)
+                total_credits += float(leg.get("credit") or 0)
 
     if acc_type in ["Asset", "Expense"]:
         balance = round(total_debits - total_credits, 2)
@@ -1903,6 +1905,8 @@ def create_finance_transaction(db, payload, actor=None):
     is_locked, period, lock_err = check_accounting_period_lock(date_val, db)
     if is_locked:
         raise ValueError(lock_err)
+    if payload.get("bank_account_id"):
+        require_active_company_bank_account(db, payload["bank_account_id"])
     transaction_id = get_next_sequence_value("transactions")
     amount = parse_float(payload.get("amount"))
     cgst_amount = parse_float(payload.get("cgst_amount"))
@@ -1975,6 +1979,11 @@ def normalize_company_bank_account_payload(data, existing=None):
     account_number = (data.get("account_number") or existing.get("account_number") or "").strip()
     ifsc = (data.get("ifsc") or data.get("ifsc_code") or existing.get("ifsc") or existing.get("ifsc_code") or "").strip()
     currency = (data.get("currency") or existing.get("currency") or "INR").strip()
+    status = data.get("status", existing.get("status", "Active"))
+    if not isinstance(status, str) or status not in {"Active", "Inactive", "Blocked"}:
+        raise ValueError("Bank account status must be Active, Inactive, or Blocked.")
+    if existing.get("status") == "Blocked" and status != "Blocked":
+        raise ValueError("Use Unblock on Company Bank Accounts before changing this account's status.")
     return {
         "account_number": account_number,
         "account_name": account_name,
@@ -1987,9 +1996,36 @@ def normalize_company_bank_account_payload(data, existing=None):
         "opening_balance": parse_float(data.get("opening_balance"), existing.get("opening_balance", 0.0)),
         "account_type": data.get("account_type", existing.get("account_type", "Current Account")),
         "legal_entity": data.get("legal_entity", existing.get("legal_entity", "")),
-        "status": data.get("status", existing.get("status", "Active")),
+        "status": status,
         "remarks": data.get("remarks", existing.get("remarks", "")),
     }
+
+
+ACTIVE_COMPANY_BANK_STATUSES = {"$in": ["Active", None, ""]}
+
+
+def company_bank_account_is_active(account):
+    return bool(account) and (account.get("status") or "Active") == "Active"
+
+
+def require_active_company_bank_account(db, bank_account_id):
+    account = db.company_bank_accounts.find_one({"id": safe_int(bank_account_id)})
+    if not account:
+        raise ValueError("Select a valid Treasury bank account.")
+    if not company_bank_account_is_active(account):
+        raise ValueError(f"This company bank account is {str(account.get('status') or 'inactive').lower()}. Only active bank accounts can be used for transactions.")
+    return account
+
+
+def require_active_finance_bank_accounts(db, *documents):
+    account_ids = {safe_int(doc.get("bank_account_id")) for doc in documents if doc and doc.get("bank_account_id")}
+    for doc in documents:
+        if doc and doc.get("id"):
+            movements = db.company_bank_transactions.find({"source_module": "Finance Transaction", "source_id": doc["id"]})
+            account_ids.update(safe_int(movement.get("bank_account_id")) for movement in movements)
+    for account_id in account_ids:
+        if account_id:
+            require_active_company_bank_account(db, account_id)
 
 
 def company_bank_account_label(account):
@@ -2029,9 +2065,7 @@ def record_company_bank_movement(db, bank_account_id, movement_type, amount, *, 
     bank_account_id = safe_int(bank_account_id)
     if not bank_account_id:
         return None
-    account = db.company_bank_accounts.find_one({"id": bank_account_id, "status": {"$ne": "Inactive"}})
-    if not account:
-        raise ValueError("Select a valid Treasury bank account.")
+    account = require_active_company_bank_account(db, bank_account_id)
     amount = round(parse_float(amount), 2)
     if amount <= 0:
         raise ValueError("Bank movement amount must be greater than zero.")
@@ -2091,6 +2125,9 @@ def sync_finance_transaction_bank_movement(db, transaction_doc, *, previous_doc=
     if transaction_id:
         existing_movements = list(db.company_bank_transactions.find({"source_module": "Finance Transaction", "source_id": transaction_id}))
         affected_account_ids.update(safe_int(item.get("bank_account_id")) for item in existing_movements if item.get("bank_account_id"))
+        for account_id in affected_account_ids:
+            if account_id:
+                require_active_company_bank_account(db, account_id)
         db.company_bank_transactions.delete_many({"source_module": "Finance Transaction", "source_id": transaction_id})
     for account_id in affected_account_ids:
         if account_id:
@@ -2159,7 +2196,7 @@ def sync_transaction_to_expense_log(db, transaction_doc):
     cgst_amount = parse_float(transaction_doc.get("cgst_amount") or 0.0)
     igst_amount = parse_float(transaction_doc.get("igst_amount") or 0.0)
     tds_amount = parse_float(transaction_doc.get("tds_amount") or 0.0)
-    tax_amount = cgst_amount + igst_amount
+    tax_amount = cgst_amount + parse_float(transaction_doc.get("sgst_amount") or 0.0) + igst_amount
     total_amount = parse_float(transaction_doc.get("total_amount") or (amount + tax_amount - tds_amount))
 
     account = db.accounts.find_one({"id": transaction_doc.get("account_id")}) if transaction_doc.get("account_id") else None
@@ -2496,9 +2533,7 @@ def create_system_notification(db, user_id, title, message, link=None):
 
 
 def company_fund_available(db):
-    accounts = list(db.company_bank_accounts.find({"status": {"$ne": "Inactive"}}))
-    if not accounts:
-        accounts = list(db.company_bank_accounts.find())
+    accounts = list(db.company_bank_accounts.find({"status": ACTIVE_COMPANY_BANK_STATUSES}))
     if not accounts:
         return 0.0
     acc_map = {acc["id"]: parse_float(acc.get("opening_balance")) for acc in accounts if "id" in acc}
@@ -3054,6 +3089,50 @@ def get_matching_account_ids(db, account_id):
 INVOICE_RECEIPT_STATUSES = ["Approved", "Partially Paid", "Paid"]
 APPROVED_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid"}
 POST_APPROVAL_INVOICE_STATUSES = {"Approved", "Partially Paid", "Paid", "Cancelled"}
+INVOICE_STATUSES = {"Draft", "Sent", *POST_APPROVAL_INVOICE_STATUSES}
+
+
+def invoice_ledger_amount_paid(db, invoice_id):
+    return invoice_payment_totals(db, invoice_id)[0]
+
+
+def invoice_transaction_payment(tx):
+    amount = tx.get("invoice_allocated_amount")
+    if amount is None:
+        amount = tx.get("total_amount") if tx.get("total_amount") is not None else tx.get("amount")
+    return round(float(amount or 0), 2)
+
+
+def invoice_payment_totals(db, invoice_id):
+    txs = list(db.transactions.find({"invoice_id": invoice_id, "status": {"$ne": "Reversed"}}))
+    return (round(sum(invoice_transaction_payment(tx) for tx in txs), 2),
+            round(sum(invoice_transaction_payment(tx) for tx in txs if tx.get("invoice_payment_recorded")), 2))
+
+
+def invoice_stage_payment_values(db, invoice, status, amount_paid=None):
+    if not isinstance(status, str) or status not in INVOICE_STATUSES:
+        raise ValueError("Select a valid invoice stage.")
+    if invoice.get("status") in APPROVED_INVOICE_STATUSES and status not in POST_APPROVAL_INVOICE_STATUSES:
+        raise ValueError("Approved invoices cannot be moved back to draft or sent status. Void this invoice and create a new one if correction is required.")
+
+    total = round(float(invoice.get("total_amount") or 0), 2)
+    if status == "Partially Paid":
+        try:
+            paid = round(float(amount_paid), 2)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("Enter a valid amount received.")
+        if isinstance(amount_paid, bool) or not 0 < paid < total:
+            raise ValueError("Partial payment must be greater than zero and less than the invoice total. Select Fully Paid for a full payment.")
+    else:
+        paid = total if status == "Paid" else 0.0
+
+    ledger_paid, posted_recorded = invoice_payment_totals(db, invoice["id"])
+    if status != "Cancelled" and paid < ledger_paid:
+        raise ValueError("Amount received cannot be less than linked ledger payments. Reverse or correct those entries first.")
+    # Stage payments are separate from ledger receipts so later reconciliation
+    # neither discards them nor counts existing receipts twice.
+    return {"status": status, "amount_paid": paid,
+            "manual_amount_paid": max(0.0, round(paid - ledger_paid + posted_recorded, 2))}
 
 
 def sync_invoice_status_and_paid(db, invoice_id):
@@ -3068,21 +3147,16 @@ def sync_invoice_status_and_paid(db, invoice_id):
     if not inv:
         return None
 
-    txs = list(db.transactions.find({
-        "invoice_id": inv_id,
-        "status": {"$ne": "Reversed"}
-    }))
-
-    total_paid = sum(
-        round(float(tx.get("total_amount") if tx.get("total_amount") is not None else tx.get("amount") or 0), 2)
-        for tx in txs
-    )
+    ledger_paid, posted_recorded = invoice_payment_totals(db, inv_id)
+    total_paid = ledger_paid + max(0.0, float(inv.get("manual_amount_paid") or 0) - posted_recorded)
     total_amount = round(float(inv.get("total_amount") or 0), 2)
 
     amount_paid = min(total_paid, total_amount)
     balance_due = max(0.0, round(total_amount - total_paid, 2))
 
-    if total_amount > 0 and total_paid >= total_amount - 0.001:
+    if inv.get("status") == "Cancelled":
+        new_status = "Cancelled"
+    elif total_amount > 0 and total_paid >= total_amount - 0.001:
         new_status = "Paid"
         amount_paid = total_amount
     elif total_paid > 0:
@@ -3136,18 +3210,9 @@ def invoice_receipt_summary(invoice):
     }
 
 
-def normalize_invoice_amount_paid(status, amount_paid, total_amount):
-    total = max(0.0, float(total_amount or 0))
-    if status == "Paid":
-        return total
-    if status == "Partially Paid":
-        paid = float(amount_paid or 0)
-        return min(max(0.0, paid), total)
-    return 0.0
-
-
 def invoice_core_values(invoice):
     return {
+        **{field: float(invoice.get(field) or 0) for field in ("cgst_percent", "cgst_amount", "sgst_percent", "sgst_amount", "igst_percent", "igst_amount")},
         "invoice_number": invoice.get("invoice_number"),
         "customer_id": int(invoice["customer_id"]) if invoice.get("customer_id") else None,
         "project_id": int(invoice["project_id"]) if invoice.get("project_id") else None,
@@ -3299,50 +3364,63 @@ def api_finance_account_transactions(account_id):
                     "leg_amount": leg_amt,
                 })
 
-    salary_raw = list(db.hr_salary_transactions.find({}, {"_id": 0}))
-    for st in salary_raw:
-        txn_account_id = safe_int(st.get("account_id"))
-        sal_account = db.accounts.find_one({"id": txn_account_id}, {"_id": 0}) if txn_account_id else None
-        sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
-        sal_date = st.get("transaction_date") or str(st.get("created_at", ""))[:10]
-        
-        # Leg 1: Salary Expense (Debit)
-        exp_acc_id = txn_account_id
-        if exp_acc_id in account_ids:
-            matching_legs.append({
-                **st,
-                "leg_id": f"sal-{st.get('id')}-exp",
-                "type": "Expense",
-                "account_id": exp_acc_id,
-                "description": st.get("description") or st.get("category") or "Salary Expense",
-                "transaction_date": sal_date,
-                "debit": sal_amt,
-                "credit": None,
-                "amount": sal_amt,
-                "total_amount": sal_amt,
-                "leg_amount": sal_amt,
-            })
-            
-        # Leg 2: Bank Outflow (Credit)
-        bank_acc = system_accounts.get("bank")
-        bank_acc_id = bank_acc["id"] if bank_acc else None
-        if bank_acc_id in account_ids:
-            matching_legs.append({
-                **st,
-                "leg_id": f"sal-{st.get('id')}-bank",
-                "type": "Income",
-                "account_id": bank_acc_id,
-                "description": f"Salary Payment Outflow ({st.get('id')})",
-                "transaction_date": sal_date,
-                "debit": None,
-                "credit": sal_amt,
-                "amount": sal_amt,
-                "total_amount": sal_amt,
-                "leg_amount": sal_amt,
-            })
+    for salary in db.hr_salary_transactions.find({"status": {"$ne": "Reversed"}}, {"_id": 0}):
+        matching_legs.extend(leg for leg in salary_transaction_gl_legs(db, salary, system_accounts)
+                             if safe_int(leg.get("account_id")) in account_ids)
 
     matching_legs.sort(key=lambda x: (x.get("transaction_date") or x.get("created_at") or ""), reverse=True)
     return jsonify(json_ready({"account": account, "transactions": matching_legs}))
+
+
+def paid_sales_invoice_query(db, account_id, customer_id, project_id):
+    return {
+        "customer_id": customer_id, "project_id": project_id, "status": "Paid",
+        "$or": [{"account_id": {"$in": get_matching_account_ids(db, account_id)}},
+                {"account_id": None}, {"account_id": {"$exists": False}}],
+    }
+
+
+def prepare_sales_invoice_posting(db, data, selected_account, existing_transaction=None):
+    customer_id = safe_int(data.get("customer_id"))
+    project_id = safe_int(data.get("project_id"))
+    invoice_id = safe_int(data.get("invoice_id"))
+    if not customer_id or not project_id or not invoice_id:
+        raise ValueError("Select a customer, project, and paid unposted invoice for this sales entry.")
+    query = paid_sales_invoice_query(db, selected_account["id"], customer_id, project_id)
+    invoice = db.invoices.find_one({**query, "id": invoice_id})
+    if not invoice:
+        raise ValueError("Select a paid invoice belonging to the selected customer, project, and sales account.")
+    tx_query = {"invoice_id": invoice_id, "status": {"$ne": "Reversed"}}
+    if existing_transaction:
+        tx_query["id"] = {"$ne": existing_transaction["id"]}
+    if db.transactions.find_one(tx_query):
+        raise ValueError("This invoice has already been posted. Reverse the existing entry before posting it again.")
+    return validate_invoice_posting(invoice, data, existing_transaction)
+
+
+@app.route("/api/finance/invoices/paid-unposted")
+def api_finance_paid_unposted_invoices():
+    require_finance_access()
+    db = get_db()
+    customer_id = request.args.get("customer_id", type=int)
+    project_id = request.args.get("project_id", type=int)
+    account_id = request.args.get("account_id", type=int)
+    if not customer_id or not project_id or not account_id:
+        return jsonify({"invoices": []})
+    account = db.accounts.find_one({"id": account_id})
+    if not is_sales_revenue_account(account) or not account_available_for_transaction(account, "Income"):
+        return jsonify({"invoices": []})
+    query = paid_sales_invoice_query(db, account_id, customer_id, project_id)
+    invoices = list(db.invoices.find(query, {"_id": 0}).sort([("issue_date", -1), ("id", -1)]))
+    tx_query = {"invoice_id": {"$in": [inv["id"] for inv in invoices]}, "status": {"$ne": "Reversed"}}
+    editing_id = request.args.get("transaction_id")
+    if editing_id:
+        tx_query["id"] = {"$ne": editing_id}
+    posted_ids = {tx["invoice_id"] for tx in db.transactions.find(tx_query, {"invoice_id": 1})}
+    return jsonify(json_ready({"invoices": [
+        {**invoice, "posting_defaults": invoice_posting_defaults(invoice)}
+        for invoice in invoices if invoice["id"] not in posted_ids
+    ]}))
 
 
 @app.route("/api/finance/invoices/receivable")
@@ -4895,15 +4973,21 @@ def api_finance_transactions():
     ensure_default_accounts(db)
     if request.method == "POST":
         data = request.get_json()
+        try:
+            require_active_finance_bank_accounts(db, {"bank_account_id": data.get("bank_account_id")})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         seq = get_next_sequence_value("transactions")
         transaction_id = f"TXN{seq:03d}"
         
         amount = round(float(data.get("amount") or 0), 2)
         cgst_percent = float(data.get("cgst_percent") or 0)
+        sgst_percent = float(data.get("sgst_percent") or 0)
         igst_percent = float(data.get("igst_percent") or 0)
         tds_percent = float(data.get("tds_percent") or 0)
         
         cgst_amount = round(amount * (cgst_percent / 100.0), 2)
+        sgst_amount = round(amount * (sgst_percent / 100.0), 2)
         igst_amount = round(amount * (igst_percent / 100.0), 2)
         tds_amount = round(amount * (tds_percent / 100.0), 2)
 
@@ -4919,12 +5003,12 @@ def api_finance_transactions():
         
         transaction_type = data.get("type", "Income")
         if transaction_type == "Income":
-            total_amount = round(amount + cgst_amount + igst_amount + additional_charges - tds_amount - platform_fee_amount, 2)
+            total_amount = round(amount + cgst_amount + sgst_amount + igst_amount + additional_charges - tds_amount - platform_fee_amount, 2)
             tot_debits = round(total_amount + platform_fee_amount + tds_amount, 2)
-            tot_credits = round(amount + additional_charges + cgst_amount + igst_amount, 2)
+            tot_credits = round(amount + additional_charges + cgst_amount + sgst_amount + igst_amount, 2)
         else:
-            total_amount = round(amount + cgst_amount + igst_amount + additional_charges + platform_fee_amount - tds_amount, 2)
-            tot_debits = round(amount + additional_charges + platform_fee_amount + cgst_amount + igst_amount, 2)
+            total_amount = round(amount + cgst_amount + sgst_amount + igst_amount + additional_charges + platform_fee_amount - tds_amount, 2)
+            tot_debits = round(amount + additional_charges + platform_fee_amount + cgst_amount + sgst_amount + igst_amount, 2)
             tot_credits = round(total_amount + tds_amount, 2)
             
         diff = round(abs(tot_debits - tot_credits), 2)
@@ -4949,34 +5033,15 @@ def api_finance_transactions():
             return jsonify({"error": "Selected account is not available for this transaction type."}), 400
         invoice_id = int(data.get("invoice_id")) if data.get("invoice_id") else None
         invoice_number = data.get("invoice_number")
-        needs_invoice = transaction_type == "Income" and selected_account and selected_account.get("name") == "Sales Revenue"
+        needs_invoice = transaction_type == "Income" and is_sales_revenue_account(selected_account)
+        invoice_posting = {}
         if needs_invoice:
-            if not customer_id:
-                return jsonify({"error": "Customer is required for Sales Revenue receipts."}), 400
-            if not invoice_id:
-                return jsonify({"error": "Invoice number is required for Sales Revenue receipts."}), 400
-            matching_ids = get_matching_account_ids(db, account_id)
-            sync_invoice_status_and_paid(db, invoice_id)
-            invoice = db.invoices.find_one({
-                "id": invoice_id,
-                "customer_id": customer_id,
-                "$or": [
-                    {"account_id": {"$in": matching_ids}},
-                    {"account_id": {"$exists": False}},
-                    {"account_id": None},
-                ],
-            })
-            if not invoice:
-                return jsonify({"error": "Select a valid invoice for this customer and account."}), 400
-            inv_total = round(float(invoice.get("total_amount") or 0), 2)
-            inv_paid = round(float(invoice.get("amount_paid") or 0), 2)
-            rem_balance = max(0.0, round(inv_total - inv_paid, 2))
-            inv_num = invoice.get("invoice_number") or f"#{invoice_id}"
-            if invoice.get("status") == "Paid" or rem_balance <= 0.001:
-                return jsonify({"error": f"Invoice {inv_num} is already fully paid."}), 400
-            if total_amount > rem_balance + 0.001:
-                return jsonify({"error": f"Transaction amount ({total_amount:,.2f}) exceeds the remaining balance due ({rem_balance:,.2f}) for invoice {inv_num}."}), 400
-            invoice_number = invoice.get("invoice_number")
+            try:
+                invoice_posting = prepare_sales_invoice_posting(db, data, selected_account)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+            invoice_id = invoice_posting["invoice_id"]
+            invoice_number = invoice_posting["invoice_number"]
         else:
             invoice_id = None
             invoice_number = None
@@ -5015,6 +5080,11 @@ def api_finance_transactions():
             linked_loan = db.loan_accounts.find_one({"id": loan_account_id, "status": {"$ne": "Cancelled"}})
             if not linked_loan:
                 return jsonify({"error": "Select a valid loan account."}), 400
+            if linked_loan.get("bank_account_id"):
+                try:
+                    require_active_company_bank_account(db, linked_loan["bank_account_id"])
+                except ValueError as exc:
+                    return jsonify({"error": str(exc)}), 400
             if category == "Loan Disbursement":
                 if transaction_type != "Income":
                     return jsonify({"error": "Loan disbursement must be posted as an income/inflow transaction."}), 400
@@ -5057,6 +5127,8 @@ def api_finance_transactions():
             "status": data.get("status", "Completed"),
             "cgst_percent": cgst_percent,
             "cgst_amount": cgst_amount,
+            "sgst_percent": sgst_percent,
+            "sgst_amount": sgst_amount,
             "igst_percent": igst_percent,
             "igst_amount": igst_amount,
             "tds_percent": tds_percent,
@@ -5075,10 +5147,16 @@ def api_finance_transactions():
             "modified_by_id": actor_id,
             "modified_by_name": actor_name
         }
-        merge_client_fields(insert_data, data)
+        insert_data.update(invoice_posting)
+        merge_client_fields(insert_data, data, protected_keys={"invoice_payment_recorded", "invoice_allocated_amount", "invoice_posting_key"})
         insert_data["bank_account_id"] = None
 
-        db.transactions.insert_one(insert_data)
+        if invoice_posting:
+            db.transactions.create_index("invoice_posting_key", unique=True, sparse=True)
+        try:
+            db.transactions.insert_one(insert_data)
+        except pymongo.errors.DuplicateKeyError:
+            return jsonify({"error": "This invoice has already been posted. Refresh the invoice list."}), 409
         if category == "Loan Disbursement" and linked_loan:
             disb_id = get_next_sequence_value("loan_disbursements")
             db.loan_disbursements.insert_one({
@@ -5269,6 +5347,11 @@ def api_finance_transaction_detail(transaction_id):
         if is_locked:
             return jsonify({"error": f"Cannot delete transaction: {lock_err}"}), 400
 
+        try:
+            require_active_finance_bank_accounts(db, old_tx)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
         db.transactions.delete_one({"id": transaction_id})
 
         synced_revenues = list(
@@ -5312,16 +5395,22 @@ def api_finance_transaction_detail(transaction_id):
             return jsonify({"error": f"Cannot modify transaction: {lock_err}"}), 400
 
         data = request.get_json()
+        try:
+            require_active_finance_bank_accounts(db, {"bank_account_id": data.get("bank_account_id")}, old_tx)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         new_date = data.get("transaction_date") or data.get("date") or old_date
         is_locked_new, period_new, lock_err_new = check_accounting_period_lock(new_date, db)
         if is_locked_new:
             return jsonify({"error": lock_err_new}), 400
         amount = round(float(data.get("amount") or 0), 2)
         cgst_percent = float(data.get("cgst_percent") or 0)
+        sgst_percent = float(data.get("sgst_percent") or 0)
         igst_percent = float(data.get("igst_percent") or 0)
         tds_percent = float(data.get("tds_percent") or 0)
         
         cgst_amount = round(amount * (cgst_percent / 100.0), 2)
+        sgst_amount = round(amount * (sgst_percent / 100.0), 2)
         igst_amount = round(amount * (igst_percent / 100.0), 2)
         tds_amount = round(amount * (tds_percent / 100.0), 2)
 
@@ -5337,12 +5426,12 @@ def api_finance_transaction_detail(transaction_id):
 
         transaction_type = data.get("type") or "Income"
         if transaction_type == "Income":
-            total_amount = round(amount + cgst_amount + igst_amount + additional_charges - tds_amount - platform_fee_amount, 2)
+            total_amount = round(amount + cgst_amount + sgst_amount + igst_amount + additional_charges - tds_amount - platform_fee_amount, 2)
             tot_debits = round(total_amount + platform_fee_amount + tds_amount, 2)
-            tot_credits = round(amount + additional_charges + cgst_amount + igst_amount, 2)
+            tot_credits = round(amount + additional_charges + cgst_amount + sgst_amount + igst_amount, 2)
         else:
-            total_amount = round(amount + cgst_amount + igst_amount + additional_charges + platform_fee_amount - tds_amount, 2)
-            tot_debits = round(amount + additional_charges + platform_fee_amount + cgst_amount + igst_amount, 2)
+            total_amount = round(amount + cgst_amount + sgst_amount + igst_amount + additional_charges + platform_fee_amount - tds_amount, 2)
+            tot_debits = round(amount + additional_charges + platform_fee_amount + cgst_amount + sgst_amount + igst_amount, 2)
             tot_credits = round(total_amount + tds_amount, 2)
 
         diff = round(abs(tot_debits - tot_credits), 2)
@@ -5363,39 +5452,15 @@ def api_finance_transaction_detail(transaction_id):
             return jsonify({"error": "Selected account is not available for this transaction type."}), 400
         invoice_id = int(data.get("invoice_id")) if data.get("invoice_id") else None
         invoice_number = data.get("invoice_number")
-        needs_invoice = transaction_type == "Income" and selected_account and selected_account.get("name") == "Sales Revenue"
+        needs_invoice = transaction_type == "Income" and is_sales_revenue_account(selected_account)
+        invoice_posting = {}
         if needs_invoice:
-            if not customer_id:
-                return jsonify({"error": "Customer is required for Sales Revenue receipts."}), 400
-            if not invoice_id:
-                return jsonify({"error": "Invoice number is required for Sales Revenue receipts."}), 400
-            matching_ids = get_matching_account_ids(db, account_id)
-            invoice = db.invoices.find_one({
-                "id": invoice_id,
-                "customer_id": customer_id,
-                "$or": [
-                    {"account_id": {"$in": matching_ids}},
-                    {"account_id": {"$exists": False}},
-                    {"account_id": None},
-                ],
-            })
-            if not invoice:
-                return jsonify({"error": "Select a valid invoice for this customer and account."}), 400
-
-            other_txs = list(db.transactions.find({
-                "invoice_id": invoice_id,
-                "id": {"$ne": transaction_id},
-                "status": {"$ne": "Reversed"}
-            }))
-            other_paid = sum(round(float(tx.get("total_amount") if tx.get("total_amount") is not None else tx.get("amount") or 0), 2) for tx in other_txs)
-            inv_total = round(float(invoice.get("total_amount") or 0), 2)
-            rem_balance = max(0.0, round(inv_total - other_paid, 2))
-            inv_num = invoice.get("invoice_number") or f"#{invoice_id}"
-            if rem_balance <= 0.001:
-                return jsonify({"error": f"Invoice {inv_num} is already fully paid by other transactions."}), 400
-            if total_amount > rem_balance + 0.001:
-                return jsonify({"error": f"Transaction amount ({total_amount:,.2f}) exceeds the remaining balance due ({rem_balance:,.2f}) for invoice {inv_num}."}), 400
-            invoice_number = invoice.get("invoice_number")
+            try:
+                invoice_posting = prepare_sales_invoice_posting(db, data, selected_account, old_tx)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+            invoice_id = invoice_posting["invoice_id"]
+            invoice_number = invoice_posting["invoice_number"]
         else:
             invoice_id = None
             invoice_number = None
@@ -5427,6 +5492,11 @@ def api_finance_transaction_detail(transaction_id):
             linked_loan = db.loan_accounts.find_one({"id": loan_account_id, "status": {"$ne": "Cancelled"}})
             if not linked_loan:
                 return jsonify({"error": "Select a valid loan account."}), 400
+            if linked_loan.get("bank_account_id"):
+                try:
+                    require_active_company_bank_account(db, linked_loan["bank_account_id"])
+                except ValueError as exc:
+                    return jsonify({"error": str(exc)}), 400
             if category == "Loan Disbursement" and transaction_type != "Income":
                 return jsonify({"error": "Loan disbursement must be posted as an income/inflow transaction."}), 400
             if category == "Loan Repayment":
@@ -5467,6 +5537,8 @@ def api_finance_transaction_detail(transaction_id):
             "status": data.get("status") or old_tx.get("status") or "Completed",
             "cgst_percent": cgst_percent,
             "cgst_amount": cgst_amount,
+            "sgst_percent": sgst_percent,
+            "sgst_amount": sgst_amount,
             "igst_percent": igst_percent,
             "igst_amount": igst_amount,
             "tds_percent": tds_percent,
@@ -5482,14 +5554,23 @@ def api_finance_transaction_detail(transaction_id):
             "modified_by_id": actor_id,
             "modified_by_name": actor_name,
         }
-        db.transactions.update_one({"id": transaction_id}, {"$set": update_payload})
+        update_payload.update(invoice_posting)
+        update = {"$set": update_payload}
+        if not invoice_posting:
+            update["$unset"] = {"invoice_payment_recorded": "", "invoice_allocated_amount": "", "invoice_posting_key": ""}
+        else:
+            db.transactions.create_index("invoice_posting_key", unique=True, sparse=True)
+        try:
+            db.transactions.update_one({"id": transaction_id}, update)
+        except pymongo.errors.DuplicateKeyError:
+            return jsonify({"error": "This invoice has already been posted. Refresh the invoice list."}), 409
         transaction_obj = db.custom_objects.find_one({"api_name": "transactions"})
         transaction_fields = get_fields_for_user(transaction_obj["id"]) if transaction_obj else []
         native_field_names = {field["api_name"] for field in transaction_fields if field.get("is_native")}
         dynamic_update_data = {
             k: v
             for k, v in data.items()
-            if k not in native_field_names and k not in {"id", "created_at", "updated_at"}
+            if k not in native_field_names and k not in update_payload and k not in {"id", "created_at", "updated_at", "invoice_payment_recorded", "invoice_allocated_amount", "invoice_posting_key"}
         }
         if dynamic_update_data:
             db.transactions.update_one({"id": transaction_id}, {"$set": dynamic_update_data})
@@ -5578,6 +5659,10 @@ def api_finance_transaction_reverse(transaction_id):
     old_tx = db.transactions.find_one({"id": transaction_id})
     if not old_tx:
         abort(404)
+    try:
+        require_active_finance_bank_accounts(db, old_tx)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     old_date = old_tx.get("transaction_date") or old_tx.get("date")
     is_locked, period, lock_err = check_accounting_period_lock(old_date, db)
     if is_locked:
@@ -5589,7 +5674,7 @@ def api_finance_transaction_reverse(transaction_id):
 
     res = db.transactions.update_one(
         {"id": transaction_id},
-        {"$set": {"status": "Reversed"}}
+        {"$set": {"status": "Reversed"}, "$unset": {"invoice_posting_key": ""}}
     )
     new_tx = db.transactions.find_one({"id": transaction_id})
     log_activity_async("Finance", "Accounting Entry", transaction_id, "UPDATE", old_data=old_tx, new_data=new_tx, reference_number=new_tx.get("reference") if new_tx else None)
@@ -5667,7 +5752,7 @@ def explain_transaction_gl(entries, currency="INR"):
             parts.append(f"Bank Account decreased by {sym}{amt:,.2f} through a credit disbursement")
         elif gl == "2000":
             parts.append(f"Accounts Payable liability increased by {sym}{amt:,.2f} through a credit")
-        elif gl in ["2010", "2020"]:
+        elif gl in ["2010", "2015", "2020"]:
             parts.append(f"{name} liability recognized with {sym}{amt:,.2f}")
         elif gl == "2030":
             parts.append(f"TDS Payable liability withheld of {sym}{amt:,.2f} through a credit")
@@ -5761,42 +5846,7 @@ def api_finance_transaction_gl_entries(transaction_id):
         }))
 
     if is_salary:
-        sal_amt = parse_float(tx.get("total_amount") or tx.get("amount"))
-        sal_date = tx.get("transaction_date") or str(tx.get("created_at", ""))[:10]
-        legs = [
-            {
-                **tx,
-                "id": transaction_id,
-                "leg_id": f"{transaction_id}-exp",
-                "account_name": "Salaries Expense",
-                "gl_code": "6010",
-                "gl_account_number": "6010",
-                "gl_account_name": "Salaries Expense",
-                "type": "Expense",
-                "account_type": "Expense",
-                "debit": sal_amt,
-                "credit": None,
-                "currency": currency,
-                "transaction_date": sal_date,
-                "description": tx.get("description") or f"Monthly Salary Disbursement ({tx.get('employee_name', '')})"
-            },
-            {
-                **tx,
-                "id": transaction_id,
-                "leg_id": f"{transaction_id}-bank",
-                "account_name": "Bank Account",
-                "gl_code": "1010",
-                "gl_account_number": "1010",
-                "gl_account_name": "Bank Account",
-                "type": "Asset",
-                "account_type": "Asset",
-                "debit": None,
-                "credit": sal_amt,
-                "currency": currency,
-                "transaction_date": sal_date,
-                "description": f"Net Salary Payout from Bank ({transaction_id})"
-            }
-        ]
+        legs = salary_transaction_gl_legs(db, tx, system_accounts, accounts_cache=accounts_cache)
     else:
         legs = expand_transaction_to_gl_legs(db, tx, system_accounts, accounts_cache=accounts_cache)
 
@@ -6041,7 +6091,12 @@ def api_invoices():
         actor, actor_id, actor_name = audit_actor()
         total_amount = float(data.get("total_amount", 0))
         status = data.get("status", "Draft")
-        amount_paid = normalize_invoice_amount_paid(status, data.get("amount_paid"), total_amount)
+        try:
+            payment_values = invoice_stage_payment_values(
+                db, {"id": invoice_id, "total_amount": total_amount}, status, data.get("amount_paid")
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         insert_data = {
             "id": invoice_id,
             "invoice_number": invoice_number,
@@ -6055,10 +6110,10 @@ def api_invoices():
             "subtotal": float(data.get("subtotal", 0)),
             "tax_rate": float(data.get("tax_rate", 0)),
             "tax_amount": float(data.get("tax_amount", 0)),
+            **{field: float(data[field] or 0) for field in ("cgst_percent", "cgst_amount", "sgst_percent", "sgst_amount", "igst_percent", "igst_amount") if field in data},
             "total_amount": total_amount,
             "currency": data.get("currency", "USD"),
-            "status": status,
-            "amount_paid": amount_paid,
+            **payment_values,
             "notes": data.get("notes"),
             "items": data.get("items", []),
             "bank_account_id": int(data["bank_account_id"]) if data.get("bank_account_id") else None,
@@ -6137,6 +6192,29 @@ def api_invoices():
         resp_data["limit"] = limit
     return jsonify(json_ready(resp_data))
 
+@app.route("/api/finance/invoices/<int:invoice_id>/status", methods=["PUT"])
+def api_invoice_status(invoice_id):
+    require_finance_access()
+    db = get_db()
+    old_inv = db.invoices.find_one({"id": invoice_id})
+    if not old_inv:
+        abort(404)
+    data = request.get_json() or {}
+    if not isinstance(data, dict) or set(data) - {"status", "amount_paid"}:
+        return jsonify({"error": "Only stage and amount received can be updated here."}), 400
+    try:
+        values = invoice_stage_payment_values(db, old_inv, data.get("status"), data.get("amount_paid"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    actor, actor_id, actor_name = audit_actor()
+    values.update({"updated_at": datetime.now(), "modified_by_id": actor_id, "modified_by_name": actor_name})
+    db.invoices.update_one({"id": invoice_id}, {"$set": values})
+    new_inv = sync_invoice_status_and_paid(db, invoice_id)
+    log_activity_async("Finance", "Invoice", invoice_id, "UPDATE", old_data=old_inv,
+                       new_data=new_inv, reference_number=new_inv.get("invoice_number"))
+    return jsonify(json_ready({"invoice": {key: value for key, value in new_inv.items() if key != "_id"}}))
+
+
 @app.route("/api/finance/invoices/<int:invoice_id>", methods=["GET", "PUT", "DELETE"])
 def api_invoice_detail(invoice_id):
     require_finance_access()
@@ -6161,7 +6239,12 @@ def api_invoice_detail(invoice_id):
         inv_number = data.get("invoice_number") or (old_inv.get("invoice_number") if old_inv else None)
         bank_account_id = int(data["bank_account_id"]) if data.get("bank_account_id") else None
         total_amount = float(data.get("total_amount")) if data.get("total_amount") is not None else 0.0
-        amount_paid = normalize_invoice_amount_paid(status, data.get("amount_paid"), total_amount)
+        try:
+            payment_values = invoice_stage_payment_values(
+                db, {**old_inv, "total_amount": total_amount}, status, data.get("amount_paid")
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         db.invoices.update_one(
             {"id": invoice_id},
             {"$set": {
@@ -6176,10 +6259,10 @@ def api_invoice_detail(invoice_id):
                 "subtotal": float(data.get("subtotal")) if data.get("subtotal") is not None else 0.0,
                 "tax_rate": float(data.get("tax_rate")) if data.get("tax_rate") is not None else 0.0,
                 "tax_amount": float(data.get("tax_amount")) if data.get("tax_amount") is not None else 0.0,
+                **{field: float(data[field] or 0) for field in ("cgst_percent", "cgst_amount", "sgst_percent", "sgst_amount", "igst_percent", "igst_amount") if field in data},
                 "total_amount": total_amount,
                 "currency": data.get("currency"),
-                "status": status,
-                "amount_paid": amount_paid,
+                **payment_values,
                 "notes": data.get("notes"),
                 "items": data.get("items", []),
                 "bank_account_id": bank_account_id,
@@ -6560,6 +6643,8 @@ def get_system_gl_accounts(db):
         "additional_charges_income": ("Additional Charges Income", "4020", "Revenue"),
         "additional_charges_expense": ("Additional Charges Expense", "5050", "Expense"),
         "cgst_output": ("CGST Output Tax Payable", "2010", "Liability"),
+        "sgst_output": ("SGST Output Tax Payable", "2015", "Liability"),
+        "sgst_input": ("SGST Input Tax Credit", "1025", "Asset"),
         "igst_output": ("IGST Output Tax Payable", "2020", "Liability"),
         "cgst_input": ("CGST Input Tax Credit", "1020", "Asset"),
         "igst_input": ("IGST Input Tax Credit", "1030", "Asset"),
@@ -6596,6 +6681,29 @@ def get_system_gl_accounts(db):
     return system_map
 
 
+def salary_transaction_is_accrual(transaction):
+    return (transaction.get("transaction_type") == "Salary Payable"
+            or transaction.get("status") == "Pending Payable"
+            or transaction.get("payment_status") == "Unpaid")
+
+
+def salary_transaction_gl_legs(db, transaction, system_accounts, accounts_cache=None):
+    if transaction.get("status") == "Reversed":
+        return []
+    amount = parse_float(transaction.get("total_amount") or transaction.get("amount"))
+    date_value = str(transaction.get("transaction_date") or transaction.get("date") or transaction.get("created_at") or "")[:10]
+    normalized = {
+        **transaction, "type": "Expense", "source_module": "HR Salary",
+        "amount": amount, "total_amount": amount, "date": date_value, "transaction_date": date_value,
+        "payment_status": "Unpaid" if salary_transaction_is_accrual(transaction) else "Paid",
+        "account_name": transaction.get("account_name") or "Salaries Expense",
+        "gl_code": transaction.get("gl_code") or "5010",
+        "cgst_amount": 0, "sgst_amount": 0, "igst_amount": 0, "tds_amount": 0,
+        "additional_charges": 0, "additional_charges_amount": 0, "platform_fee_amount": 0, "platform_charges": 0,
+    }
+    return expand_transaction_to_gl_legs(db, normalized, system_accounts, accounts_cache=accounts_cache)
+
+
 def expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=None):
     legs = []
     t_id = str(t.get("id") or "")
@@ -6604,15 +6712,16 @@ def expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=None):
     
     amount = round(float(t.get("amount") or 0.0), 2)
     cgst_amount = round(float(t.get("cgst_amount") or 0.0), 2)
+    sgst_amount = round(float(t.get("sgst_amount") or 0.0), 2)
     igst_amount = round(float(t.get("igst_amount") or 0.0), 2)
     tds_amount = round(float(t.get("tds_amount") or 0.0), 2)
     additional_charges = round(float(t.get("additional_charges") or t.get("additional_charges_amount") or 0.0), 2)
     platform_fee = round(float(t.get("platform_fee_amount") or t.get("platform_charges") or 0.0), 2)
     
     if t_type == "Income":
-        total_amount = parse_float(t.get("total_amount"), amount + cgst_amount + igst_amount + additional_charges - tds_amount - platform_fee)
+        total_amount = parse_float(t.get("total_amount"), amount + cgst_amount + sgst_amount + igst_amount + additional_charges - tds_amount - platform_fee)
     else:
-        total_amount = parse_float(t.get("total_amount"), amount + cgst_amount + igst_amount + additional_charges + platform_fee - tds_amount)
+        total_amount = parse_float(t.get("total_amount"), amount + cgst_amount + sgst_amount + igst_amount + additional_charges + platform_fee - tds_amount)
 
     primary_acc_id = safe_int(t.get("account_id"))
     primary_acc_name = t.get("account_name") or t.get("gl_account_name")
@@ -7009,6 +7118,20 @@ def expand_transaction_to_gl_legs(db, t, system_accounts, accounts_cache=None):
                 "description": desc_text,
             })
 
+    if sgst_amount > 0:
+        is_income = t_type == "Income"
+        acc = system_accounts.get("sgst_output" if is_income else "sgst_input") or {}
+        gl_code = acc.get("gl_code", "2015" if is_income else "1025")
+        name = acc.get("name", "SGST Output Tax Payable" if is_income else "SGST Input Tax Credit")
+        acc_type = "Liability" if is_income else "Asset"
+        legs.append({**t, "id": t_id, "leg_id": f"{t_id}-sgst", "account_id": acc.get("id"),
+                     "gl_code": gl_code, "gl_account_number": gl_code, "account_name": name,
+                     "gl_account_name": name, "type": acc_type, "account_type": acc_type,
+                     "debit": None if is_income else sgst_amount, "credit": sgst_amount if is_income else None,
+                     "debit_amount": 0.0 if is_income else sgst_amount,
+                     "credit_amount": sgst_amount if is_income else 0.0,
+                     "leg_amount": sgst_amount, "amount": sgst_amount,
+                     "description": f"{name} ({t.get('sgst_percent', 0)}%)"})
     return legs
 
 
@@ -7073,20 +7196,15 @@ def api_gl_report():
 
         salary_open_query = {"transaction_date": {"$lt": start_date}}
         opening_sal_txns = list(db.hr_salary_transactions.find(salary_open_query))
-        for st in opening_sal_txns:
-            txn_account_id = safe_int(st.get("account_id"))
-            sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
-            sal_date = st.get("transaction_date") or str(st.get("created_at", ""))[:10]
-            amt_usd = convert_to_usd(sal_amt, st.get("currency") or "INR", sal_date, inr_rate, setting)
-            if account_id:
-                if txn_account_id and int(txn_account_id) == int(account_id):
-                    if acc_type in ["Asset", "Expense"]:
-                        opening_balance += amt_usd
-                    else:
-                        opening_balance -= amt_usd
-            else:
-                opening_balance -= amt_usd
-                
+        for salary in opening_sal_txns:
+            for leg in salary_transaction_gl_legs(db, salary, system_accounts, accounts_cache=accounts_cache):
+                amount = float(leg.get("debit") or 0) - float(leg.get("credit") or 0)
+                amount_usd = convert_to_usd(amount, leg.get("currency") or "INR", leg.get("transaction_date"), inr_rate, setting)
+                if account_id and str(leg.get("account_id")) == str(account_id):
+                    opening_balance += amount_usd if acc_type in ["Asset", "Expense"] else -amount_usd
+                elif not account_id and str(leg.get("gl_code")) == "1010":
+                    opening_balance += amount_usd
+
     # 2. Fetch period transactions from main finance transactions
     period_query = {"status": {"$ne": "Reversed"}}
     if start_date and end_date:
@@ -7144,69 +7262,11 @@ def api_gl_report():
         salary_date_query if salary_date_query else {}, {"_id": 0}
     ))
 
-    for st in salary_transactions_raw:
-        txn_account_id = safe_int(st.get("account_id"))
-        sal_account = accounts_cache.get(txn_account_id) if txn_account_id else None
-        sal_amt = parse_float(st.get("total_amount") or st.get("amount"))
-        sal_date = st.get("transaction_date") or str(st.get("created_at", ""))[:10]
-        
-        # Leg 1: Salary Expense (Debit)
-        exp_acc_id = txn_account_id
-        exp_gl_code = (sal_account or {}).get("gl_code") or st.get("gl_code") or "5010"
-        exp_acc_name = (sal_account or {}).get("name") or st.get("account_name") or "Salary"
-        
-        sal_exp_leg = {
-            **st,
-            "leg_id": f"sal-{st.get('id')}-exp",
-            "type": "Expense",
-            "account_id": exp_acc_id,
-            "gl_code": exp_gl_code,
-            "gl_account_number": exp_gl_code,
-            "account_name": exp_acc_name,
-            "gl_account_name": exp_acc_name,
-            "source_module": "HR Salary",
-            "description": st.get("description") or st.get("category") or "Salary Expense",
-            "transaction_date": sal_date,
-            "date": sal_date,
-            "currency": st.get("currency") or "INR",
-            "debit": sal_amt,
-            "credit": None,
-            "amount": sal_amt,
-            "total_amount": sal_amt,
-        }
-        
-        # Leg 2: Bank Account Outflow / Salary Payable (Credit)
-        bank_acc = system_accounts.get("bank")
-        bank_acc_id = bank_acc["id"] if bank_acc else None
-        bank_gl_code = (bank_acc or {}).get("gl_code", "1010")
-        bank_acc_name = (bank_acc or {}).get("name", "Bank Account")
-        
-        sal_bank_leg = {
-            **st,
-            "leg_id": f"sal-{st.get('id')}-bank",
-            "type": "Income",
-            "account_id": bank_acc_id,
-            "gl_code": bank_gl_code,
-            "gl_account_number": bank_gl_code,
-            "account_name": bank_acc_name,
-            "gl_account_name": bank_acc_name,
-            "source_module": "HR Salary",
-            "description": f"Salary Payment Outflow ({st.get('id')})",
-            "transaction_date": sal_date,
-            "date": sal_date,
-            "currency": st.get("currency") or "INR",
-            "debit": None,
-            "credit": sal_amt,
-            "amount": sal_amt,
-            "total_amount": sal_amt,
-        }
-
-        all_sal_legs = [sal_exp_leg, sal_bank_leg]
+    for salary in salary_transactions_raw:
+        salary_legs = salary_transaction_gl_legs(db, salary, system_accounts, accounts_cache=accounts_cache)
         if account_id:
-            sal_legs = [l for l in all_sal_legs if l.get("account_id") and int(l["account_id"]) == int(account_id)]
-        else:
-            sal_legs = all_sal_legs
-        period_legs.extend(sal_legs)
+            salary_legs = [leg for leg in salary_legs if str(leg.get("account_id")) == str(account_id)]
+        period_legs.extend(salary_legs)
 
     # Sort all legs together by transaction_date, numeric transaction id, debits first, then credits
     def leg_sort_key(leg):
@@ -7327,7 +7387,7 @@ def api_gl_report():
     elif end_date:
         sal_period_query["transaction_date"] = {"$lte": end_date}
     recon_sal_txns = list(db.hr_salary_transactions.find(sal_period_query))
-    sal_outflow = sum(float(s.get("total_amount") or s.get("amount") or 0.0) for s in recon_sal_txns)
+    sal_outflow = sum(float(s.get("total_amount") or s.get("amount") or 0.0) for s in recon_sal_txns if s.get("status") != "Reversed" and not salary_transaction_is_accrual(s))
     tl_total_outflow = tl_outflow + sal_outflow
     
     rev_log_income = sum(float(t.get("total_amount") or t.get("amount") or 0.0) for t in recon_txns if t.get("type") == "Income" and is_revenue_log_transaction(t))
@@ -7372,7 +7432,7 @@ def api_gl_report():
                     gl_expenses += dr
 
     bank_outflows += sal_outflow
-    gl_expenses += sal_outflow
+    gl_expenses += sum(float(s.get("total_amount") or s.get("amount") or 0.0) for s in recon_sal_txns if s.get("status") != "Reversed")
     gl_operational_rev = gl_gross_rev - gl_gateway_fees
 
     reconciliation = {
@@ -8640,79 +8700,126 @@ def api_hr_salary_payments():
     return jsonify(json_ready({"payable": saved_payable, "payroll": saved_payroll}))
 
 
+def salary_payable_payroll(db, payable):
+    record_ids = payable.get("hr_payroll_record_ids") or []
+    query = {"id": {"$in": record_ids}} if record_ids else {"salary_payable_id": payable["id"]}
+    return list(db.hr_payroll.find(query, {"_id": 0}))
+
+
+def salary_payable_has_posting(db, payable, records):
+    return db.hr_salary_transactions.find_one({
+        "status": {"$ne": "Reversed"},
+        "$or": [{"salary_payable_id": payable["id"]}, {"id": payable.get("source_id")},
+                {"hr_payroll_record_ids": {"$in": [record["id"] for record in records]}}],
+    }) is not None
+
+
+@app.route("/api/finance/salary-posting-options", methods=["GET"])
+def api_salary_posting_options():
+    user = require_finance_access()
+    db = get_db()
+    can_post = user_has_hr_permission(db, user, "post_salary_to_ledger")
+    if not can_post:
+        return jsonify({"can_post_salary": False, "payables": [], "accounts": [],
+                        "transactions": [], "message": "Post Salary to Ledger permission is required."})
+    ensure_default_accounts(db)
+    accounts = [account for account in account_list(db, sort=[("gl_code", 1), ("name", 1)], include_balances=False)
+                if account_available_for_transaction(account, "Expense")]
+    batches = []
+    for payable in db.payables.find({"source_module": "HR Salary", "status": {"$nin": ["Cancelled", "Reversed"]}}, {"_id": 0}):
+        records = salary_payable_payroll(db, payable)
+        try:
+            details = salary_payable_details(payable, records)
+        except (ValueError, TypeError):
+            continue
+        if not salary_payable_has_posting(db, payable, records):
+            batches.append(details)
+    transactions = list(db.hr_salary_transactions.find({}, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1)]))
+    return jsonify(json_ready({"can_post_salary": True, "payables": batches,
+                               "accounts": accounts, "transactions": transactions}))
+
+
+@app.route("/api/finance/salary-postings", methods=["POST"])
 @app.route("/api/hr/salary-ledger-payments", methods=["POST"])
 def api_hr_salary_ledger_payments():
-    user = require_hr_access()
+    user = require_finance_access() if request.path.startswith("/api/finance/") else require_hr_access()
     db = get_db()
     if not user_has_hr_permission(db, user, "post_salary_to_ledger"):
         abort(403)
     data = request.get_json() or {}
-    transaction = data.get("transaction") or {}
-    payroll_records = data.get("payroll_records") or []
-    record_ids = [item.get("id") for item in payroll_records if item.get("id")]
-    if not record_ids:
-        return jsonify({"error": "Select at least one finalized unpaid salary record."}), 400
-    tx_date = transaction.get("transaction_date") or transaction.get("date") or datetime.now().strftime("%Y-%m-%d")
+    transaction = data.get("transaction") or data
+    payable_id = safe_int(data.get("payable_id") or transaction.get("salary_payable_id"))
+    # Accept older clients while linking their selected payroll to its existing payable.
+    if not payable_id:
+        record_ids = [item.get("id") for item in data.get("payroll_records") or [] if item.get("id")]
+        if record_ids:
+            record = db.hr_payroll.find_one({"id": record_ids[0]})
+            payable_id = safe_int((record or {}).get("salary_payable_id"))
+    payable = db.payables.find_one({"id": payable_id, "source_module": "HR Salary"}) if payable_id else None
+    if not payable:
+        return jsonify({"error": "Select a salary payable created in HR Management."}), 400
+    records = salary_payable_payroll(db, payable)
+    try:
+        details = salary_payable_details(payable, records)
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    if salary_payable_has_posting(db, payable, records):
+        return jsonify({"error": "This salary payable has already been posted to the transaction ledger."}), 409
+    supplied_ids = {str(item.get("id")) for item in data.get("payroll_records") or [] if item.get("id")}
+    if supplied_ids and supplied_ids != {str(value) for value in details["record_ids"]}:
+        return jsonify({"error": "Post all payroll records belonging to the selected salary payable together."}), 400
+    tx_date = (transaction.get("transaction_date") or transaction.get("date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+    try:
+        date.fromisoformat(tx_date)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Select a valid posting date."}), 400
     is_locked, period, lock_err = check_accounting_period_lock(tx_date, db)
     if is_locked:
         return jsonify({"error": lock_err}), 400
     account_id = safe_int(transaction.get("account_id"))
-    if not account_id:
-        return jsonify({"error": "Select the GL account for salary posting."}), 400
     ensure_default_accounts(db)
-    account = db.accounts.find_one({"id": account_id})
+    account = db.accounts.find_one({"id": account_id}) if account_id else None
     if not account_available_for_transaction(account, "Expense"):
         return jsonify({"error": "Select an active expense GL account for salary posting."}), 400
-    total_amount = parse_float(transaction.get("total_amount") or transaction.get("amount"))
-    if total_amount <= 0:
-        return jsonify({"error": "Salary posting amount must be greater than zero."}), 400
-    existing_transaction = db.hr_salary_transactions.find_one({"hr_payroll_record_ids": {"$in": record_ids}})
-    if existing_transaction:
-        return jsonify({"error": "Duplicate salary posting prevented for this salary period."}), 400
-    req_id = (transaction.get("id") or "").strip()
-    if req_id.startswith("TXN"):
-        record_id = req_id
-    else:
-        seq = get_next_sequence_value("transactions")
-        record_id = f"TXN{seq:03d}"
-    reference = transaction.get("reference") or transaction.get("transaction_reference") or f"SAL-PAYABLE-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    seq = get_next_sequence_value("transactions")
+    record_id = f"TXN{seq:03d}"
+    reference = (transaction.get("reference") or transaction.get("transaction_reference")
+                 or payable.get("source_reference") or payable.get("payable_number"))
+    amount = details["total_amount"]
+    record_ids = details["record_ids"]
     tx_doc = {
-        **transaction,
-        "id": record_id,
-        "reference": reference,
-        "transaction_reference": reference,
-        "status": "Pending Payable",
-        "transaction_type": "Salary Payable",
-        "category": "Payroll / Salary Payable",
-        "account_id": account_id,
-        "account_name": account.get("name"),
-        "gl_code": account.get("gl_code"),
-        "amount": total_amount,
-        "total_amount": total_amount,
-        "hr_payroll_record_ids": record_ids,
-        "employee_bifurcation": [],
-        "outflow": 0,
-        "debit": total_amount,
-        "updated_at": datetime.now(),
-        "created_at": datetime.now(),
-        "created_by_id": user["id"],
+        "id": record_id, "display_id": record_id, "source_module": "HR Salary",
+        "type": "Expense", "reference": reference, "transaction_reference": reference,
+        "transaction_date": tx_date, "date": tx_date,
+        "description": f"Salary for {details['salary_month']} {details['salary_year']} · {payable.get('payable_number') or payable_id}",
+        "party_name": f"Salary for {details['salary_month']} {details['salary_year']}",
+        "status": "Posted", "payment_status": "Unpaid", "is_paid": False,
+        "transaction_type": "Salary Payable", "category": "Payroll / Salary Payable",
+        "account_id": account_id, "account_name": account.get("name"), "gl_code": account.get("gl_code"),
+        "amount": amount, "total_amount": amount, "currency": details["currency"],
+        "salary_month": details["salary_month"], "salary_year": details["salary_year"],
+        "salary_payable_id": payable_id, "salary_payable_number": payable.get("payable_number"),
+        "hr_payroll_record_ids": record_ids, "salary_record_count": len(record_ids),
+        "salary_posting_key": str(payable_id), "salary_posting_record_keys": [str(value) for value in record_ids],
+        "employee_bifurcation": [], "outflow": 0, "debit": amount,
+        "updated_at": datetime.now(), "created_at": datetime.now(), "created_by_id": user["id"],
     }
-    db.hr_salary_transactions.update_one({"id": record_id}, {"$set": tx_doc}, upsert=True)
-    saved_transaction = db.hr_salary_transactions.find_one({"id": record_id}, {"_id": 0})
-    payable = create_or_update_payable_from_salary_batch(db, saved_transaction)
-    db.hr_payroll.update_many(
-        {"id": {"$in": record_ids}},
-        {"$set": {
-            "transaction_reference": reference,
-            "ledger_transaction_id": record_id,
-            "salary_payable_id": payable.get("id") if payable else None,
-            "salary_payable_number": payable.get("payable_number") if payable else None,
-            "salary_payable_status": payable.get("status") if payable else "Pending",
-            "updated_at": datetime.now(),
-        }},
-    )
+    db.hr_salary_transactions.create_index("salary_posting_key", unique=True, sparse=True)
+    db.hr_salary_transactions.create_index("salary_posting_record_keys", unique=True, sparse=True)
+    try:
+        db.hr_salary_transactions.insert_one(tx_doc)
+    except pymongo.errors.DuplicateKeyError:
+        return jsonify({"error": "This salary payable or its payroll records have already been posted."}), 409
+    db.payables.update_one({"id": payable_id}, {"$set": {
+        "ledger_transaction_id": record_id, "ledger_account_id": account_id, "updated_at": datetime.now(),
+    }})
+    db.hr_payroll.update_many({"id": {"$in": record_ids}}, {"$set": {
+        "ledger_transaction_id": record_id, "updated_at": datetime.now(),
+    }})
+    log_activity_async("Finance", "Accounting Entry", record_id, "CREATE", new_data=tx_doc, reference_number=reference)
     saved_payroll = list(db.hr_payroll.find({"id": {"$in": record_ids}}, {"_id": 0}))
-    return jsonify(json_ready({"transaction": saved_transaction, "payable": payable, "payroll": saved_payroll}))
+    return jsonify(json_ready({"transaction": tx_doc, "payable": db.payables.find_one({"id": payable_id}, {"_id": 0}),
+                               "payroll": saved_payroll}))
 
 
 @app.route("/api/hr/settings", methods=["GET", "PUT"])
@@ -8745,7 +8852,10 @@ def api_treasury_bank_accounts():
     db = get_db()
     if request.method == "POST":
         data = request.get_json() or {}
-        payload = normalize_company_bank_account_payload(data)
+        try:
+            payload = normalize_company_bank_account_payload(data)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if not payload["account_number"] or not payload["account_name"] or not payload["bank_name"]:
             return jsonify({"error": "Account Number, Account Name, and Bank Name are required."}), 400
         if db.company_bank_accounts.find_one({"account_number": payload["account_number"]}):
@@ -8768,7 +8878,7 @@ def api_treasury_bank_accounts():
     tx_query = {"bank_account_id": {"$in": account_ids}} if account_ids else {}
     transactions = list(db.company_bank_transactions.find(tx_query, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1), ("id", -1)]).limit(50))
     stats = {
-        "available_balance": sum(parse_float(account.get("current_balance")) for account in accounts if account.get("status") != "Inactive"),
+        "available_balance": sum(parse_float(account.get("current_balance")) for account in accounts if company_bank_account_is_active(account)),
         "total_inflow": sum(parse_float(tx.get("inflow")) for tx in db.company_bank_transactions.find({}, {"inflow": 1})),
         "total_outflow": sum(parse_float(tx.get("outflow")) for tx in db.company_bank_transactions.find({}, {"outflow": 1})),
         "pending_payables": sum(parse_float(p.get("outstanding_amount")) for p in db.payables.find({"status": {"$in": ["Pending", "Partially Paid"]}}, {"outstanding_amount": 1})),
@@ -8785,7 +8895,10 @@ def api_treasury_bank_account_detail(bank_account_id):
         abort(404)
     if request.method == "PUT":
         data = request.get_json() or {}
-        payload = normalize_company_bank_account_payload(data, account)
+        try:
+            payload = normalize_company_bank_account_payload(data, account)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         duplicate = db.company_bank_accounts.find_one({"account_number": payload["account_number"], "id": {"$ne": bank_account_id}})
         if duplicate:
             return jsonify({"error": "A Treasury bank account with this account number already exists."}), 400
@@ -8799,6 +8912,28 @@ def api_treasury_bank_account_detail(bank_account_id):
         return jsonify(json_ready({"success": True, "bank_account": company_bank_account_with_balance(db, updated)}))
     transactions = list(db.company_bank_transactions.find({"bank_account_id": bank_account_id}, {"_id": 0}).sort([("transaction_date", -1), ("created_at", -1), ("id", -1)]))
     return jsonify(json_ready({"bank_account": company_bank_account_with_balance(db, account), "transactions": transactions}))
+
+
+@app.route("/api/treasury/bank-accounts/<int:bank_account_id>/status", methods=["PUT"])
+def api_treasury_bank_account_status(bank_account_id):
+    user = require_treasury_access()
+    db = get_db()
+    account = db.company_bank_accounts.find_one({"id": bank_account_id})
+    if not account:
+        abort(404)
+    data = request.get_json() or {}
+    if not isinstance(data, dict) or set(data) != {"status"} or data.get("status") not in ("Active", "Blocked"):
+        return jsonify({"error": "Select Blocked to block the account or Active to unblock it."}), 400
+    status = data["status"]
+    if status == "Active" and account.get("status") != "Blocked":
+        return jsonify({"error": "Only a blocked bank account can be unblocked."}), 400
+    db.company_bank_accounts.update_one({"id": bank_account_id}, {"$set": {
+        "status": status, "updated_at": datetime.now(), "modified_by_id": user["id"],
+    }})
+    updated = db.company_bank_accounts.find_one({"id": bank_account_id})
+    action = "Blocked" if status == "Blocked" else "Unblocked"
+    log_treasury_action(user["id"], f"{action} Company Bank Account", f"{action} {company_bank_account_label(account)}.")
+    return jsonify(json_ready({"success": True, "bank_account": company_bank_account_with_balance(db, updated)}))
 
 
 @app.route("/api/treasury/bank-accounts/<int:bank_account_id>/statement", methods=["GET"])
@@ -8839,10 +8974,10 @@ def api_treasury_fund_transfers():
         transfer_date = data.get("transfer_date") or datetime.now().strftime("%Y-%m-%d")
         to_account_id = safe_int(data.get("to_bank_account_id"))
         if data.get("transfer_all"):
-            if not to_account_id or not db.company_bank_accounts.find_one({"id": to_account_id, "status": {"$ne": "Inactive"}}):
+            if not to_account_id or not db.company_bank_accounts.find_one({"id": to_account_id, "status": ACTIVE_COMPANY_BANK_STATUSES}):
                 return jsonify({"error": "Select a valid destination account."}), 400
             transfer_docs = []
-            for source in db.company_bank_accounts.find({"id": {"$ne": to_account_id}, "status": {"$ne": "Inactive"}}):
+            for source in db.company_bank_accounts.find({"id": {"$ne": to_account_id}, "status": ACTIVE_COMPANY_BANK_STATUSES}):
                 balance = bank_account_current_balance(db, source["id"]) or 0.0
                 if balance <= 0.01:
                     continue
@@ -8887,8 +9022,8 @@ def api_treasury_fund_transfers():
             return jsonify({"error": "From account, To account, and Transfer Amount are required."}), 400
         if from_account_id == to_account_id:
             return jsonify({"error": "Source and destination accounts must be different."}), 400
-        from_account = db.company_bank_accounts.find_one({"id": from_account_id, "status": {"$ne": "Inactive"}})
-        to_account = db.company_bank_accounts.find_one({"id": to_account_id, "status": {"$ne": "Inactive"}})
+        from_account = db.company_bank_accounts.find_one({"id": from_account_id, "status": ACTIVE_COMPANY_BANK_STATUSES})
+        to_account = db.company_bank_accounts.find_one({"id": to_account_id, "status": ACTIVE_COMPANY_BANK_STATUSES})
         if not from_account or not to_account:
             return jsonify({"error": "Select active source and destination bank accounts."}), 400
         transfer_id = get_next_sequence_value("fund_transfers")
@@ -8929,7 +9064,7 @@ def api_treasury_fund_transfers():
         return jsonify(json_ready({"success": True, "transfer": transfer_doc}))
 
     transfers = list(db.fund_transfers.find({}, {"_id": 0}).sort([("transfer_date", -1), ("created_at", -1), ("id", -1)]))
-    accounts = [company_bank_account_with_balance(db, account) for account in db.company_bank_accounts.find({"status": {"$ne": "Inactive"}}, {"_id": 0}).sort("account_name", 1)]
+    accounts = [company_bank_account_with_balance(db, account) for account in db.company_bank_accounts.find({"status": ACTIVE_COMPANY_BANK_STATUSES}, {"_id": 0}).sort("account_name", 1)]
     return jsonify(json_ready({"transfers": transfers, "bank_accounts": accounts}))
 
 
@@ -9099,6 +9234,10 @@ def api_treasury_payable_payment(payable_id):
     bank_account_id = safe_int(data.get("bank_account_id"))
     if not bank_account_id:
         return jsonify({"error": "Paid From Bank Account is required."}), 400
+    try:
+        require_active_company_bank_account(db, bank_account_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     account_balance = bank_account_current_balance(db, bank_account_id)
     if account_balance is None:
         return jsonify({"error": "Select a valid Treasury bank account."}), 400
@@ -9238,7 +9377,7 @@ def api_treasury_payable_payment(payable_id):
     else:
         sync_revenue_settlement_from_payable(db, updated_payable)
     if is_salary_payable:
-        salary_transaction = db.hr_salary_transactions.find_one({"id": payable.get("source_id")}, {"_id": 0})
+        salary_transaction = db.hr_salary_transactions.find_one({"id": payable.get("ledger_transaction_id") or payable.get("source_id")}, {"_id": 0})
         payroll_ids = (salary_transaction or {}).get("hr_payroll_record_ids") or payable.get("hr_payroll_record_ids") or []
         query_clauses = []
         if payroll_ids:
@@ -10458,6 +10597,10 @@ def api_treasury_loan_disbursement(loan_id):
         return jsonify({"error": "Disbursement amount must be greater than zero."}), 400
     if totals["total_disbursed_amount"] + amount > parse_float(loan.get("total_loan_amount")) + 0.01:
         return jsonify({"error": "Total disbursement cannot exceed approved loan amount."}), 400
+    try:
+        require_active_company_bank_account(db, data.get("bank_account_id") or loan.get("bank_account_id"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     tx = create_finance_transaction(db, {
         "account_id": safe_int(data.get("bank_account_id") or loan.get("bank_account_id")),
         "loan_account_id": loan_id,
@@ -10696,8 +10839,10 @@ def api_treasury_revenue_update(revenue_id):
         return jsonify({"error": "Expense entries are payable-managed. Open Payables and mark the payable as paid to deduct company fund."}), 400
 
     bank_account_id = safe_int(data.get("bank_account_id"))
-    if not bank_account_id or not db.company_bank_accounts.find_one({"id": bank_account_id, "status": {"$ne": "Inactive"}}):
-        return jsonify({"error": "Select the bank account where this revenue was received."}), 400
+    try:
+        require_active_company_bank_account(db, bank_account_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     
     reserve_percentage = 100.0
     channel_partner_id = None
