@@ -253,6 +253,22 @@ def get_db():
         )
     return mongo_client.get_database("lms_crm")
 
+
+def log_mongodb_connection():
+    """Ping MongoDB and write a credential-safe startup status message."""
+    try:
+        db = get_db()
+        db.command("ping")
+    except Exception as error:
+        print(
+            f"✗ MongoDB connection failed ({type(error).__name__})",
+            flush=True,
+        )
+        return False
+
+    print(f"✓ MongoDB connected (database: {db.name})", flush=True)
+    return True
+
 def get_next_sequence_value(sequence_name):
     db = get_db()
     # Find the sequence document and increment the sequence value by 1.
@@ -264,16 +280,6 @@ def get_next_sequence_value(sequence_name):
         return_document=pymongo.ReturnDocument.AFTER
     )
     return sequence_doc["sequence_value"]
-
-def fetch_all(query, params=None):
-    raise NotImplementedError("fetch_all is deprecated. Use PyMongo direct queries.")
-
-def fetch_one(query, params=None):
-    raise NotImplementedError("fetch_one is deprecated. Use PyMongo direct queries.")
-
-def execute(query, params=None):
-    raise NotImplementedError("execute is deprecated. Use PyMongo direct queries.")
-
 
 def json_ready(value):
     if isinstance(value, ObjectId):
@@ -474,54 +480,6 @@ def get_fields_for_user(object_id):
             filtered_fields.append(f)
             
     return filtered_fields
-
-
-def custom_objects_for_nav():
-    try:
-        return fetch_all("SELECT label, plural_label, api_name FROM custom_objects WHERE is_standard = 0 ORDER BY plural_label")
-    except Error:
-        return []
-
-
-def app_launcher_items():
-    items = [
-        {"label": "Dashboard", "type": "App", "url": url_for("dashboard")},
-        {"label": "Customers", "type": "Standard Object", "url": url_for("customers")},
-        {"label": "Opportunities", "type": "Standard Object", "url": url_for("opportunities")},
-        {"label": "Projects", "type": "Module", "url": url_for("projects_module")},
-        {"label": "Finance", "type": "Module", "url": url_for("finance_dashboard")},
-    ]
-    for custom_object in custom_objects_for_nav():
-        items.append(
-            {
-                "label": custom_object["plural_label"],
-                "type": "Custom Object",
-                "url": url_for("custom_object_records", api_name=custom_object["api_name"]),
-            }
-        )
-    return items
-
-
-def get_standard_fields(api_name):
-    custom_object = fetch_one("SELECT * FROM custom_objects WHERE api_name = %s", (api_name,))
-    if not custom_object:
-        return [], None
-    fields = fetch_all(
-        "SELECT * FROM custom_fields WHERE object_id = %s AND is_native = 0 ORDER BY created_at",
-        (custom_object["id"],),
-    )
-    return fields, custom_object
-
-
-def get_object_fields(api_name):
-    custom_object = fetch_one("SELECT * FROM custom_objects WHERE api_name = %s", (api_name,))
-    if not custom_object:
-        return [], None
-    fields = fetch_all(
-        "SELECT * FROM custom_fields WHERE object_id = %s ORDER BY is_native DESC, id",
-        (custom_object["id"],),
-    )
-    return fields, custom_object
 
 
 def seed_native_standard_fields():
